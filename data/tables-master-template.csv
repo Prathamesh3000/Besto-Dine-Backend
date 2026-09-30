@@ -1,0 +1,94 @@
+area,name,capacity
+Indoor Dining,D1,2
+Indoor Dining,D2,2
+Indoor Dining,D3,4
+Indoor Dining,D4,4
+Indoor Dining,D5,4
+Indoor Dining,D6,4
+Indoor Dining,D7,6
+Indoor Dining,D8,6
+Indoor Dining,D9,8
+Indoor Dining,D10,8
+AC Hall,AC1,2
+AC Hall,AC2,4
+AC Hall,AC3,4
+AC Hall,AC4,4
+AC Hall,AC5,6
+AC Hall,AC6,6
+AC Hall,AC7,8
+Non-AC Hall,NA1,4
+Non-AC Hall,NA2,4
+Non-AC Hall,NA3,6
+Non-AC Hall,NA4,6
+Non-AC Hall,NA5,8
+Family Section,FAM1,4
+Family Section,FAM2,4
+Family Section,FAM3,6
+Family Section,FAM4,6
+Family Section,FAM5,8
+Family Section,FAM6,8
+Outdoor Dining,OD1,2
+Outdoor Dining,OD2,4
+Outdoor Dining,OD3,4
+Outdoor Dining,OD4,6
+Outdoor Dining,OD5,6
+Outdoor Dining,OD6,8
+Garden,G1,4
+Garden,G2,4
+Garden,G3,6
+Garden,G4,6
+Garden,G5,8
+Garden,G6,10
+Rooftop,RT1,2
+Rooftop,RT2,4
+Rooftop,RT3,4
+Rooftop,RT4,6
+Rooftop,RT5,6
+Rooftop,RT6,8
+Terrace,TR1,4
+Terrace,TR2,4
+Terrace,TR3,6
+Terrace,TR4,6
+Terrace,TR5,8
+Poolside,PL1,2
+Poolside,PL2,4
+Poolside,PL3,4
+Poolside,PL4,6
+Poolside,PL5,6
+Bar & Lounge,BL1,2
+Bar & Lounge,BL2,4
+Bar & Lounge,BL3,4
+Bar & Lounge,BL4,6
+Bar Counter,BC1,1
+Bar Counter,BC2,1
+Bar Counter,BC3,1
+Bar Counter,BC4,1
+Bar Counter,BC5,2
+Bar Counter,BC6,2
+Private Dining Room,PDR1,6
+Private Dining Room,PDR2,8
+Private Dining Room,PDR3,10
+Private Dining Room,PDR4,12
+VIP Lounge,VIP1,4
+VIP Lounge,VIP2,6
+VIP Lounge,VIP3,8
+Cabin,CB1,4
+Cabin,CB2,6
+Cabin,CB3,8
+Banquet Hall,BH1,10
+Banquet Hall,BH2,10
+Banquet Hall,BH3,12
+Banquet Hall,BH4,12
+Banquet Hall,BH5,20
+Coffee Shop,CS1,2
+Coffee Shop,CS2,2
+Coffee Shop,CS3,4
+Coffee Shop,CS4,4
+Coffee Shop,CS5,6
+Takeaway Counter,TC1,2
+Drive-Through,DT1,1
+Kids Zone,KZ1,4
+Kids Zone,KZ2,4
+Kids Zone,KZ3,6
+Smoking Area,SM1,4
+Smoking Area,SM2,4
