@@ -12,6 +12,7 @@ const logger = require('../utils/logger');
 const { getIO, emitToStaff } = require('../utils/socket');
 const { signTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const { lineItemsSubtotal } = require('./orderBillMath');
+const { httpError } = require('./orderErrors');
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 
@@ -97,18 +98,68 @@ function orderLineKey(it) {
 // (one source of truth — no per-view display merge needed). The matched
 // line keeps its original `addedAt`, so it stays in its original timeline
 // bucket. Genuinely different new items still append as their own line
-// (and keep the "added later" highlight). Per-line quantity caps at 99.
+// (and keep the "added later" highlight).
+//
+// A merged line may hold up to MAX_LINE_QUANTITY (999 — the same per-item
+// limit createOrder enforces). It used to be silently capped at 99, which
+// shrank a 150-portion line (and its bill) on "one more". A merge that
+// would exceed the limit now refuses the whole batch (400
+// QUANTITY_EXCEEDED) BEFORE anything is mutated.
 // Mutates `targetItems` in place; the caller saves.
+const MAX_LINE_QUANTITY = 999;
 function appendItemsMerging(targetItems, incoming) {
+  // Plan first (so a refusal leaves targetItems untouched), then apply.
+  const planned = new Map(); // matched line → new quantity
+  const pushes = [];
   for (const inc of incoming) {
     const incQty = Math.max(1, Math.floor(Number(inc?.quantity) || 1));
-    const match = targetItems.find(t => orderLineKey(t) === orderLineKey(inc));
+    const match = targetItems.find(t => orderLineKey(t) === orderLineKey(inc))
+      || pushes.find(t => orderLineKey(t) === orderLineKey(inc));
     if (match) {
-      match.quantity = Math.min(99, (Number(match.quantity) || 0) + incQty);
+      const current = planned.has(match) ? planned.get(match) : (Number(match.quantity) || 0);
+      const next = current + incQty;
+      if (next > MAX_LINE_QUANTITY) {
+        throw httpError(400, {
+          success: false,
+          code: 'QUANTITY_EXCEEDED',
+          message: `Quantity ${next} for "${match.name || inc?.name || 'item'}" exceeds the per-item limit of ${MAX_LINE_QUANTITY}.`,
+        });
+      }
+      planned.set(match, next);
     } else {
-      targetItems.push(inc);
+      pushes.push(inc);
     }
   }
+  for (const [line, qty] of planned) line.quantity = qty;
+  for (const inc of pushes) targetItems.push(inc);
+}
+
+// True when a menu item can be ordered right now: status 'active' (a
+// missing status is legacy data and counts as active) and inside its
+// availability schedule (availableDays / startTime–endTime, ADM-043 —
+// same semantics as utils/menuAvailability.buildAvailabilityFilter,
+// including overnight windows). Returns null when orderable, otherwise a
+// short reason for the 400 message.
+function menuItemUnavailableReason(menu, now = new Date()) {
+  if (!menu) return 'not on the menu';
+  if (menu.status && menu.status !== 'active') return 'no longer available';
+  const { currentDayShort, currentTimeHHMM } = require('../utils/menuAvailability');
+  const days = Array.isArray(menu.availableDays) ? menu.availableDays : [];
+  if (days.length && !days.includes(currentDayShort(now))) return 'not available today';
+  const pad = (t) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '').trim());
+    return m ? `${m[1].padStart(2, '0')}:${m[2]}` : String(t || '').trim();
+  };
+  const start = pad(menu.startTime);
+  const end = pad(menu.endTime);
+  if (start && end) {
+    const hhmm = currentTimeHHMM(now);
+    const inWindow = start <= end
+      ? (hhmm >= start && hhmm <= end)
+      : (hhmm >= start || hhmm <= end);
+    if (!inWindow) return `only available ${start}–${end}`;
+  }
+  return null;
 }
 
 // Short, human-readable line-item summary for notifications/toasts —
@@ -220,6 +271,8 @@ module.exports = {
   revertStatusOnAppend,
   orderLineKey,
   appendItemsMerging,
+  MAX_LINE_QUANTITY,
+  menuItemUnavailableReason,
   summariseItems,
   newOrderAdminDescription,
   partitionItemsByStation,

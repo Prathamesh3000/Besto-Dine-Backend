@@ -19,6 +19,7 @@ const { notify } = require('../services/notificationService');
 const EVENTS = require('../realtime/events');
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const logger = require('../utils/logger');
+const { seatsTakenOf } = require('../utils/tableSeats');
 
 // Delay thresholds (minutes). A kitchen ticket sitting in new/preparing past
 // PREP_DELAY_MIN, or a plated order waiting to be picked up past
@@ -77,7 +78,7 @@ exports.getFloorOverview = async (req, res) => {
         // integrity but must never show on the floor (same rule as
         // tableController.getTables).
         let tables = await Table.find({ ...tf, ...bf, isDeleted: { $ne: true } })
-            .select('name capacity status area assignedWaiter mergedWith')
+            .select('name capacity status area assignedWaiter mergedWith seats')
             .populate('assignedWaiter', 'name staffId')
             .sort({ name: 1 })
             .lean();
@@ -117,7 +118,20 @@ exports.getFloorOverview = async (req, res) => {
             ordersByTable.get(key).push(o);
         }
 
+        // Seats of a merge group live on its leader; report the group's
+        // seated parties against the group's summed capacity.
+        const tableById = new Map(tables.map(t => [String(t._id), t]));
+        const seatsOfGroup = (t) => {
+            const ids = [String(t._id), ...((t.mergedWith || []).map(String))];
+            const members = ids.map(id => tableById.get(id)).filter(Boolean);
+            return {
+                taken: members.reduce((n, m) => n + seatsTakenOf(m), 0),
+                capacity: members.reduce((n, m) => n + (Number(m.capacity) || 0), 0),
+            };
+        };
+
         const tablesOut = tables.map(t => {
+            const seatGroup = seatsOfGroup(t);
             const tableOrders = ordersByTable.get(String(t._id)) || [];
             const oldest = tableOrders.reduce(
                 (acc, o) => (!acc || new Date(o.createdAt) < new Date(acc) ? o.createdAt : acc),
@@ -127,6 +141,10 @@ exports.getFloorOverview = async (req, res) => {
                 _id: t._id,
                 name: t.name,
                 capacity: t.capacity,
+                // QA #13 — diner parties holding a seat (QR scan) and the
+                // capacity they count against (summed over a merge group).
+                seatsTaken: seatGroup.taken,
+                seatCapacity: seatGroup.capacity,
                 status: t.status,
                 area: t.area ? String(t.area) : null,
                 merged: Array.isArray(t.mergedWith) && t.mergedWith.length > 0,

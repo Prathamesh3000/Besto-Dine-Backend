@@ -99,7 +99,10 @@ const config = {
         accessTokenTtl: str('ACCESS_TOKEN_TTL', '30m'),
         superadminAccessTokenTtl: str('SUPERADMIN_ACCESS_TOKEN_TTL', '15m'),
         refreshTtlHoursStaff: int('REFRESH_TTL_HOURS_STAFF', 168, { min: 1 }),
-        refreshTtlHoursCustomer: int('REFRESH_TTL_HOURS_CUSTOMER', 720, { min: 1 }),
+        // Customer ABSOLUTE session cap (hours) — the per-token window is
+        // the inactivity timeout below. Read live by authController.
+        refreshTtlHoursCustomer: int('REFRESH_TTL_HOURS_CUSTOMER', 24, { min: 1 }),
+        customerIdleTimeoutMinutes: int('CUSTOMER_IDLE_TIMEOUT_MINUTES', 60, { min: 1 }),
         refreshTtlHoursSuperadmin: int('REFRESH_TTL_HOURS_SUPERADMIN', 12, { min: 1 }),
         scanTokenTtl: str('SCAN_TOKEN_TTL', '4h'),
         useCookieAuth: bool('USE_COOKIE_AUTH', false),

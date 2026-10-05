@@ -2237,7 +2237,7 @@ exports.listPendingApprovals = async (_req, res) => {
                     requestedPlanPrice: r.requestedPlan?.price ?? r.requestedPlanPrice ?? null,
                 }))),
             Restaurant.find({ paymentStatus: 'pending' })
-                .select('name slug contactEmail contactPhone city subscription.planName subscription.plan paymentNote status updatedAt')
+                .select('name slug contactEmail contactPhone city subscription.planName subscription.plan subscription.price paymentNote status updatedAt')
                 .sort({ updatedAt: -1 })
                 .lean(),
             // Plan price map so the offline-payments queue can show the
@@ -2245,10 +2245,15 @@ exports.listPendingApprovals = async (_req, res) => {
             SubscriptionPlan.find({}).select('price currency').lean(),
         ]);
 
+        // Agreed snapshot price first (priceOverride at create time) —
+        // same amount getPaymentApprovalDetail shows; catalogue price is
+        // only a fallback for legacy rows without a snapshot.
         const priceById = new Map(plans.map(p => [String(p._id), p.price || 0]));
         const paymentPendingEnriched = paymentPending.map(r => ({
             ...r,
-            planPrice: r.subscription?.plan ? (priceById.get(String(r.subscription.plan)) || 0) : 0,
+            planPrice: typeof r.subscription?.price === 'number'
+                ? r.subscription.price
+                : (r.subscription?.plan ? (priceById.get(String(r.subscription.plan)) || 0) : 0),
         }));
 
         return res.status(200).json({
@@ -2570,14 +2575,30 @@ exports.approvePlanChangeRequest = async (req, res) => {
         // only schedule downgrades for tenant-source requests; the
         // operator path is for offline-payment swaps that the operator
         // wants to apply right away.
+        // Prefer the snapshot (what the tenant pays); the catalogue price
+        // may have been edited since. Fall back to it only for legacy
+        // tenants without a snapshotted price.
         let currentPrice = 0;
-        if (restaurant.subscription?.plan) {
+        if (typeof restaurant.subscription?.price === 'number') {
+            currentPrice = restaurant.subscription.price;
+        } else if (restaurant.subscription?.plan) {
             const currentPlanDoc = await SubscriptionPlan.findById(restaurant.subscription.plan).select('price');
             currentPrice = currentPlanDoc?.price ?? 0;
         }
         const isDowngrade = request.requestSource === 'tenant'
             && currentPrice > 0
             && plan.price < currentPrice;
+
+        // A tenant request is only ever a downgrade. Anything else
+        // (same price or pricier) must go through paid self-service
+        // upgrade — approving it here would hand out the plan for free.
+        if (request.requestSource === 'tenant' && !isDowngrade) {
+            return res.status(400).json({
+                success: false,
+                code: 'NOT_A_DOWNGRADE',
+                message: `${plan.name} is not cheaper than what this tenant currently pays — reject this request; upgrades must be paid via self-service.`,
+            });
+        }
 
         if (isDowngrade) {
             // ── Schedule, don't swap ────────────────────────────────

@@ -55,14 +55,14 @@ exports.restaurantWelcome = ({
         ? `You're on a <strong>${trialDays}-day free trial</strong>. No charges until the trial ends.`
         : '';
 
-    const subject = `Welcome to BestoDine — ${safeName}`;
+    const subject = `Welcome to BestoDine — ${restaurantName || 'your restaurant'}`; // plain-text header, not HTML
 
     const html = `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${subject}</title>
+    <title>${escapeHtml(subject)}</title>
 </head>
 <body style="margin:0;padding:0;background-color:#F5F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1A181B;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F5F5F7;padding:32px 16px;">
@@ -190,14 +190,14 @@ exports.restaurantSelfSignupWelcome = ({
         ? `You're on a <strong>${trialDays}-day free trial</strong>. No charges until the trial ends.`
         : '';
 
-    const subject = `Welcome to BestoDine — ${safeName}`;
+    const subject = `Welcome to BestoDine — ${restaurantName || 'your restaurant'}`; // plain-text header, not HTML
 
     const html = `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${subject}</title>
+    <title>${escapeHtml(subject)}</title>
 </head>
 <body style="margin:0;padding:0;background-color:#F5F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1A181B;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F5F5F7;padding:32px 16px;">
@@ -419,14 +419,14 @@ exports.restaurantSuspended = ({
     const safeOwner  = escapeHtml(ownerName || 'there');
     const safeReason = escapeHtml(reason || '').replace(/\n/g, '<br>');
 
-    const subject = `Your BestoDine account has been suspended — ${safeName}`;
+    const subject = `Your BestoDine account has been suspended — ${restaurantName || 'your restaurant'}`; // plain-text header
 
     const html = `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${subject}</title>
+    <title>${escapeHtml(subject)}</title>
 </head>
 <body style="margin:0;padding:0;background-color:#F5F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1A181B;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F5F5F7;padding:32px 16px;">
@@ -519,14 +519,14 @@ exports.restaurantReactivated = ({
     const safeOwner  = escapeHtml(ownerName || 'there');
     const safeReason = escapeHtml(reason || '').replace(/\n/g, '<br>');
 
-    const subject = `Your BestoDine account has been reactivated — ${safeName}`;
+    const subject = `Your BestoDine account has been reactivated — ${restaurantName || 'your restaurant'}`; // plain-text header
 
     const html = `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${subject}</title>
+    <title>${escapeHtml(subject)}</title>
 </head>
 <body style="margin:0;padding:0;background-color:#F5F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1A181B;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F5F5F7;padding:32px 16px;">
@@ -619,7 +619,7 @@ exports.restaurantReactivated = ({
 exports.customerPasswordReset = ({ customerName, resetUrl, restaurantName, expiryMinutes = 30 }) => {
     const safeName = escapeHtml(customerName || 'there');
     const safeBrand = escapeHtml(restaurantName || 'BestoDine');
-    const subject = `Reset your ${safeBrand} password`;
+    const subject = `Reset your ${restaurantName || 'BestoDine'} password`; // plain-text header
 
     const html = `<!DOCTYPE html>
 <html>

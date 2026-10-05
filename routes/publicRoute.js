@@ -50,7 +50,13 @@ router.get('/menu-bootstrap',               getMenuBootstrap);
 // create thousands of ghost tenants before anyone noticed.
 const signupLimiter = makeLimiter({ name: 'public-signup',
     windowMs: 60 * 60 * 1000,   // 1 hour
-    max: 3,                      // 3 successful+failed signups per hour per IP
+    // 3 successful signups per hour per IP (SIGNUP_RATE_LIMIT_PER_HOUR).
+    // Rejected attempts (4xx/5xx — typo'd phone, taken email, weak
+    // password) no longer count: they create nothing, and counting them
+    // locked owners (and QA) out after a few validation errors, so the
+    // final valid submit answered 429 instead of "Application received".
+    max: Math.max(1, Number(process.env.SIGNUP_RATE_LIMIT_PER_HOUR) || 3),
+    skipFailedRequests: true,
     message: {
         success: false,
         code: 'RATE_LIMITED',

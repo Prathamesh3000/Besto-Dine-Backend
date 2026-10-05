@@ -12,9 +12,12 @@ const { getSettings } = require('../utils/settingsCache');
 const { sendEmail } = require('../utils/email');
 const User = require('../models/user');
 const Restaurant = require('../models/restaurant');
+const Coupon = require('../models/coupon');
+const CouponRedemption = require('../models/couponRedemption');
 
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
-const { loadBookingPrice, applyBookingDetailsEdit, DEFAULT_PARKING_RATES } = require('../utils/advanceBookingPricing');
+const { loadBookingPrice, applyBookingDetailsEdit } = require('../utils/advanceBookingPricing');
+const { loadParkingConfig, normalizeParkingDetails } = require('../utils/parkingConfig');
 const {
     checkSettledPayment,
     mergedNotes,
@@ -198,6 +201,43 @@ const HALL_DURATION_OPTIONS = [5, 6];
 const DEFAULT_HALL_DURATION = 5;
 // Legacy hall bookings stored no duration — assume the default block.
 const LEGACY_HALL_DURATION = DEFAULT_HALL_DURATION;
+// Table bookings are sold as one-hour slots ("7-8 PM"); two bookings of
+// the same table conflict when their slots overlap.
+const TABLE_SLOT_HOURS = 1;
+
+// Absolute start of the booked event: the booking's calendar date (the
+// date-only value stored at 00:00 UTC) at its `startTime` ("HH:MM") as
+// wall-clock time in the tenant's timezone (IST default). Bookings with
+// no stored start time fall back to the stored `bookingDate` instant.
+function bookingEventStart(booking, timeZone = 'Asia/Kolkata') {
+    const date = new Date(booking.bookingDate);
+    if (Number.isNaN(date.getTime())) return date;
+    const m = String(booking.startTime || '').match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return date;
+    let tz = timeZone || 'Asia/Kolkata';
+    try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { tz = 'Asia/Kolkata'; }
+    const wallClockUTC = Date.UTC(
+        date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(),
+        Math.min(23, Number(m[1])), Math.min(59, Number(m[2])), 0,
+    );
+    const p = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, hourCycle: 'h23',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(wallClockUTC)).reduce((acc, x) => { if (x.type !== 'literal') acc[x.type] = Number(x.value); return acc; }, {});
+    const offsetMs = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - wallClockUTC;
+    return new Date(wallClockUTC - offsetMs);
+}
+
+// Hours from now until the event start (negative = already started).
+async function hoursUntilEvent(req, booking) {
+    let timeZone;
+    try {
+        const settings = await getSettings(req);
+        timeZone = settings?.general?.timezone;
+    } catch { /* default timezone */ }
+    return (bookingEventStart(booking, timeZone) - Date.now()) / (1000 * 60 * 60);
+}
 
 // Start hour of a booking as a number (0-23). Prefers the explicit
 // `startTime` ("HH:MM") and falls back to parsing the display label.
@@ -224,9 +264,6 @@ const createAdvanceBooking = async (req, res) => {
             selectedSize,
             selectedSizeName,
             isVeg,
-            selectedVehicle,
-            vehicleCount,
-            parkingSkipped,
             selectedAddons,
             selectedAddonDetails,
             selectedEvent,
@@ -299,35 +336,42 @@ const createAdvanceBooking = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Guest count looks unrealistic (max 2000)' });
         }
         if (bookingType === 'hall' && selectedHallId) {
-            try {
-                const hall = await Hall.findOne({ _id: selectedHallId, ...tenantFilter(req) }).select('minCapacity maxCapacity name').lean();
-                if (hall) {
-                    // CUS-079 — capacity validation MUST check both ends.
-                    // Previously only maxCapacity was enforced, so a hall
-                    // with minCapacity=50 would accept a 5-guest booking
-                    // and the host arrived to find a giant empty room
-                    // (and an unhappy customer who was charged a hall
-                    // minimum they didn't expect).
-                    if (hall.maxCapacity && guestCount > hall.maxCapacity) {
-                        return res.status(400).json({
-                            success: false,
-                            code: 'HALL_CAPACITY_EXCEEDED',
-                            message: `${hall.name} fits up to ${hall.maxCapacity} guests. Pick a bigger hall or reduce the count.`,
-                            min: hall.minCapacity || null,
-                            max: hall.maxCapacity,
-                        });
-                    }
-                    if (hall.minCapacity && guestCount < hall.minCapacity) {
-                        return res.status(400).json({
-                            success: false,
-                            code: 'HALL_CAPACITY_BELOW_MIN',
-                            message: `${hall.name} requires a minimum of ${hall.minCapacity} guests. Pick a smaller hall or increase the count.`,
-                            min: hall.minCapacity,
-                            max: hall.maxCapacity || null,
-                        });
-                    }
-                }
-            } catch { /* hall lookup failure isn't fatal — booking proceeds with guard relaxed */ }
+            // The hall must exist in THIS tenant and be bookable. A foreign
+            // or unknown id used to skip the capacity guard and get priced
+            // at ₹0; a deactivated hall used to stay bookable via the API.
+            const hall = mongoose.Types.ObjectId.isValid(String(selectedHallId))
+                ? await Hall.findOne({ _id: selectedHallId, ...tenantFilter(req) }).select('minCapacity maxCapacity name isActive').lean()
+                : null;
+            if (!hall) {
+                return res.status(404).json({ success: false, code: 'HALL_NOT_FOUND', message: 'Hall not found' });
+            }
+            if (hall.isActive === false) {
+                return res.status(400).json({ success: false, code: 'HALL_UNAVAILABLE', message: `${hall.name} is not available for booking.` });
+            }
+            // CUS-079 — capacity validation MUST check both ends.
+            // Previously only maxCapacity was enforced, so a hall
+            // with minCapacity=50 would accept a 5-guest booking
+            // and the host arrived to find a giant empty room
+            // (and an unhappy customer who was charged a hall
+            // minimum they didn't expect).
+            if (hall.maxCapacity && guestCount > hall.maxCapacity) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'HALL_CAPACITY_EXCEEDED',
+                    message: `${hall.name} fits up to ${hall.maxCapacity} guests. Pick a bigger hall or reduce the count.`,
+                    min: hall.minCapacity || null,
+                    max: hall.maxCapacity,
+                });
+            }
+            if (hall.minCapacity && guestCount < hall.minCapacity) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'HALL_CAPACITY_BELOW_MIN',
+                    message: `${hall.name} requires a minimum of ${hall.minCapacity} guests. Pick a smaller hall or increase the count.`,
+                    min: hall.minCapacity,
+                    max: hall.maxCapacity || null,
+                });
+            }
         }
 
         // 1b. Hall availability check — prevent double-bookings (per-tenant).
@@ -374,26 +418,78 @@ const createAdvanceBooking = async (req, res) => {
             }
         }
 
-        // 1c. Validate wallet points BEFORE creating the booking (per-tenant)
+        // 1b'. Table availability — same overlap rule as halls: a table
+        // already held by a Pending / Confirmed booking for an overlapping
+        // slot on that date cannot be booked again.
+        const bookedTableIds = bookingType === 'table'
+            ? (selectedTableIds || []).filter(id => mongoose.Types.ObjectId.isValid(id))
+            : [];
+        if (bookedTableIds.length > 0) {
+            const sameDay = await AdvanceBooking.find({
+                tables: { $in: bookedTableIds },
+                bookingDate: selectedDate,
+                status: { $in: ['Pending', 'Confirmed'] },
+                ...tf,
+            }).select('bookingTime startTime durationHours').lean();
+            const conflicting = sameDay.find((b) => {
+                const otherStart = bookingStartHour(b.startTime, b.bookingTime);
+                if (startHour === null || otherStart === null) return true;
+                const otherEnd = otherStart + (Number(b.durationHours) || TABLE_SLOT_HOURS);
+                const myEnd = startHour + TABLE_SLOT_HOURS;
+                return startHour < otherEnd && otherStart < myEnd;
+            });
+            if (conflicting) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'TABLE_SLOT_TAKEN',
+                    message: 'This table is already booked for an overlapping time on the selected date. Please choose a different time, date or table.'
+                });
+            }
+        }
+
+        // 1c. Wallet points must be a non-negative number.
         const numericWalletPoints = parseFloat(walletPointsUsed) || 0;
         if (!Number.isFinite(numericWalletPoints) || numericWalletPoints < 0) {
             return res.status(400).json({ success: false, message: 'Invalid wallet points amount' });
         }
-        let walletForDeduction = null;
-        if (numericWalletPoints > 0) {
-            walletForDeduction = await Wallet.findOne({ user: userId, ...tf });
-            if (!walletForDeduction || walletForDeduction.loyaltyPoints < numericWalletPoints) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Insufficient wallet points. Available: ${walletForDeduction?.loyaltyPoints || 0}`
-                });
+
+        // Branch resolution (needed for coupon branch scope below):
+        //   - Admin with a branch pin (Sub Admin making a manual booking) → their pin.
+        //   - Customer booking a table → derive from the selected table's branch
+        //     so the booking shows up on that branch's admin tab.
+        //   - Otherwise (hall booking by customer, or data with no branch
+        //     context) → null (tenant-level, visible to tenant owner only).
+        let bookingBranch = pinnedBranchId(req) || null;
+        if (!bookingBranch && bookingType === 'table' && (selectedTableIds || []).length > 0) {
+            const firstTableId = (selectedTableIds || []).find(id => mongoose.Types.ObjectId.isValid(id));
+            if (firstTableId) {
+                const tbl = await Table.findOne({ _id: firstTableId, ...tf }).select('branch');
+                if (tbl && tbl.branch) bookingBranch = tbl.branch;
             }
         }
 
         // 1d. Bug #9 — authoritative price from the tenant catalog.
         const pricingSettings = await getSettings(req);
         const pointsToRupee = pricingSettings?.wallet?.pointsToRupee || 0.1;
-        const price = await loadBookingPrice({ body: req.body, tf, userId, pointsToRupee });
+        const price = await loadBookingPrice({ body: req.body, tf, userId, pointsToRupee, branch: bookingBranch });
+        if (price.parkingError) {
+            return res.status(400).json({ success: false, code: 'INVALID_PARKING', message: price.parkingError });
+        }
+
+        // 1e. Validate wallet points BEFORE creating the booking (per-tenant).
+        // Only the points the booking actually needs are spent — requesting
+        // 10,000 points against a ₹600 booking at ₹0.1/pt uses 6,000.
+        const pointsToDeduct = price.pointsUsed || 0;
+        let walletForDeduction = null;
+        if (pointsToDeduct > 0) {
+            walletForDeduction = await Wallet.findOne({ user: userId, ...tf });
+            if (!walletForDeduction || walletForDeduction.loyaltyPoints < pointsToDeduct) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Insufficient wallet points. Available: ${walletForDeduction?.loyaltyPoints || 0}`
+                });
+            }
+        }
         const clientTotal = parseFloat(total);
         if (Number.isFinite(clientTotal) && Math.abs(clientTotal - price.total) > 1) {
             logger.warn('Advance booking: client total differs from server price — using server price', {
@@ -466,25 +562,15 @@ const createAdvanceBooking = async (req, res) => {
             }
             paymentOutcome = outcome;
             verifiedPayment = { paymentId: razorpayPaymentId, orderId: razorpay_order_id };
+        } else if (!(Number(price.total) > 0)) {
+            // Nothing is due (coupon / points cover the whole booking):
+            // there is no payment to verify, and the booking is fully
+            // settled rather than left 'Pending' at ₹0 (2026-10).
+            paymentOutcome = { status: 'Paid', advancePaid: 0 };
         }
         const releasePaymentClaim = async () => {
             if (verifiedPayment) await releaseClaim(verifiedPayment.paymentId, { purpose: 'advance_booking', ref: bookingId });
         };
-
-        // Branch resolution:
-        //   - Admin with a branch pin (Sub Admin making a manual booking) → their pin.
-        //   - Customer booking a table → derive from the selected table's branch
-        //     so the booking shows up on that branch's admin tab.
-        //   - Otherwise (hall booking by customer, or data with no branch
-        //     context) → null (tenant-level, visible to tenant owner only).
-        let bookingBranch = pinnedBranchId(req) || null;
-        if (!bookingBranch && bookingType === 'table' && (selectedTableIds || []).length > 0) {
-            const firstTableId = (selectedTableIds || []).find(id => mongoose.Types.ObjectId.isValid(id));
-            if (firstTableId) {
-                const tbl = await Table.findOne({ _id: firstTableId, ...tf }).select('branch');
-                if (tbl && tbl.branch) bookingBranch = tbl.branch;
-            }
-        }
 
         // 3. Map Frontend Data to AdvanceBooking Model
         const newBooking = new AdvanceBooking({
@@ -525,12 +611,19 @@ const createAdvanceBooking = async (req, res) => {
                 otherAddons: price.lines.addons,
                 isSkipped: !selectedDecor && (!selectedAddons || selectedAddons.length === 0)
             },
-            parkingDetails: {
-                vehicleType: selectedVehicle,
-                count: parseInt(vehicleCount) || 0,
-                timeDuration: req.body.parkingDuration ? `${req.body.parkingDuration}hrs` : '2hrs',
-                isSkipped: parkingSkipped || !selectedVehicle
-            },
+            // Multi-vehicle parking (QA N10/N11) — rows, rates and hours
+            // as priced by utils/parkingConfig. `vehicleType` / `count`
+            // stay populated (first type / total vehicles) for older
+            // readers of the single-type shape.
+            parkingDetails: price.lines.parking ? {
+                vehicleType: price.lines.parking.vehicles[0].vehicleType,
+                count: price.lines.parking.vehicles.reduce((s, v) => s + v.count, 0),
+                timeDuration: `${price.lines.parking.hours}hrs`,
+                vehicles: price.lines.parking.vehicles,
+                mode: price.lines.parking.mode,
+                startTime: price.lines.parking.startTime,
+                isSkipped: false,
+            } : { count: 0, isSkipped: true },
             payment: {
                 totalAmount: price.total,
                 // Only a server-verified payment moves these (bug #9).
@@ -538,7 +631,8 @@ const createAdvanceBooking = async (req, res) => {
                 method: paymentMethod || 'cash',
                 status: paymentOutcome.status,
                 couponCode: couponCode || null,
-                walletPointsUsed: numericWalletPoints,
+                // Points actually spent (≤ requested), not the request.
+                walletPointsUsed: pointsToDeduct,
                 razorpayPaymentId: verifiedPayment?.paymentId || null,
                 razorpayOrderId: verifiedPayment?.orderId || null,
                 priceBreakdown: price.breakdown,
@@ -546,16 +640,83 @@ const createAdvanceBooking = async (req, res) => {
             notes: `Booking for ${selectedEventName || 'General'} via Website`
         });
 
+        // Coupon consumption — the discount was priced in, so the coupon is
+        // spent now: atomically bump usageCount (respecting usageLimit at
+        // this moment, as orderCreateService does) and log a
+        // CouponRedemption row so usagePerUser holds for the next booking.
+        let couponConsumed = null; // { couponId, redemptionId }
+        const releaseCoupon = async () => {
+            if (!couponConsumed) return;
+            try {
+                if (couponConsumed.redemptionId) await CouponRedemption.deleteOne({ _id: couponConsumed.redemptionId, ...tf });
+                await Coupon.updateOne({ _id: couponConsumed.couponId, usageCount: { $gt: 0 }, ...tf }, { $inc: { usageCount: -1 } });
+            } catch (rbErr) {
+                logger.error('Advance booking: coupon rollback failed', { couponId: String(couponConsumed.couponId), error: rbErr.message });
+            }
+            couponConsumed = null;
+        };
+        if (price.coupon && price.breakdown.discount > 0) {
+            const coupon = await Coupon.findOneAndUpdate(
+                {
+                    _id: price.coupon._id,
+                    isActive: true,
+                    ...tf,
+                    $or: [
+                        { usageLimit: { $lte: 0 } },          // unlimited
+                        { $expr: { $lt: ['$usageCount', '$usageLimit'] } },
+                    ],
+                },
+                { $inc: { usageCount: 1 } },
+                { returnDocument: 'after' }
+            );
+            if (!coupon) {
+                await releasePaymentClaim();
+                return res.status(409).json({
+                    success: false,
+                    code: 'COUPON_UNAVAILABLE',
+                    message: 'This coupon has reached its usage limit or is no longer active. Please remove it and try again.',
+                });
+            }
+            couponConsumed = { couponId: coupon._id, redemptionId: null };
+            const redemption = await CouponRedemption.create({
+                coupon: coupon._id,
+                couponCode: coupon.code,
+                couponTitle: coupon.title,
+                user: userId,
+                restaurant: tenantId(req),
+                branch: coupon.branch || null,
+                orderValue: price.subtotal,
+                discountAmount: price.breakdown.discount,
+                discountType: coupon.discountType,
+                discountValue: coupon.discountValue,
+            });
+            couponConsumed.redemptionId = redemption._id;
+            // Per-customer limit re-checked after our own row is written so
+            // two concurrent bookings cannot both slip under it.
+            if (Number(coupon.usagePerUser) > 0) {
+                const used = await CouponRedemption.countDocuments({ coupon: coupon._id, user: userId, ...tf });
+                if (used > coupon.usagePerUser) {
+                    await releaseCoupon();
+                    await releasePaymentClaim();
+                    return res.status(409).json({
+                        success: false,
+                        code: 'COUPON_USER_LIMIT',
+                        message: `You can only use this coupon ${coupon.usagePerUser} time${coupon.usagePerUser > 1 ? 's' : ''}.`,
+                    });
+                }
+            }
+        }
+
         // Wallet was already validated above (walletForDeduction)
-        if (numericWalletPoints > 0 && walletForDeduction) {
-            const pointsBefore = walletForDeduction.loyaltyPoints;
+        if (pointsToDeduct > 0 && walletForDeduction) {
             // Atomic deduction to prevent race conditions (per-tenant)
             const updated = await Wallet.findOneAndUpdate(
-                { user: userId, loyaltyPoints: { $gte: numericWalletPoints }, ...tf },
-                { $inc: { loyaltyPoints: -numericWalletPoints } },
+                { user: userId, loyaltyPoints: { $gte: pointsToDeduct }, ...tf },
+                { $inc: { loyaltyPoints: -pointsToDeduct } },
                 { returnDocument: 'after' }
             );
             if (!updated) {
+                await releaseCoupon();
                 await releasePaymentClaim();
                 return res.status(400).json({ success: false, message: 'Wallet points changed. Please try again.' });
             }
@@ -566,11 +727,11 @@ const createAdvanceBooking = async (req, res) => {
                 restaurant: tenantId(req),
                 branch: bookingBranch,
                 type: 'points_redeemed',
-                amount: -numericWalletPoints, // Debit
+                amount: -pointsToDeduct, // Debit
                 paymentMethod: 'points',
                 description: `Points redeemed for booking ${bookingType}`,
                 transactionId: idGen.transactionId(),
-                balanceBefore: pointsBefore,
+                balanceBefore: updated.loyaltyPoints + pointsToDeduct,
                 balanceAfter: updated.loyaltyPoints,
                 status: 'completed'
             });
@@ -587,9 +748,10 @@ const createAdvanceBooking = async (req, res) => {
             // Undo the side effects so the customer can retry (or get an
             // orphan refund) instead of losing points / a spent payment.
             await releasePaymentClaim();
-            if (numericWalletPoints > 0 && walletForDeduction) {
+            await releaseCoupon();
+            if (pointsToDeduct > 0 && walletForDeduction) {
                 try {
-                    await Wallet.findOneAndUpdate({ user: userId, ...tf }, { $inc: { loyaltyPoints: numericWalletPoints } });
+                    await Wallet.findOneAndUpdate({ user: userId, ...tf }, { $inc: { loyaltyPoints: pointsToDeduct } });
                 } catch (rbErr) {
                     logger.error('Advance booking: points rollback failed', { userId: String(userId), error: rbErr.message });
                 }
@@ -784,24 +946,29 @@ const updateBookingDetails = async (req, res) => {
         const { cakes, addons, parking, discount } = req.body;
         const edit = { cakes, addons, parking, discount };
 
-        // Parking rate for the booking's vehicle type — same source as
-        // loadBookingPrice (tenant settings, else the default table).
+        // Per-type parking rates — same source as loadBookingPrice
+        // (Settings.reservation.parking, else the default table).
         let parkingRate = 0;
-        const vehicleType = booking.parkingDetails?.vehicleType;
-        if (parking !== undefined && vehicleType && booking.bookingType !== 'hall') {
-            const Settings = require('../models/settings');
-            const settings = await Settings.findOne(tenantFilter(req)).select('parking').lean();
-            const vehicles = settings?.parking?.vehicles;
-            parkingRate = Array.isArray(vehicles) && vehicles.length > 0
-                ? Number(vehicles.find((v) => v.id === vehicleType)?.pricePerHour) || 0
-                : Number(DEFAULT_PARKING_RATES[vehicleType]) || 0;
-            const maxHours = Number(settings?.parking?.maxDuration) || 24;
+        let parkingRates = null;
+        if (parking !== undefined && booking.bookingType !== 'hall') {
+            const config = await loadParkingConfig(tenantFilter(req));
+            parkingRates = Object.fromEntries(config.vehicles.map((v) => [v.id, v.pricePerHour]));
+            const vehicleType = normalizeParkingDetails(booking.parkingDetails || {})?.vehicles?.[0]?.vehicleType;
+            parkingRate = vehicleType ? (Number(parkingRates[vehicleType]) || 0) : 0;
+            const unknown = (Array.isArray(parking.vehicles) ? parking.vehicles : [])
+                .map((v) => String(v?.vehicleType || '').trim().toLowerCase())
+                .filter((t) => t && parkingRates[t] === undefined);
+            if (unknown.length) {
+                return res.status(400).json({ success: false, message: `Parking is not available for vehicle type "${unknown[0]}"` });
+            }
+            // Staff may book longer than the customer-facing maximum.
+            const maxHours = Math.max(24, config.maxDuration);
             if (Number(parking.hours) > maxHours) {
                 return res.status(400).json({ success: false, message: `Parking hours cannot exceed ${maxHours}` });
             }
         }
 
-        const result = applyBookingDetailsEdit({ booking, edit, parkingRate });
+        const result = applyBookingDetailsEdit({ booking, edit, parkingRate, parkingRates });
         const update = { $set: result.set };
         // Audit trail next to the original catalog price lines.
         update.$push = {
@@ -869,7 +1036,7 @@ const getMyBookings = async (req, res) => {
             specialEvent: b.specialEvent,
             cakeDetails: b.cakeDetails,
             addons: b.addons,
-            parkingDetails: b.parkingDetails,
+            parkingDetails: normalizeParkingDetails(b.parkingDetails),
             payment: b.payment,
             notes: b.notes,
             createdAt: b.createdAt,
@@ -1190,9 +1357,9 @@ const cancelMyBooking = async (req, res) => {
             return res.status(400).json({ success: false, code: 'BOOKING_COMPLETED', message: 'Completed bookings cannot be cancelled.' });
         }
 
-        // Hours until the event. Negative = event already passed.
-        const eventTime = new Date(booking.bookingDate);
-        const hoursUntil = (eventTime - Date.now()) / (1000 * 60 * 60);
+        // Hours until the event START (booking date + start time in the
+        // tenant timezone). Negative = event already started.
+        const hoursUntil = await hoursUntilEvent(req, booking);
 
         // Refund tier from policy.
         const advancePaid = Number(booking.payment?.advancePaid || 0);
@@ -1276,7 +1443,7 @@ const previewCancellation = async (req, res) => {
         if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
 
         const advancePaid = Number(booking.payment?.advancePaid || 0);
-        const hoursUntil = (new Date(booking.bookingDate) - Date.now()) / (1000 * 60 * 60);
+        const hoursUntil = await hoursUntilEvent(req, booking);
         let refundPct = 0;
         let refundTierLabel = 'Non-refundable (< 24h)';
         if (hoursUntil >= 48) { refundPct = 100; refundTierLabel = 'Full refund (≥ 48h notice)'; }

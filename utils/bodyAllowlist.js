@@ -40,7 +40,7 @@ const MENU_ITEM_FIELDS = Object.freeze([
 // POST /categories + PUT /categories/:id — AddCategoryModal
 // { name, displayOrder, image, showOnKiosk } and the status toggle.
 const CATEGORY_FIELDS = Object.freeze([
-    'name', 'displayOrder', 'image', 'status', 'showOnKiosk', 'branch',
+    'name', 'displayOrder', 'image', 'status', 'showOnKiosk', 'branch', 'kind',
 ]);
 
 // PUT /branches/:id — Branches.jsx edit form. isActive is NOT here:

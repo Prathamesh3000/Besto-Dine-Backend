@@ -131,8 +131,11 @@ describe('discounts, tips and delivery', () => {
             subtotal: 1000, taxConfig, orderType: 'takeaway',
             couponDiscount: 100, pointsRedeemed: 50, tipAmount: 30, deliveryFee: 40,
         });
-        // 1000 + 100 gst - 100 - 50 + 30 + 40
-        expect(b.total).toBe(1020);
+        // GST is on the post-coupon value: 10% of (1000 − 100) = 90.
+        // Points are a payment method and do not reduce the GST base.
+        // 1000 + 90 gst - 100 - 50 + 30 + 40 = 1010
+        expect(b.gst).toBe(90);
+        expect(b.total).toBe(1010);
     });
 
     test('a bill can never go negative', () => {
@@ -156,5 +159,40 @@ describe('rounding', () => {
         const b = computeBill({ subtotal: undefined, taxConfig: {}, orderType: 'dine-in' });
         expect(b.total).toBe(0);
         expect(Number.isNaN(b.gst)).toBe(false);
+    });
+});
+
+describe('GST after the coupon discount (pricing decision)', () => {
+    const taxConfig = toTaxConfig({ gst: { enabled: true, value: 5 } });
+
+    test('₹1000 food, 5% GST, ₹100 coupon → GST ₹45, total ₹945', () => {
+        const b = computeBill({ subtotal: 1000, taxConfig, orderType: 'takeaway', couponDiscount: 100 });
+        // 5% of (1000 − 100) = 45; 1000 + 45 − 100 = 945
+        expect(b.gst).toBe(45);
+        expect(b.total).toBe(945);
+    });
+
+    test('service and additional charges stay on the gross subtotal', () => {
+        const cfg = toTaxConfig({
+            gst: { enabled: true, value: 5 },
+            serviceCharge: { enabled: true, value: 10 },
+            additionalCharges: [{ name: 'Green Tax', type: 'Percentage', value: 2 }],
+        });
+        const b = computeBill({ subtotal: 1000, taxConfig: cfg, orderType: 'dine-in', couponDiscount: 100 });
+        // gst 5% of 900 = 45; service 10% of 1000 = 100; green 2% of 1000 = 20
+        expect(b).toMatchObject({ gst: 45, serviceCharge: 100, additionalChargesTotal: 20 });
+        expect(b.total).toBe(1065); // 1000 + 45 + 100 + 20 − 100
+    });
+
+    test('loyalty points do not reduce the GST base', () => {
+        const b = computeBill({ subtotal: 1000, taxConfig, orderType: 'takeaway', pointsRedeemed: 100 });
+        expect(b.gst).toBe(50);
+        expect(b.total).toBe(950);
+    });
+
+    test('a coupon larger than the subtotal floors the GST base at 0', () => {
+        const b = computeBill({ subtotal: 200, taxConfig, orderType: 'takeaway', couponDiscount: 250 });
+        expect(b.gst).toBe(0);
+        expect(b.total).toBe(0);
     });
 });

@@ -227,6 +227,14 @@ describe('POST /public/register-restaurant → approval → login', () => {
         expect(res.body.field).toBe('contactPhone');
     });
 
+    test('QA N4: more than 10 digits after normalisation → 400 contactPhone', async () => {
+        for (const contactPhone of ['98765432101', '+91 98765-432101', '9876543210123']) {
+            const res = await signup(signupBody({ contactPhone }));
+            expect(res.status).toBe(400);
+            expect(res.body.field).toBe('contactPhone');
+        }
+    });
+
     test('private / inactive / unknown planId → 400 INVALID_PLAN', async () => {
         for (const planId of [String(plans.privateDeal._id), String(plans.retired._id), 'nope']) {
             const res = await signup(signupBody({ planId }));

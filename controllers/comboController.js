@@ -3,6 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const Combo = require('../models/combo');
 const MenuItem = require('../models/menuItem');
+const Branch = require('../models/branch');
+const { isStaffCaller } = require('../utils/menuAvailability');
 const logger = require('../utils/logger');
 const { parseCsv } = require('../utils/csvParser');
 const { pickDishImage, isDeadImage } = require('../utils/dishImagePicker');
@@ -46,6 +48,66 @@ function comboBranchFilter(req) {
     return {};
 }
 
+// Client-writable combo fields. restaurant / branch are stamped by the
+// handler, savings is derived by the pre-save hook (or recomputed on
+// update), and counters are never taken from the body.
+const COMBO_FIELDS = [
+    'name', 'serveUpto', 'description', 'images', 'vegType', 'isSpecial',
+    'categories', 'price', 'originalPrice', 'discount', 'discountType',
+    'unlimitedQuantity', 'taxApplicable', 'serviceCharge', 'availableDays',
+    'startTime', 'endTime', 'isHealthy', 'status',
+];
+function pickComboFields(body = {}) {
+    const out = {};
+    for (const k of COMBO_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(body, k)) out[k] = body[k];
+    }
+    return out;
+}
+
+/**
+ * Validate the bundled items: every menuItemId must be a menu item of
+ * this tenant (and, for a pinned Branch Admin, one their branch can
+ * see). Name / price / veg flag of linked items are taken from the real
+ * menu item, not the client. Items without a menuItemId are free-text.
+ * Returns { ok, categories } or { ok:false, message }.
+ */
+async function resolveComboCategories(req, categories) {
+    if (categories === undefined) return { ok: true, categories: undefined };
+    if (!Array.isArray(categories)) return { ok: false, message: 'categories must be an array' };
+    const pinned = pinnedBranchId(req);
+    const out = [];
+    for (const cat of categories) {
+        if (!cat || typeof cat !== 'object') return { ok: false, message: 'Invalid combo category' };
+        if (cat.items !== undefined && !Array.isArray(cat.items)) {
+            return { ok: false, message: 'Combo category items must be an array' };
+        }
+        const items = [];
+        for (const it of cat.items || []) {
+            if (!it || typeof it !== 'object') return { ok: false, message: 'Invalid combo item' };
+            if (it.menuItemId == null || it.menuItemId === '') {
+                items.push({ name: it.name, price: it.price, isVeg: it.isVeg });
+                continue;
+            }
+            if (!mongoose.isValidObjectId(it.menuItemId)) {
+                return { ok: false, message: 'Invalid menu item in combo' };
+            }
+            const filter = { _id: it.menuItemId, ...tenantFilter(req) };
+            if (pinned) filter.$or = [{ branch: pinned }, { branch: null }, { 'branchPrices.branch': pinned }];
+            const mi = await MenuItem.findOne(filter).select('name basePrice finalPrice vegType').lean();
+            if (!mi) return { ok: false, message: 'Combo item not found in your menu' };
+            items.push({
+                menuItemId: mi._id,
+                name: mi.name,
+                price: mi.finalPrice != null ? mi.finalPrice : (mi.basePrice || 0),
+                isVeg: mi.vegType === 'veg',
+            });
+        }
+        out.push({ name: cat.name, items });
+    }
+    return { ok: true, categories: out };
+}
+
 // Escape special regex characters to prevent ReDoS
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -66,8 +128,12 @@ exports.getCombos = async (req, res) => {
             queryObj.name = { $regex: escapeRegex(search), $options: 'i' };
         }
 
-        // Filtering by Status
-        if (status && status !== 'All Status' && status !== 'Select Status') {
+        // Filtering by Status. Customers / anonymous callers only ever
+        // see active combos (drafts and auto-archived combos stay hidden,
+        // same default as /menu); staff may filter freely.
+        if (!isStaffCaller(req)) {
+            queryObj.status = 'active';
+        } else if (status && status !== 'All Status' && status !== 'Select Status') {
             queryObj.status = status.toLowerCase();
         }
 
@@ -165,9 +231,21 @@ exports.createCombo = async (req, res) => {
         // creates at their own branch; tenant owner may pass body.branch
         // explicitly or leave it null for tenant-level / Main).
         const pinned = pinnedBranchId(req);
-        const ownerBranch = pinned || req.body.branch || null;
+        let ownerBranch = pinned || req.body.branch || null;
+        if (!pinned && ownerBranch) {
+            if (!mongoose.isValidObjectId(ownerBranch)
+                || !(await Branch.exists({ _id: ownerBranch, ...tenantFilter(req), isActive: true }))) {
+                return res.status(400).json({ success: false, message: 'Branch not found or not part of your restaurant' });
+            }
+        }
+        const resolved = await resolveComboCategories(req, req.body.categories);
+        if (!resolved.ok) {
+            return res.status(400).json({ success: false, message: resolved.message });
+        }
+        const fields = pickComboFields(req.body);
+        if (resolved.categories !== undefined) fields.categories = resolved.categories;
         const combo = await Combo.create({
-            ...req.body,
+            ...fields,
             restaurant: tenantId(req),
             branch: ownerBranch,
         });
@@ -188,11 +266,22 @@ exports.createCombo = async (req, res) => {
 // @access  Private/Admin
 exports.updateCombo = async (req, res) => {
     try {
-        const updateData = { ...req.body };
-        // Never let the body re-tenant the doc, and don't let a pinned
-        // admin re-assign a combo to a different branch.
-        delete updateData.restaurant;
-        if (pinnedBranchId(req)) delete updateData.branch;
+        // Allowlisted fields only — never re-tenant the doc or write
+        // counters; a pinned admin cannot re-assign the branch.
+        const updateData = pickComboFields(req.body);
+        if (!pinnedBranchId(req) && Object.prototype.hasOwnProperty.call(req.body, 'branch')) {
+            const b = req.body.branch || null;
+            if (b && (!mongoose.isValidObjectId(b)
+                || !(await Branch.exists({ _id: b, ...tenantFilter(req), isActive: true })))) {
+                return res.status(400).json({ success: false, message: 'Branch not found or not part of your restaurant' });
+            }
+            updateData.branch = b;
+        }
+        const resolved = await resolveComboCategories(req, req.body.categories);
+        if (!resolved.ok) {
+            return res.status(400).json({ success: false, message: resolved.message });
+        }
+        if (resolved.categories !== undefined) updateData.categories = resolved.categories;
 
         const scope = { _id: req.params.id, ...tenantFilter(req), ...strictBranchFilter(req) };
 

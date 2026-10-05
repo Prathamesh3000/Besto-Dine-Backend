@@ -6,6 +6,21 @@ const { tenantFilter, analyticsBranchFilter } = require('../utils/tenantScope');
 const { devError } = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 
+// Day / hour buckets use the tenant's own timezone (Restaurant.timezone,
+// "used for daily reports") — the same zone /telemetry/reports uses —
+// falling back to ANALYTICS_TIMEZONE / Asia/Kolkata.
+const DEFAULT_REPORT_TZ = process.env.ANALYTICS_TIMEZONE || 'Asia/Kolkata';
+function reportTz(req) {
+    const tz = typeof req?.restaurant?.timezone === 'string' ? req.restaurant.timezone.trim() : '';
+    if (!tz) return DEFAULT_REPORT_TZ;
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: tz });
+        return tz;
+    } catch {
+        return DEFAULT_REPORT_TZ;
+    }
+}
+
 // @desc    Get 30-Day Sales Data (Chart-ready)
 // @route   GET /api/analytics/sales-history
 // @access  Private/Admin
@@ -33,7 +48,7 @@ exports.getSalesHistory = asyncHandler(async (req, res) => {
         },
         {
             $group: {
-                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: reportTz(req) } },
                 total: { $sum: "$total" },
                 count: { $sum: 1 }
             }
@@ -52,7 +67,7 @@ exports.getPeakHours = asyncHandler(async (req, res) => {
         { $match: { status: { $ne: 'cancelled' }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
         {
             $group: {
-                _id: { $hour: "$createdAt" },
+                _id: { $hour: { date: "$createdAt", timezone: reportTz(req) } },
                 count: { $sum: 1 }
             }
         },
@@ -66,8 +81,10 @@ exports.getPeakHours = asyncHandler(async (req, res) => {
 // @route   GET /api/analytics/top-items
 // @access  Private/Admin
 exports.getTopItems = asyncHandler(async (req, res) => {
+    // Sold = not cancelled and not fully refunded (the money went back;
+    // /analytics/summary excludes the same orders).
     const topItems = await Order.aggregate([
-        { $match: { status: { $ne: 'cancelled' }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
+        { $match: { status: { $ne: 'cancelled' }, paymentStatus: { $ne: 'Refunded' }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
         { $unwind: "$items" },
         {
             $group: {

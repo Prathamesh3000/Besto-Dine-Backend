@@ -21,6 +21,10 @@ const ALLOWED_CATEGORIES = [
 ];
 const ALLOWED_UNITS = ['kg', 'g', 'L', 'mL', 'pcs', 'dozen', 'box', 'pack', 'bottle', 'can'];
 
+// Stock quantities are rounded to 3 decimals on every write (see
+// models/inventory.js roundQty) so float drift never refuses real stock.
+const { roundQty } = Inventory;
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -378,7 +382,8 @@ exports.getSummary = async (req, res) => {
                 {
                     $match: {
                         'adjustmentHistory.date': { $gte: startOfToday },
-                        'adjustmentHistory.type': { $in: ['usage', 'waste'] },
+                        // 'return' = cancelled-order stock given back; netted out of usage below.
+                        'adjustmentHistory.type': { $in: ['usage', 'waste', 'return'] },
                     },
                 },
                 {
@@ -394,9 +399,14 @@ exports.getSummary = async (req, res) => {
 
         const stats = summaryResult[0] || { totalItems: 0, lowStock: 0, outOfStock: 0, totalValue: 0 };
         const today = { usage: { value: 0, count: 0 }, waste: { value: 0, count: 0 } };
+        let returnedValue = 0;
         (todayResult || []).forEach(r => {
-            if (today[r._id]) today[r._id] = { value: Math.round(r.value * 100) / 100, count: r.count };
+            if (r._id === 'return') returnedValue = r.value;
+            else if (today[r._id]) today[r._id] = { value: Math.round(r.value * 100) / 100, count: r.count };
         });
+        if (returnedValue) {
+            today.usage.value = Math.max(0, Math.round((today.usage.value - returnedValue) * 100) / 100);
+        }
         const categoryBreakdown = {};
         categoryResult.forEach(cat => {
             categoryBreakdown[cat._id] = { count: cat.count, value: Math.round(cat.value * 100) / 100 };
@@ -521,6 +531,11 @@ exports.createItem = async (req, res) => {
         const { name, category, unit, currentStock, minStock, maxStock, costPerUnit, supplier, expiryDate, branch, expiryTracking, shelfLifeDays } = req.body;
 
         const validationErrors = validateItemFields({ name, minStock, maxStock, costPerUnit, currentStock, expiryDate, shelfLifeDays }, true);
+        // Required + enum checks up front → 400 (these used to surface as a
+        // 500 from a TypeError on name.trim() or a Mongoose ValidationError).
+        if (typeof name !== 'string') validationErrors.unshift('Item name is required');
+        if (!ALLOWED_CATEGORIES.includes(category)) validationErrors.push(`category must be one of: ${ALLOWED_CATEGORIES.join(', ')}`);
+        if (!ALLOWED_UNITS.includes(unit)) validationErrors.push(`unit must be one of: ${ALLOWED_UNITS.join(', ')}`);
         if (validationErrors.length > 0) {
             return res.status(400).json({ success: false, message: validationErrors[0], errors: validationErrors });
         }
@@ -545,7 +560,7 @@ exports.createItem = async (req, res) => {
         }
 
         const itemId = await generateNextId(req);
-        const stockQty = Number(currentStock) || 0;
+        const stockQty = roundQty(Number(currentStock) || 0);
 
         const item = new Inventory({
             itemId,
@@ -580,6 +595,7 @@ exports.createItem = async (req, res) => {
         if (error.code === 11000) {
             return res.status(400).json({ success: false, message: 'Duplicate item ID — please try again' });
         }
+        if (error.name === 'ValidationError' || error.name === 'CastError') return res.status(400).json({ success: false, message: error.message });
         res.status(500).json({ success: false, message: 'Failed to create inventory item', ...devError(error) });
     }
 };
@@ -714,7 +730,7 @@ exports.importItemsCsv = async (req, res) => {
                 }
 
                 const currentStockRaw = get('currentStock');
-                const currentStock = currentStockRaw === '' ? 0 : Number(currentStockRaw);
+                const currentStock = currentStockRaw === '' ? 0 : roundQty(Number(currentStockRaw));
                 if (!Number.isFinite(currentStock) || currentStock < 0) {
                     throw new Error('currentStock must be a non-negative number');
                 }
@@ -832,12 +848,16 @@ exports.updateItem = async (req, res) => {
         const { name, category, unit, minStock, maxStock, costPerUnit, supplier, expiryDate, branch, expiryTracking, shelfLifeDays } = req.body;
 
         const validationErrors = validateItemFields({ name, minStock, maxStock, costPerUnit, expiryDate, shelfLifeDays });
+        if (category !== undefined && !ALLOWED_CATEGORIES.includes(category)) validationErrors.push(`category must be one of: ${ALLOWED_CATEGORIES.join(', ')}`);
+        if (unit !== undefined && !ALLOWED_UNITS.includes(unit)) validationErrors.push(`unit must be one of: ${ALLOWED_UNITS.join(', ')}`);
         if (validationErrors.length > 0) {
             return res.status(400).json({ success: false, message: validationErrors[0], errors: validationErrors });
         }
 
         const tf = tenantFilter(req);
-        const item = await Inventory.findOne({ _id: req.params.id, ...tf });
+        // Same branch scope as the read path — a branch-pinned Sub Admin
+        // cannot edit another branch's item by id.
+        const item = await Inventory.findOne({ _id: req.params.id, ...tf, ...branchFilter(req) });
         if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found' });
 
         if (name && name.trim().toLowerCase() !== item.name.toLowerCase()) {
@@ -889,6 +909,7 @@ exports.updateItem = async (req, res) => {
 
         res.status(200).json({ success: true, item });
     } catch (error) {
+        if (error.name === 'ValidationError' || error.name === 'CastError') return res.status(400).json({ success: false, message: error.message });
         res.status(500).json({ success: false, message: 'Failed to update item', ...devError(error) });
     }
 };
@@ -902,7 +923,7 @@ exports.adjustStock = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Type and quantity are required' });
         }
 
-        const qty = Number(quantity);
+        const qty = roundQty(Number(quantity));
         if (!['restock', 'usage', 'waste', 'correction', 'return', 'order-deduction'].includes(type)) {
             return res.status(400).json({ success: false, message: 'Invalid adjustment type' });
         }
@@ -922,14 +943,16 @@ exports.adjustStock = async (req, res) => {
         }
 
         const tf = tenantFilter(req);
-        const item = await Inventory.findOne({ _id: req.params.id, ...tf });
+        // Branch scope as on the read path: a pinned Sub Admin cannot move
+        // another branch's stock by id.
+        const item = await Inventory.findOne({ _id: req.params.id, ...tf, ...branchFilter(req) });
         if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found' });
 
         const previousStock = item.currentStock;
         let newStock;
 
         if (type === 'restock' || type === 'return') {
-            newStock = previousStock + qty;
+            newStock = roundQty(previousStock + qty);
             if (item.maxStock > 0 && newStock > item.maxStock) {
                 return res.status(400).json({
                     success: false,
@@ -937,7 +960,7 @@ exports.adjustStock = async (req, res) => {
                 });
             }
         } else if (type === 'usage' || type === 'waste' || type === 'order-deduction') {
-            newStock = previousStock - qty;
+            newStock = roundQty(previousStock - qty);
             if (newStock < 0) {
                 return res.status(400).json({
                     success: false,
@@ -954,6 +977,7 @@ exports.adjustStock = async (req, res) => {
             }
         }
 
+        newStock = roundQty(newStock);
         const historyEntry = {
             type: type === 'order-deduction' ? 'usage' : type,
             quantity: qty,
@@ -1030,7 +1054,7 @@ exports.adjustStock = async (req, res) => {
 exports.deleteItem = async (req, res) => {
     try {
         const tf = tenantFilter(req);
-        const item = await Inventory.findOneAndDelete({ _id: req.params.id, ...tf });
+        const item = await Inventory.findOneAndDelete({ _id: req.params.id, ...tf, ...branchFilter(req) });
         if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found' });
         // Also clean up any recipe references
         await Recipe.updateMany(
@@ -1138,6 +1162,11 @@ exports.saveRecipe = async (req, res) => {
         if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
             return res.status(400).json({ success: false, message: 'At least one ingredient is required' });
         }
+        // Out-of-enum unit → 400 here (used to 500 from the schema enum).
+        const badUnit = ingredients.find(i => i && !ALLOWED_UNITS.includes(i.unit));
+        if (badUnit) {
+            return res.status(400).json({ success: false, message: `Ingredient unit must be one of: ${ALLOWED_UNITS.join(', ')}` });
+        }
 
         // Verify menu item belongs to this tenant
         const menuItem = await MenuItem.findOne({ _id: menuItemId, ...tf });
@@ -1190,6 +1219,7 @@ exports.saveRecipe = async (req, res) => {
         if (error.code === 11000) {
             return res.status(400).json({ success: false, message: 'Recipe already exists for this menu item' });
         }
+        if (error.name === 'ValidationError' || error.name === 'CastError') return res.status(400).json({ success: false, message: error.message });
         res.status(500).json({ success: false, message: 'Failed to save recipe', ...devError(error) });
     }
 };
@@ -1775,7 +1805,7 @@ exports.checkInventoryForOrder = async (items, restaurantId, branch = null) => {
             continue;
         }
 
-        if (inv.currentStock < totalNeeded) {
+        if (roundQty(inv.currentStock) < roundQty(totalNeeded)) {
             result.ok = false;
             result.shortages.push({
                 ingredient: invId,
@@ -1873,9 +1903,9 @@ exports.deductInventoryForOrder = async (order, restaurantId, userId = null) => 
                         continue;
                     }
 
-                    // Convert units if needed
-                    const needed = convertUnits(neededRaw, ing.unit, invItem.unit);
-                    if (needed === null) {
+                    // Convert units if needed (rounded to the stock precision)
+                    const converted = convertUnits(neededRaw, ing.unit, invItem.unit);
+                    if (converted === null) {
                         results.errors.push({
                             inventoryItem: invId,
                             name: invItem.name,
@@ -1883,35 +1913,78 @@ exports.deductInventoryForOrder = async (order, restaurantId, userId = null) => 
                         });
                         continue;
                     }
+                    const needed = roundQty(converted);
 
-                    const previousStock = invItem.currentStock;
-                    const newStock = Math.max(0, previousStock - needed);
-
-                    // Atomic deduction
-                    const updated = await Inventory.findOneAndUpdate(
-                        { _id: invId, restaurant: restaurantId, currentStock: { $gte: needed } },
-                        {
-                            $set: { currentStock: newStock },
-                            $push: {
-                                adjustmentHistory: {
-                                    $each: [{
-                                        type: 'usage',
-                                        quantity: Math.round(needed * 1000) / 1000,
-                                        previousStock,
-                                        newStock,
-                                        reason: `Auto: Order ${order.orderId} — ${orderItem.name || ''} ×${orderQty}`,
-                                        adjustedBy: userId,
-                                        date: new Date(),
-                                    }],
-                                    $slice: -200,
+                    // Atomic RELATIVE deduction ($inc guarded by $gte) — two
+                    // orders deducting the same ingredient concurrently both
+                    // land. When stock is short, take what is left with a
+                    // compare-and-set on the value read (retry if it moved).
+                    // Every row is tagged with the order so a cancel restores
+                    // exactly what was taken (see restoreInventoryForOrder).
+                    let outcome = null;
+                    for (let attempt = 0; attempt < 5 && !outcome; attempt++) {
+                        const inc = await Inventory.incStock(
+                            { _id: invId, restaurant: restaurantId, currentStock: { $gte: needed } },
+                            -needed
+                        );
+                        if (inc) { outcome = { kind: 'full', ...inc }; break; }
+                        const cur = await Inventory.findOne({ _id: invId, restaurant: restaurantId }).select('currentStock').lean();
+                        if (!cur) break;
+                        if (cur.currentStock >= needed) continue; // restocked meanwhile — retry the full deduction
+                        const had = roundQty(cur.currentStock);
+                        const taken = await Inventory.findOneAndUpdate(
+                            { _id: invId, restaurant: restaurantId, currentStock: cur.currentStock },
+                            {
+                                $set: { currentStock: 0, status: 'out-of-stock' },
+                                $push: {
+                                    adjustmentHistory: {
+                                        $each: [{
+                                            type: 'usage',
+                                            quantity: had,
+                                            previousStock: had,
+                                            newStock: 0,
+                                            reason: `Auto (partial): Order ${order.orderId} — needed ${needed} ${invItem.unit}, had ${had}`,
+                                            adjustedBy: userId,
+                                            order: order._id,
+                                            date: new Date(),
+                                        }],
+                                        $slice: -200,
+                                    },
                                 },
                             },
-                        },
-                        { returnDocument: 'after' }
-                    );
+                            { returnDocument: 'after' }
+                        );
+                        if (taken) outcome = { kind: 'partial', had };
+                    }
 
-                    if (updated) {
-                        const newStatus = computeStatus(updated.currentStock, updated.minStock);
+                    if (!outcome) {
+                        results.errors.push({ inventoryItem: invId, name: invItem.name, reason: 'Stock changed concurrently — not deducted' });
+                        continue;
+                    }
+
+                    if (outcome.kind === 'full') {
+                        const { previousStock, newStock, doc: updated } = outcome;
+                        await Inventory.updateOne(
+                            { _id: invId, restaurant: restaurantId },
+                            {
+                                $push: {
+                                    adjustmentHistory: {
+                                        $each: [{
+                                            type: 'usage',
+                                            quantity: needed,
+                                            previousStock,
+                                            newStock,
+                                            reason: `Auto: Order ${order.orderId} — ${orderItem.name || ''} ×${orderQty}`,
+                                            adjustedBy: userId,
+                                            order: order._id,
+                                            date: new Date(),
+                                        }],
+                                        $slice: -200,
+                                    },
+                                },
+                            }
+                        );
+                        const newStatus = computeStatus(newStock, updated.minStock);
                         if (updated.status !== newStatus) {
                             // R-10: tenant-scope the status sync. `restaurantId` is the
                             // function parameter passed by the caller (orderController),
@@ -1926,7 +1999,7 @@ exports.deductInventoryForOrder = async (order, restaurantId, userId = null) => 
                         results.deducted.push({
                             inventoryItem: invId,
                             name: invItem.name,
-                            deducted: Math.round(needed * 1000) / 1000,
+                            deducted: needed,
                             unit: invItem.unit,
                             remaining: newStock,
                             status: newStatus,
@@ -1946,28 +2019,6 @@ exports.deductInventoryForOrder = async (order, restaurantId, userId = null) => 
                             trigger: `Order ${order.orderId}`,
                         });
                     } else {
-                        // Insufficient stock — deduct what's available
-                        const fallback = await Inventory.findOneAndUpdate(
-                            { _id: invId, restaurant: restaurantId },
-                            {
-                                $set: { currentStock: 0, status: 'out-of-stock' },
-                                $push: {
-                                    adjustmentHistory: {
-                                        $each: [{
-                                            type: 'usage',
-                                            quantity: previousStock,
-                                            previousStock,
-                                            newStock: 0,
-                                            reason: `Auto (partial): Order ${order.orderId} — needed ${Math.round(needed * 1000) / 1000} ${invItem.unit}, had ${previousStock}`,
-                                            adjustedBy: userId,
-                                            date: new Date(),
-                                        }],
-                                        $slice: -200,
-                                    },
-                                },
-                            },
-                            { returnDocument: 'after' }
-                        );
                         // The partial path forces newStock=0, so the item
                         // is definitely out-of-stock now. Notify regardless
                         // of the prior status — this is a real shortage
@@ -1983,7 +2034,7 @@ exports.deductInventoryForOrder = async (order, restaurantId, userId = null) => 
                         results.errors.push({
                             inventoryItem: invId,
                             name: invItem.name,
-                            reason: `Insufficient: needed ${Math.round(needed * 1000) / 1000} ${invItem.unit}, had ${previousStock}`,
+                            reason: `Insufficient: needed ${needed} ${invItem.unit}, had ${outcome.had}`,
                         });
                     }
                 } catch (err) {
@@ -2004,14 +2055,17 @@ exports.deductInventoryForOrder = async (order, restaurantId, userId = null) => 
  * in-progress order is cancelled so the kitchen doesn't lose stock for
  * food that was never actually made / sold.
  *
- * Uses the same recipe × yield × quantity math as the deduction path.
+ * Restores exactly what the deduction TOOK: deductInventoryForOrder tags
+ * each 'usage' row with the order id, and those rows (net of earlier
+ * 'return' rows for the same order) cap what is added back — so a
+ * partial deduction (only 0.1 of 0.3 kg was there) restores 0.1, not
+ * 0.3. The recipe walk is kept for per-line reasons; any recorded amount
+ * the current recipe no longer lists is restored at the end. Orders
+ * deducted before rows were tagged fall back to recipe × quantity.
  * Writes a `type: 'return'` adjustmentHistory entry (not `restock`) so
  * the analytics tab doesn't treat a cancel as a supplier delivery.
  *
- * Safe to call even if `order.inventoryDeducted` is false (no-op) or
- * if some ingredient's recipe was since edited (it'll restore whatever
- * the current recipe says — which is the best we can do without
- * storing a frozen snapshot on the order).
+ * Safe to call even if `order.inventoryDeducted` is false (no-op).
  */
 exports.restoreInventoryForOrder = async (order, restaurantId, userId = null) => {
     const results = { restored: [], errors: [], skipped: [] };
@@ -2029,19 +2083,114 @@ exports.restoreInventoryForOrder = async (order, restaurantId, userId = null) =>
             return results;
         }
 
+        // What this order's deduction actually took, per inventory item.
+        // null → no tagged rows (legacy order): fall back to the recipe.
+        const tagged = await Inventory.find({ restaurant: restaurantId, 'adjustmentHistory.order': order._id })
+            .select('adjustmentHistory.order adjustmentHistory.type adjustmentHistory.quantity')
+            .lean();
+        const recorded = tagged.length ? {} : null;
+        for (const inv of tagged) {
+            let net = 0;
+            for (const h of inv.adjustmentHistory || []) {
+                if (!h.order || String(h.order) !== String(order._id)) continue;
+                if (h.type === 'usage') net += h.quantity || 0;
+                else if (h.type === 'return') net -= h.quantity || 0;
+            }
+            recorded[String(inv._id)] = roundQty(net);
+        }
+
+        const restoreOne = async (invItem, wanted, reason) => {
+            const invId = invItem._id;
+            const key = String(invId);
+            let amount = wanted;
+            if (recorded) {
+                const left = recorded[key] || 0;
+                amount = Math.min(amount, left);
+                recorded[key] = roundQty(left - amount);
+            }
+            amount = roundQty(amount);
+            if (amount <= 0) {
+                results.skipped.push({ inventoryItem: invId, name: invItem.name, reason: 'Nothing deducted for this order' });
+                return;
+            }
+
+            // Capped at maxStock to avoid restoring above the ceiling (e.g.
+            // someone adjusted the max down after deduction). Relative $inc;
+            // with a cap, guarded by the value the cap was computed from.
+            let cur = invItem;
+            let inc = null;
+            let give = 0;
+            for (let attempt = 0; attempt < 5 && cur; attempt++) {
+                const cap = cur.maxStock > 0 ? cur.maxStock : Number.POSITIVE_INFINITY;
+                give = roundQty(Math.min(amount, cap - cur.currentStock));
+                if (give <= 0) break;
+                inc = await Inventory.incStock(
+                    Number.isFinite(cap)
+                        ? { _id: invId, restaurant: restaurantId, currentStock: cur.currentStock }
+                        : { _id: invId, restaurant: restaurantId },
+                    give
+                );
+                if (inc) break;
+                cur = await Inventory.findOne({ _id: invId, restaurant: restaurantId }).select('currentStock maxStock').lean();
+            }
+            if (!inc) {
+                results.skipped.push({ inventoryItem: invId, name: invItem.name, reason: 'At max stock' });
+                return;
+            }
+
+            await Inventory.updateOne(
+                { _id: invId, restaurant: restaurantId },
+                {
+                    $push: {
+                        adjustmentHistory: {
+                            $each: [{
+                                type: 'return',
+                                quantity: give,
+                                previousStock: inc.previousStock,
+                                newStock: inc.newStock,
+                                reason,
+                                adjustedBy: userId,
+                                order: order._id,
+                                date: new Date(),
+                            }],
+                            $slice: -200,
+                        },
+                    },
+                }
+            );
+
+            const newStatus = computeStatus(inc.newStock, inc.doc.minStock);
+            if (inc.doc.status !== newStatus) {
+                // R-10: tenant-scope the status sync inside
+                // restoreInventoryForOrder. `restaurantId` is the
+                // function parameter from orderController.
+                await Inventory.updateOne(
+                    { _id: invId, restaurant: restaurantId },
+                    { status: newStatus }
+                );
+            }
+
+            results.restored.push({
+                inventoryItem: invId,
+                name: invItem.name,
+                restored: give,
+                unit: invItem.unit,
+                newStock: inc.newStock,
+            });
+        };
+
         const menuItemIds = [...new Set(
             order.items
                 .map(i => i.menuItem?.toString?.() || i.menuItem)
                 .filter(id => id && mongoose.isValidObjectId(id))
         )];
-        if (menuItemIds.length === 0) return results;
 
         const orderBranch = order.branch || null;
-        const recipes = await Recipe.find({
+        const recipes = menuItemIds.length ? await Recipe.find({
             menuItem: { $in: menuItemIds },
             restaurant: restaurantId,
             branch: { $in: [orderBranch, null] },
-        }).lean();
+        }).lean() : [];
 
         const recipeMap = {};
         for (const r of recipes) {
@@ -2080,59 +2229,22 @@ exports.restoreInventoryForOrder = async (order, restaurantId, userId = null) =>
                         continue;
                     }
 
-                    const previousStock = invItem.currentStock;
-                    // Capped at maxStock to avoid restoring above the ceiling
-                    // (e.g. someone adjusted the max down after deduction).
-                    const cap = invItem.maxStock > 0 ? invItem.maxStock : Number.POSITIVE_INFINITY;
-                    const newStock = Math.min(cap, previousStock + needed);
-                    const actualReturned = newStock - previousStock;
-                    if (actualReturned <= 0) {
-                        results.skipped.push({ inventoryItem: invId, name: invItem.name, reason: 'At max stock' });
-                        continue;
-                    }
-
-                    await Inventory.updateOne(
-                        { _id: invId, restaurant: restaurantId },
-                        {
-                            $set: { currentStock: newStock },
-                            $push: {
-                                adjustmentHistory: {
-                                    $each: [{
-                                        type: 'return',
-                                        quantity: Math.round(actualReturned * 1000) / 1000,
-                                        previousStock,
-                                        newStock,
-                                        reason: `Auto: Cancelled Order ${order.orderId} — ${orderItem.name || ''} ×${orderQty}`,
-                                        adjustedBy: userId,
-                                        date: new Date(),
-                                    }],
-                                    $slice: -200,
-                                },
-                            },
-                        }
-                    );
-
-                    const newStatus = computeStatus(newStock, invItem.minStock);
-                    if (invItem.status !== newStatus) {
-                        // R-10: tenant-scope the status sync inside
-                        // restoreInventoryForOrder. `restaurantId` is the
-                        // function parameter from orderController.
-                        await Inventory.updateOne(
-                            { _id: invId, restaurant: restaurantId },
-                            { status: newStatus }
-                        );
-                    }
-
-                    results.restored.push({
-                        inventoryItem: invId,
-                        name: invItem.name,
-                        restored: Math.round(actualReturned * 1000) / 1000,
-                        unit: invItem.unit,
-                        newStock,
-                    });
+                    await restoreOne(invItem, needed, `Auto: Cancelled Order ${order.orderId} — ${orderItem.name || ''} ×${orderQty}`);
                 } catch (err) {
                     results.errors.push({ inventoryItem: invId, reason: err.message });
                 }
+            }
+        }
+
+        // Recorded deductions the current recipe no longer lists (recipe
+        // edited after the order was prepared) are still given back.
+        for (const [key, left] of Object.entries(recorded || {})) {
+            if (left <= 0) continue;
+            try {
+                const invItem = await Inventory.findOne({ _id: key, restaurant: restaurantId });
+                if (invItem) await restoreOne(invItem, left, `Auto: Cancelled Order ${order.orderId}`);
+            } catch (err) {
+                results.errors.push({ inventoryItem: key, reason: err.message });
             }
         }
     } catch (err) {
@@ -2207,9 +2319,12 @@ exports.getActualVsTheoretical = async (req, res) => {
             // Sum actual usage from adjustment history in the period.
             // Includes `waste` because waste is stock actually gone (just
             // not sold) — excluding it hides spoilage in the variance.
-            const actualUsage = (inv.adjustmentHistory || [])
-                .filter(h => ['usage', 'waste'].includes(h.type) && new Date(h.date) >= since)
-                .reduce((sum, h) => sum + h.quantity, 0);
+            // 'return' rows (a prepared-then-cancelled order's stock given
+            // back) reverse usage, so they are netted out — the cancelled
+            // order is likewise absent from the theoretical side.
+            const actualUsage = Math.max(0, (inv.adjustmentHistory || [])
+                .filter(h => ['usage', 'waste', 'return'].includes(h.type) && new Date(h.date) >= since)
+                .reduce((sum, h) => sum + (h.type === 'return' ? -h.quantity : h.quantity), 0));
 
             const converted = th ? convertUnits(theoQty, th.unit, inv.unit) : theoQty;
             const theoConverted = converted !== null ? converted : theoQty;
@@ -2290,16 +2405,22 @@ exports.getConsumptionReport = async (req, res) => {
             Inventory.aggregate([
                 { $match: match },
                 { $unwind: '$adjustmentHistory' },
-                { $match: { 'adjustmentHistory.date': { $gte: since }, 'adjustmentHistory.type': { $in: ['usage', 'waste'] } } },
+                // 'return' rows (cancelled-order stock given back) net out usage.
+                { $match: { 'adjustmentHistory.date': { $gte: since }, 'adjustmentHistory.type': { $in: ['usage', 'waste', 'return'] } } },
                 { $group: {
                     _id: { id: '$_id', name: '$name', unit: '$unit', type: '$adjustmentHistory.type', cost: '$costPerUnit' },
                     qty: { $sum: '$adjustmentHistory.quantity' },
                 } },
                 { $group: {
                     _id: { id: '$_id.id', name: '$_id.name', unit: '$_id.unit', cost: '$_id.cost' },
-                    usage: { $sum: { $cond: [{ $eq: ['$_id.type', 'usage'] }, '$qty', 0] } },
+                    usage: { $sum: { $switch: { branches: [
+                        { case: { $eq: ['$_id.type', 'usage'] }, then: '$qty' },
+                        { case: { $eq: ['$_id.type', 'return'] }, then: { $multiply: ['$qty', -1] } },
+                    ], default: 0 } } },
                     waste: { $sum: { $cond: [{ $eq: ['$_id.type', 'waste'] }, '$qty', 0] } },
                 } },
+                { $set: { usage: { $max: [0, '$usage'] } } },
+                { $match: { $or: [{ usage: { $gt: 0 } }, { waste: { $gt: 0 } }] } },
                 { $project: {
                     _id: 0, name: '$_id.name', unit: '$_id.unit',
                     usage: { $round: ['$usage', 3] }, waste: { $round: ['$waste', 3] },
@@ -2310,12 +2431,17 @@ exports.getConsumptionReport = async (req, res) => {
             Inventory.aggregate([
                 { $match: match },
                 { $unwind: '$adjustmentHistory' },
-                { $match: { 'adjustmentHistory.date': { $gte: since }, 'adjustmentHistory.type': { $in: ['usage', 'waste'] } } },
+                { $match: { 'adjustmentHistory.date': { $gte: since }, 'adjustmentHistory.type': { $in: ['usage', 'waste', 'return'] } } },
                 { $group: {
                     _id: { $dateToString: { format: '%Y-%m-%d', date: '$adjustmentHistory.date' } },
-                    cost: { $sum: { $multiply: ['$adjustmentHistory.quantity', '$costPerUnit'] } },
+                    cost: { $sum: { $multiply: [
+                        '$adjustmentHistory.quantity', '$costPerUnit',
+                        { $cond: [{ $eq: ['$adjustmentHistory.type', 'return'] }, -1, 1] },
+                    ] } },
+                    consumed: { $sum: { $cond: [{ $eq: ['$adjustmentHistory.type', 'return'] }, 0, 1] } },
                 } },
-                { $project: { _id: 0, date: '$_id', cost: { $round: ['$cost', 2] } } },
+                { $match: { consumed: { $gt: 0 } } },
+                { $project: { _id: 0, date: '$_id', cost: { $round: [{ $max: [0, '$cost'] }, 2] } } },
                 { $sort: { date: 1 } },
             ]),
         ]);

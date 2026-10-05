@@ -113,10 +113,29 @@ const advanceBookingSchema = new mongoose.Schema({
         }],
         isSkipped: { type: Boolean, default: false }
     },
+    // QA N10/N11 — one booking can park several vehicle types
+    // (`vehicles`), for the whole event or a chosen start + duration.
+    // `vehicleType` / `count` are kept as first type / total vehicles so
+    // older readers keep working; bookings saved before multi-vehicle
+    // only have those two — `normalizeParkingDetails` (utils/parkingConfig)
+    // turns them into a one-row `vehicles` list on read (see toJSON below).
     parkingDetails: {
         vehicleType: { type: String },
         count: { type: Number, default: 0 },
         timeDuration: { type: String, default: '2hrs' },
+        vehicles: {
+            type: [{
+                vehicleType: { type: String, required: true },
+                label: { type: String },
+                count: { type: Number, min: 0, default: 0 },
+                rate: { type: Number, min: 0, default: 0 },     // ₹ per vehicle per hour
+                amount: { type: Number, min: 0, default: 0 },   // rate × count × hours
+                _id: false,
+            }],
+            default: undefined,
+        },
+        mode: { type: String, enum: ['event', 'custom'], default: undefined },
+        startTime: { type: String, default: null },             // "HH:MM"
         isSkipped: { type: Boolean, default: false }
     },
     payment: {
@@ -180,6 +199,15 @@ const advanceBookingSchema = new mongoose.Schema({
     }
 }, {
     timestamps: true
+});
+
+// Read-side backward compatibility for single-type parking bookings.
+const { normalizeParkingDetails } = require('../utils/parkingConfig');
+advanceBookingSchema.set('toJSON', {
+    transform(doc, ret) {
+        if (ret && ret.parkingDetails) ret.parkingDetails = normalizeParkingDetails(ret.parkingDetails);
+        return ret;
+    },
 });
 
 advanceBookingSchema.index({ user: 1, bookingDate: -1 });

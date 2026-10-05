@@ -27,14 +27,23 @@ const PAYMENT_DEFAULTS = {
  * @param {Object|null} settings - The tenant settings object (from getSettings)
  * @returns {Object} Resolved loyalty config with no missing fields
  */
+// A stored number wins even when it is 0 — the Settings schema allows 0
+// (e.g. minBillToEarn 0 = earn on every bill, pointsExpiryDays 0 = never
+// expire). Only a missing / non-numeric value falls back to the default.
+function numberOr(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
 function resolveLoyaltySettings(settings) {
     const w = settings?.wallet || {};
     return {
         enableLoyalty: w.enableLoyalty !== undefined ? w.enableLoyalty : PAYMENT_DEFAULTS.enableLoyalty,
-        minBillToEarn: w.minBillToEarn || PAYMENT_DEFAULTS.minBillToEarn,
-        pointsPerRupee: w.pointsPerRupee || PAYMENT_DEFAULTS.pointsPerRupee,
-        pointsToRupee: w.pointsToRupee || PAYMENT_DEFAULTS.pointsToRupee,
-        pointsExpiryDays: w.pointsExpiryDays || PAYMENT_DEFAULTS.pointsExpiryDays,
+        minBillToEarn: numberOr(w.minBillToEarn, PAYMENT_DEFAULTS.minBillToEarn),
+        pointsPerRupee: numberOr(w.pointsPerRupee, PAYMENT_DEFAULTS.pointsPerRupee),
+        pointsToRupee: numberOr(w.pointsToRupee, PAYMENT_DEFAULTS.pointsToRupee),
+        pointsExpiryDays: numberOr(w.pointsExpiryDays, PAYMENT_DEFAULTS.pointsExpiryDays),
         refundMode: w.refundMode || PAYMENT_DEFAULTS.refundMode,
     };
 }

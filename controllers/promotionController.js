@@ -8,10 +8,21 @@ const MenuItem = require('../models/menuItem');
 
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const { mergedBranchFilter, mergedCustomerBranchFilter, getMainBranchId } = require('../utils/mainBranch');
-const { computeCouponDiscount } = require('../utils/couponScope');
+const { computeCouponDiscount, withCategoryKinds, menuCategoryKind } = require('../utils/couponScope');
 const { devError } = require('../utils/AppError');
 const { pickAllowed, toPositiveAmount, COUPON_FIELDS, PROMOTION_FIELDS } = require('../utils/bodyAllowlist');
 const { resolveOwnedBranch } = require('../utils/branchOwnership');
+const { APP_TIMEZONE } = require('../utils/pickupTime');
+
+// ms offset of `timezone` from UTC at instant `date` (east of UTC = +).
+const getTimezoneOffsetMs = (timezone, date) => {
+    const p = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone, hourCycle: 'h23',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(date).reduce((acc, x) => { if (x.type !== 'literal') acc[x.type] = Number(x.value); return acc; }, {});
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(date.getTime() / 1000) * 1000;
+};
 
 // Branch-scope helper for customer-facing promotion / coupon reads.
 //
@@ -225,13 +236,37 @@ exports.applyCoupon = async (req, res) => {
         // produce the same answer as before; scoped coupons can't be
         // evaluated correctly without the item breakdown, so they
         // refuse rather than silently over-discount.
+        //
+        // Decision 6 — each pseudo-item carries the category kind (Food /
+        // Drink) the admin set on the menu category. Lines that send a
+        // `menuItem` id are resolved against this tenant's menu (the
+        // authoritative kind); otherwise a client-sent categoryKind is
+        // used (this endpoint is a preview — order create re-prices
+        // server-side), else classifyItem falls back to prepStation.
         let discountItems = Array.isArray(items) && items.length > 0
             ? items.map(i => ({
-                prepStation: i.prepStation || 'kitchen',
-                price: Number(i.price) || 0,
-                quantity: Number(i.quantity) || 0,
+                menuItem: (i && typeof i.menuItem === 'string') ? i.menuItem : undefined,
+                categoryKind: i?.categoryKind,
+                prepStation: i?.prepStation || 'kitchen',
+                price: Number(i?.price) || 0,
+                quantity: Number(i?.quantity) || 0,
               }))
             : null;
+        if (discountItems && coupon.scope && coupon.scope !== 'all') {
+            const mongoose = require('mongoose');
+            const ids = [...new Set(discountItems.map(i => i.menuItem).filter(id => id && mongoose.isValidObjectId(id)))];
+            const menuById = new Map();
+            if (ids.length) {
+                const menus = await MenuItem.find({ _id: { $in: ids.slice(0, 500) }, ...tenantFilter(req) })
+                    .select('category').populate('category', 'kind').lean();
+                for (const m of menus) menuById.set(String(m._id), m);
+            }
+            // A resolvable menu item overrides whatever kind the client sent.
+            discountItems = withCategoryKinds(
+                discountItems.map(i => (menuCategoryKind(menuById.get(String(i.menuItem))) ? { ...i, categoryKind: undefined } : i)),
+                menuById,
+            );
+        }
         if (!discountItems && coupon.scope && coupon.scope !== 'all') {
             return res.status(400).json({
                 success: false,
@@ -281,15 +316,20 @@ exports.getCustomerCRM = async (req, res) => {
     try {
         const { userId } = req.params;
 
-        const user = await User.findById(userId).select('-password');
-        if (!user) {
-            return res.status(404).json({ success: false, message: 'Customer not found' });
-        }
-
         // Wallet + orders restricted to this tenant only.
         const tf = tenantFilter(req);
         const wallet = await Wallet.findOne({ user: userId, ...tf });
         const orders = await Order.find({ user: userId, ...tf }).sort({ createdAt: -1 });
+
+        // The User model is not tenant-scoped, so only reveal the identity
+        // of CUSTOMERS with activity (wallet / orders) in the caller's
+        // tenant — never another tenant's users or any staff account.
+        const user = (wallet || orders.length)
+            ? await User.findOne({ _id: userId, role: 'customer' }).select('name email')
+            : null;
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'Customer not found' });
+        }
         
         // Calculate insights
         const totalSpent = orders.reduce((acc, o) => acc + (o.total || 0), 0);
@@ -491,7 +531,17 @@ exports.updateCoupon = async (req, res) => {
         const err = validateCouponBody(req.body);
         if (err) return res.status(400).json({ success: false, message: err });
 
+        const filter = { _id: req.params.id, ...tenantFilter(req), ...strictBranchFilter(req) };
         const updateData = pickAllowed(req.body, COUPON_FIELDS);
+
+        // Re-validate against the MERGED coupon (stored + incoming): a body
+        // of only { discountValue: 150 } on a percentage coupon, or only an
+        // endDate before the stored startDate, must be refused too.
+        const stored = await Coupon.findOne(filter).lean();
+        if (!stored) return res.status(404).json({ success: false, message: 'Coupon not found' });
+        const mergedErr = validateCouponBody({ ...stored, ...updateData });
+        if (mergedErr) return res.status(400).json({ success: false, message: mergedErr });
+
         if (Object.prototype.hasOwnProperty.call(updateData, 'branch')) {
             // Tenant owner: the new branch must belong to this tenant.
             // Sub Admin: cannot re-assign a coupon to another branch (a
@@ -504,7 +554,7 @@ exports.updateCoupon = async (req, res) => {
             else updateData.branch = branchCheck.branchId;
         }
         const coupon = await Coupon.findOneAndUpdate(
-            { _id: req.params.id, ...tenantFilter(req), ...strictBranchFilter(req) },
+            filter,
             updateData,
             { returnDocument: 'after', runValidators: true }
         );
@@ -539,23 +589,22 @@ exports.getPerformanceStats = async (req, res) => {
     try {
         const { filter = 'week' } = req.query;
 
-        // Determine date range
-        const now = new Date();
-        let startDate;
-        let dayCount;
-        if (filter === 'today') {
-            startDate = new Date(now); startDate.setHours(0, 0, 0, 0);
-            dayCount = 1;
-        } else if (filter === 'month') {
-            startDate = new Date(now); startDate.setDate(startDate.getDate() - 29);
-            startDate.setHours(0, 0, 0, 0);
-            dayCount = 30;
-        } else {
-            // week (default)
-            startDate = new Date(now); startDate.setDate(startDate.getDate() - 6);
-            startDate.setHours(0, 0, 0, 0);
-            dayCount = 7;
-        }
+        // Determine date range. Day boundaries, bucket keys/labels and the
+        // $dateToString grouping below all use ONE basis — the tenant
+        // timezone (APP_TIMEZONE, IST by default) — so a redemption at
+        // 06:00 IST lands in "today" whatever the server's own TZ is.
+        const dayCount = filter === 'today' ? 1 : filter === 'month' ? 30 : 7;
+        const todayKey = new Intl.DateTimeFormat('en-CA', {
+            timeZone: APP_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+        }).format(new Date());
+        const [ty, tm, td] = todayKey.split('-').map(Number);
+        // dayUTC(i) = the calendar date of bucket i as a UTC-midnight Date
+        // (used only for its Y-M-D / weekday, never as an instant).
+        const dayUTC = (i) => new Date(Date.UTC(ty, tm - 1, td - (dayCount - 1) + i));
+        const firstDay = dayUTC(0);
+        // Instant of local midnight of the first bucket in APP_TIMEZONE.
+        const startDate = new Date(firstDay.getTime() - getTimezoneOffsetMs(APP_TIMEZONE, firstDay));
+        const dayFmt = { format: '%Y-%m-%d', date: '$createdAt', timezone: APP_TIMEZONE };
 
         const tf = tenantFilter(req);
         // Strict per-branch analytics — Branch Admin sees only their
@@ -568,7 +617,7 @@ exports.getPerformanceStats = async (req, res) => {
             { $match: { createdAt: { $gte: startDate }, ...tf, ...bf } },
             {
                 $group: {
-                    _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                    _id: { $dateToString: dayFmt },
                     count: { $sum: 1 },
                     savings: { $sum: '$discountAmount' },
                     avgOrderValue: { $avg: '$orderValue' }
@@ -600,13 +649,12 @@ exports.getPerformanceStats = async (req, res) => {
 
         const daily = [];
         for (let i = 0; i < dayCount; i++) {
-            const d = new Date(startDate);
-            d.setDate(d.getDate() + i);
+            const d = dayUTC(i);
             const key = d.toISOString().split('T')[0];
             const row = aggMap[key];
             daily.push({
                 date: key,
-                label: filter === 'month' ? `${d.getDate()}/${d.getMonth() + 1}` : dayNames[d.getDay()],
+                label: filter === 'month' ? `${d.getUTCDate()}/${d.getUTCMonth() + 1}` : dayNames[d.getUTCDay()],
                 count: row ? row.count : 0,
                 savings: row ? row.savings : 0
             });
@@ -630,7 +678,7 @@ exports.getPerformanceStats = async (req, res) => {
         //     each other. Both now share this single, meaningful basis.
         const orderAgg = await Order.aggregate([
             { $match: { ...tf, ...bf, createdAt: { $gte: startDate }, status: { $ne: 'cancelled' } } },
-            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } }
+            { $group: { _id: { $dateToString: dayFmt }, count: { $sum: 1 } } }
         ]);
         const orderMap = {};
         for (const row of orderAgg) orderMap[row._id] = row.count;
@@ -670,8 +718,15 @@ exports.getPerformanceStats = async (req, res) => {
 // @access  Admin
 exports.getRedemptions = async (req, res) => {
     try {
-        const { page = 1, limit = 10, filter = '', couponId = '' } = req.query;
-        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const { filter = '', couponId = '' } = req.query;
+        // Clamp paging: page >= 1, 1 <= limit <= 100 (page=0 used to reach
+        // Mongo as a negative skip → 500).
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
+        const skip = (page - 1) * limit;
+        if (couponId && !require('mongoose').isValidObjectId(couponId)) {
+            return res.status(400).json({ success: false, message: 'Invalid coupon id' });
+        }
 
         const query = { ...tenantFilter(req), ...adminBranchFilter(req) };
 
@@ -698,7 +753,7 @@ exports.getRedemptions = async (req, res) => {
                 .populate('user', 'name email staffId')
                 .sort({ createdAt: -1 })
                 .skip(skip)
-                .limit(parseInt(limit)),
+                .limit(limit),
             CouponRedemption.countDocuments(query)
         ]);
 
@@ -706,8 +761,8 @@ exports.getRedemptions = async (req, res) => {
             success: true,
             redemptions,
             total,
-            page: parseInt(page),
-            totalPages: Math.ceil(total / parseInt(limit))
+            page,
+            totalPages: Math.ceil(total / limit)
         });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Error fetching redemptions', ...devError(error) });

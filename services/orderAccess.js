@@ -13,7 +13,8 @@ const { pinnedBranchId } = require('../utils/tenantScope');
 // Used by customer-facing mutation endpoints that are mounted with
 // optionalAuth (cancel, payment). The tenant is already enforced by the
 // order lookup. A caller may act on the order when they are:
-//   • staff of the tenant (any order),
+//   • staff of the tenant (any order — branch-pinned staff only their
+//     own branch's),
 //   • the logged-in owner (order.user === caller), or
 //   • holding an X-Scan-Token whose sessionId matches the order's
 //     scanSessionId — only for orders with NO owner (guest orders). A
@@ -22,6 +23,13 @@ const ORDER_STAFF_ROLES = new Set(['admin', 'manager', 'captain', 'waiter', 'che
 function orderAccessForCaller(req, order) {
   const caller = req.user || null;
   if (caller && ORDER_STAFF_ROLES.has(caller.role)) {
+    // Branch-pinned staff are confined to their branch's orders (same
+    // R-07 rule PATCH /:id/status enforces). Tenant-level orders
+    // (branch null) stay reachable.
+    const pinned = pinnedBranchId(req);
+    if (pinned && order.branch && String(order.branch) !== String(pinned)) {
+      return { allowed: false, isStaff: true, reason: 'BRANCH_MISMATCH' };
+    }
     return { allowed: true, isStaff: true };
   }
   if (order.user) {

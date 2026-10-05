@@ -3,7 +3,8 @@ const StaffWallet = require('../models/staffWallet');
 const StaffWalletTransaction = require('../models/staffWalletTransaction');
 const StaffWithdrawal = require('../models/staffWithdrawal');
 const logger = require('../utils/logger');
-const { tenantFilter, tenantId } = require('../utils/tenantScope');
+const User = require('../models/user');
+const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { notify } = require('../services/notificationService');
 const EVENTS = require('../realtime/events');
 
@@ -12,6 +13,24 @@ const EVENTS = require('../realtime/events');
 // set narrow is also a defence against an unrelated user accidentally
 // auto-creating a wallet just by hitting GET /staff-wallet/me.
 const WALLET_ROLES = new Set(['waiter', 'captain']);
+
+// Smallest withdrawal the model accepts (StaffWithdrawal.amount min).
+const MIN_WITHDRAWAL = 1;
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/**
+ * Branch scope for the admin withdrawal endpoints. StaffWithdrawal has
+ * no branch field, so a branch-pinned admin is limited to withdrawals of
+ * staff whose User.branch is their pinned branch (same rule as tip
+ * settlement). Returns {} for a tenant-wide admin.
+ */
+async function withdrawalBranchScope(req) {
+    const pinned = pinnedBranchId(req);
+    if (!pinned) return {};
+    const staff = await User.find({ ...tenantFilter(req), branch: pinned }).select('_id').lean();
+    return { user: { $in: staff.map((u) => u._id) } };
+}
 
 /**
  * Idempotently fetch (or create) the wallet doc for a given staff user.
@@ -47,8 +66,10 @@ async function creditWallet({ userId, restaurantId, amount, referenceKind, refer
         throw new Error('creditWallet: amount must be > 0');
     }
     const wallet = await getOrCreateWallet({ userId, restaurantId, session });
-    wallet.balance = Math.round((wallet.balance + amount) * 100) / 100;
-    wallet.lifetimeCredits = Math.round((wallet.lifetimeCredits + amount) * 100) / 100;
+    // Round to the paisa so the ledger row matches the balance exactly.
+    amount = round2(amount);
+    wallet.balance = round2(wallet.balance + amount);
+    wallet.lifetimeCredits = round2(wallet.lifetimeCredits + amount);
     await wallet.save({ session });
 
     await new StaffWalletTransaction({
@@ -128,6 +149,11 @@ exports.requestWithdrawal = async (req, res) => {
             await session.abortTransaction();
             session.endSession();
             return res.status(400).json({ success: false, message: 'Amount must be a positive number.' });
+        }
+        if (numericAmount < MIN_WITHDRAWAL) {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({ success: false, message: `Minimum withdrawal is ₹${MIN_WITHDRAWAL}.` });
         }
         if (!['Cash', 'UPI', 'Bank'].includes(method)) {
             await session.abortTransaction();
@@ -257,7 +283,8 @@ exports.listWithdrawals = async (req, res) => {
         const status = ['pending', 'paid', 'rejected'].includes(req.query.status)
             ? req.query.status
             : null;
-        const filter = { ...tenantFilter(req) };
+        const scope = await withdrawalBranchScope(req);
+        const filter = { ...tenantFilter(req), ...scope };
         if (status) filter.status = status;
 
         const withdrawals = await StaffWithdrawal.find(filter)
@@ -270,7 +297,7 @@ exports.listWithdrawals = async (req, res) => {
         // Aggregate counts so the admin badge can show "5 pending"
         // without a second round-trip.
         const counts = await StaffWithdrawal.aggregate([
-            { $match: tenantFilter(req) },
+            { $match: { ...tenantFilter(req), ...scope } },
             { $group: { _id: '$status', n: { $sum: 1 } } },
         ]);
         const pendingCount = counts.find((c) => c._id === 'pending')?.n || 0;
@@ -293,16 +320,21 @@ exports.approveWithdrawal = async (req, res) => {
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ success: false, message: 'Invalid withdrawal id' });
         }
-        const w = await StaffWithdrawal.findOne({ _id: id, ...tenantFilter(req) });
-        if (!w) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
-        if (w.status !== 'pending') {
-            return res.status(409).json({ success: false, message: `Already ${w.status}, cannot approve again.` });
+        const scoped = { _id: id, ...tenantFilter(req), ...(await withdrawalBranchScope(req)) };
+        // Atomic pending → paid transition: a concurrent approve or reject
+        // that already moved the row out of 'pending' makes this a no-op.
+        const set = { status: 'paid', handledBy: req.user._id, handledAt: new Date() };
+        if (txnRef) set.txnRef = String(txnRef).trim().slice(0, 100);
+        const w = await StaffWithdrawal.findOneAndUpdate(
+            { ...scoped, status: 'pending' },
+            { $set: set },
+            { returnDocument: 'after', runValidators: true },
+        );
+        if (!w) {
+            const existing = await StaffWithdrawal.findOne(scoped).select('status').lean();
+            if (!existing) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+            return res.status(409).json({ success: false, message: `Already ${existing.status}, cannot approve again.` });
         }
-        w.status = 'paid';
-        w.handledBy = req.user._id;
-        w.handledAt = new Date();
-        if (txnRef) w.txnRef = String(txnRef).trim().slice(0, 100);
-        await w.save();
 
         // Notify the waiter so their app updates instantly.
         await notify({
@@ -344,16 +376,26 @@ exports.rejectWithdrawal = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid withdrawal id' });
         }
         const tf = tenantFilter(req);
-        const w = await StaffWithdrawal.findOne({ _id: id, ...tf }).session(session);
+        const scoped = { _id: id, ...tf, ...(await withdrawalBranchScope(req)) };
+        // Atomic pending → rejected claim inside the transaction: a
+        // concurrent approve (or reject) can no longer also win, because
+        // whichever write lands second no longer matches status 'pending'.
+        const w = await StaffWithdrawal.findOneAndUpdate(
+            { ...scoped, status: 'pending' },
+            { $set: {
+                status: 'rejected',
+                rejectReason: reason ? String(reason).trim().slice(0, 300) : 'No reason provided',
+                handledBy: req.user._id,
+                handledAt: new Date(),
+            } },
+            { returnDocument: 'after', session },
+        );
         if (!w) {
+            const existing = await StaffWithdrawal.findOne(scoped).select('status').session(session).lean();
             await session.abortTransaction();
             session.endSession();
-            return res.status(404).json({ success: false, message: 'Withdrawal not found' });
-        }
-        if (w.status !== 'pending') {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(409).json({ success: false, message: `Already ${w.status}, cannot reject.` });
+            if (!existing) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+            return res.status(409).json({ success: false, message: `Already ${existing.status}, cannot reject.` });
         }
 
         const wallet = await StaffWallet.findOne({ _id: w.wallet, ...tf }).session(session);
@@ -366,12 +408,6 @@ exports.rejectWithdrawal = async (req, res) => {
         wallet.lifetimeDebits = Math.round((wallet.lifetimeDebits - w.amount) * 100) / 100;
         if (wallet.lifetimeDebits < 0) wallet.lifetimeDebits = 0;   // guard against drift
         await wallet.save({ session });
-
-        w.status = 'rejected';
-        w.rejectReason = reason ? String(reason).trim().slice(0, 300) : 'No reason provided';
-        w.handledBy = req.user._id;
-        w.handledAt = new Date();
-        await w.save({ session });
 
         await new StaffWalletTransaction({
             restaurant: w.restaurant,

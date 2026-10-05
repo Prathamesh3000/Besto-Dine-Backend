@@ -37,6 +37,18 @@ const optStrArray = (field, maxItems, maxLen) => [
     body(`${field}.*`).isString().withMessage(`${field} entries must be text`).bail()
         .isLength({ max: maxLen }).withMessage(`${field} entry is too long`),
 ];
+// Availability window bound: '' (no window) or a 00:00–23:59 time.
+// "9:00" is normalised to "09:00" — utils/menuAvailability compares
+// HH:MM strings, so an unpadded value would sort after "17:00".
+const TIME_RE = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+const optTime = (field) => body(field).optional({ values: 'null' })
+    .isString().withMessage(`${field} must be text`).bail()
+    .custom((v) => v.trim() === '' || TIME_RE.test(v.trim()))
+    .withMessage(`${field} must be a time between 00:00 and 23:59 (HH:MM)`).bail()
+    .customSanitizer((v) => {
+        const m = TIME_RE.exec(String(v).trim());
+        return m ? `${m[1].padStart(2, '0')}:${m[2]}` : '';
+    });
 const optBool = (field) => body(field).optional({ values: 'null' }).isBoolean().withMessage(`${field} must be true or false`);
 
 const menuItemRules = [
@@ -50,8 +62,8 @@ const menuItemRules = [
     body('offerExpiryDate').optional({ values: 'falsy' }).isISO8601().withMessage('Invalid offer expiry date'),
     optStr('cookingTime', 100),
     optStr('serveUpto', 100),
-    optStr('startTime', 50),
-    optStr('endTime', 50),
+    optTime('startTime'),
+    optTime('endTime'),
     optStr('healthLevel', 100),
     optStr('inactivationReason', 1000),
     body('vegType').optional().isIn(['veg', 'non-veg']).withMessage('Invalid veg type'),

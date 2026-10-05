@@ -6,7 +6,9 @@ const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('
 const { devError } = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 
-const round3 = (n) => Math.round((n || 0) * 1000) / 1000;
+// Same stock precision as every other inventory write (3 decimals).
+const round3 = Inventory.roundQty;
+const stockStatus = (stock, min) => (stock <= 0 ? 'out-of-stock' : stock <= (min || 0) ? 'low-stock' : 'in-stock');
 
 // Branch + shared(null) scope — see supplierController.branchScopeFilter.
 function branchFilter(req) {
@@ -80,10 +82,10 @@ exports.create = async (req, res) => {
         if (!recipe) return res.status(404).json({ success: false, message: 'Recipe not found' });
 
         // Compute the per-ingredient deduction (recipe qty × batches),
-        // converted to the inventory unit, and verify stock first.
-        const deductions = [];
-        const shortages = [];
-        let totalCost = 0;
+        // converted to the inventory unit, AGGREGATED per inventory item
+        // (a recipe may list the same ingredient on two lines), and
+        // verify stock against the total first.
+        const needByInv = new Map(); // invId → { inv, needed }
         for (const ing of recipe.ingredients) {
             const inv = ing.inventoryItem;
             if (!inv) continue;
@@ -92,8 +94,17 @@ exports.create = async (req, res) => {
             if (needed === null) {
                 return res.status(400).json({ success: false, message: `Unit mismatch on ${inv.name} (${ing.unit} → ${inv.unit}). Fix the recipe unit first.` });
             }
+            const key = String(inv._id);
+            const slot = needByInv.get(key) || { inv, needed: 0 };
+            slot.needed += needed;
+            needByInv.set(key, slot);
+        }
+        const deductions = [];
+        const shortages = [];
+        let totalCost = 0;
+        for (const { inv, needed } of needByInv.values()) {
             const need = round3(needed);
-            if (inv.currentStock < need) {
+            if (round3(inv.currentStock) < need) {
                 shortages.push({ name: inv.name, need, have: inv.currentStock, unit: inv.unit });
             }
             totalCost += need * (inv.costPerUnit || 0);
@@ -114,7 +125,7 @@ exports.create = async (req, res) => {
             if (!outItem) return res.status(400).json({ success: false, message: 'Output item is invalid for this tenant' });
             outUnit = outItem.unit;
         }
-        const outQty = outItem ? Math.max(0, Number(outputQty) || 0) : 0;
+        const outQty = outItem ? Math.max(0, round3(Number(outputQty) || 0)) : 0;
 
         const branchId = pinnedBranchId(req) || recipe.branch || (req.branch ? (req.branch._id || req.branch) : null);
         const production = new Production({
@@ -140,31 +151,44 @@ exports.create = async (req, res) => {
         // Apply stock movements: deduct ingredients (usage), add output (restock).
         for (const d of deductions) {
             try {
-                const inv = await Inventory.findOne({ _id: d.inventoryItem, ...tf });
-                if (!inv) continue;
-                const previousStock = inv.currentStock;
-                inv.currentStock = Math.max(0, round3(previousStock - d.qty));
-                inv.adjustmentHistory.push({
-                    type: 'usage', quantity: d.qty, previousStock, newStock: inv.currentStock,
-                    reason: `Production ${production.batchNumber} (${recipe.menuItem?.name || 'batch'})`,
-                    adjustedBy: req.user._id, date: new Date(),
+                // Relative, guarded decrement (no lost concurrent updates);
+                // if stock fell short meanwhile, clamp at 0 as before.
+                let previousStock, newStock, minStock;
+                const inc = await Inventory.incStock({ _id: d.inventoryItem, ...tf, currentStock: { $gte: d.qty } }, -d.qty);
+                if (inc) {
+                    ({ previousStock, newStock } = inc);
+                    minStock = inc.doc.minStock;
+                } else {
+                    const before = await Inventory.findOneAndUpdate(
+                        { _id: d.inventoryItem, ...tf, currentStock: { $lt: d.qty } },
+                        { $set: { currentStock: 0 } },
+                        { returnDocument: 'before' }
+                    );
+                    if (!before) continue;
+                    previousStock = round3(before.currentStock); newStock = 0; minStock = before.minStock;
+                }
+                await Inventory.updateOne({ _id: d.inventoryItem, ...tf }, {
+                    $set: { status: stockStatus(newStock, minStock) },
+                    $push: { adjustmentHistory: { $each: [{
+                        type: 'usage', quantity: d.qty, previousStock, newStock,
+                        reason: `Production ${production.batchNumber} (${recipe.menuItem?.name || 'batch'})`,
+                        adjustedBy: req.user._id, date: new Date(),
+                    }], $slice: -200 } },
                 });
-                if (inv.adjustmentHistory.length > 200) inv.adjustmentHistory = inv.adjustmentHistory.slice(-200);
-                await inv.save();
             } catch { /* best effort */ }
         }
         if (outItem && outQty > 0) {
             try {
-                const inv = await Inventory.findOne({ _id: outItem._id, ...tf });
-                const previousStock = inv.currentStock;
-                inv.currentStock = round3(previousStock + outQty);
-                inv.lastRestocked = new Date();
-                inv.adjustmentHistory.push({
-                    type: 'restock', quantity: outQty, previousStock, newStock: inv.currentStock,
-                    reason: `Production ${production.batchNumber}`, adjustedBy: req.user._id, date: new Date(),
-                });
-                if (inv.adjustmentHistory.length > 200) inv.adjustmentHistory = inv.adjustmentHistory.slice(-200);
-                await inv.save();
+                const inc = await Inventory.incStock({ _id: outItem._id, ...tf }, outQty);
+                if (inc) {
+                    await Inventory.updateOne({ _id: outItem._id, ...tf }, {
+                        $set: { lastRestocked: new Date(), status: stockStatus(inc.newStock, inc.doc.minStock) },
+                        $push: { adjustmentHistory: { $each: [{
+                            type: 'restock', quantity: outQty, previousStock: inc.previousStock, newStock: inc.newStock,
+                            reason: `Production ${production.batchNumber}`, adjustedBy: req.user._id, date: new Date(),
+                        }], $slice: -200 } },
+                    });
+                }
             } catch { /* best effort */ }
         }
 

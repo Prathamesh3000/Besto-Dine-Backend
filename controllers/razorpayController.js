@@ -23,16 +23,32 @@ const { tenantFilter, tenantId } = require('../utils/tenantScope');
 const { resolveLoyaltySettings } = require('../utils/paymentDefaults');
 const { createTipForPaidOrder, revokeTipsForOrder } = require('../utils/tipHelpers');
 const { freeTableOrUnmergeGroup } = require('../utils/tableMerge');
-const { applyPendingUpgrade, applyPaidPlanUpgrade, applyScheduledDowngrade } = require('../utils/planPaymentApply');
+const {
+    applyPendingUpgrade,
+    applyPaidPlanUpgrade,
+    applyScheduledDowngrade,
+    pendingPaymentMismatch,
+    localYmd,
+} = require('../utils/planPaymentApply');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const AdvanceBooking = require('../models/advanceBooking');
 const {
     checkWalletRechargePayment,
     checkOrderPaymentBinding,
+    orderCheckoutIds,
+    checkCaptureCoversDue,
+    orderAmountDue,
     checkOrphanRefundEligibility,
     isValidCheckoutSignature,
+    paiseToRupees,
 } = require('../utils/paymentChecks');
 const { claimPayment, releaseClaim, findClaim } = require('../utils/paymentClaim');
+const {
+    roundPaise,
+    isWalletPaid,
+    ledgerPaymentMethod,
+    loyaltyPointsToClawBack,
+} = require('../utils/orderRefund');
 
 // Verified guest scan-session id from X-Scan-Token (never trusted raw).
 // Used to stamp / match the payer of a guest Razorpay checkout.
@@ -49,9 +65,56 @@ function verifiedScanSessionId(req) {
     }
 }
 
+// DEV-ONLY: mock Razorpay orders minted by createRazorpayOrder in mock
+// mode, so a mock payment can report the amount (and notes) its checkout
+// was opened for. In-process and bounded; never used outside mock mode.
+const mockOrderRegistry = new Map();
+const MOCK_REGISTRY_MAX = 1000;
+function rememberMockOrder(order) {
+    if (!order?.id) return;
+    if (mockOrderRegistry.size >= MOCK_REGISTRY_MAX) {
+        mockOrderRegistry.delete(mockOrderRegistry.keys().next().value);
+    }
+    mockOrderRegistry.set(order.id, { amount: order.amount, notes: order.notes || {} });
+}
+
 // Fetch a payment + its Razorpay order. Throws on any gateway failure so
 // callers fail CLOSED (bug #10) instead of trusting client data.
 async function fetchPaymentAndOrder(paymentId, razorpayOrderId) {
+    // Mock payments exist only in this process — the real gateway has
+    // never heard of them, so fetching would 401. Synthesise the
+    // captured-payment shape the callers assert on, including the amount
+    // the mock checkout was opened for (without it the amount checks
+    // refuse every mock payment). Gated on the `_mock_` id prefixes, so
+    // a real payment is always fetched for real even while mock mode is on.
+    if (rzpMock.isMockEnabled() && rzpMock.isMockPaymentId(paymentId)) {
+        const minted = razorpayOrderId ? mockOrderRegistry.get(razorpayOrderId) : null;
+        return {
+            payment: {
+                id: paymentId,
+                entity: 'payment',
+                status: 'captured',
+                order_id: razorpayOrderId || null,
+                method: 'mock',
+                captured: true,
+                amount: minted ? minted.amount : undefined,
+                currency: 'INR',
+                notes: minted ? minted.notes : {},
+                created_at: Math.floor(Date.now() / 1000),
+            },
+            rzpOrder: razorpayOrderId
+                ? {
+                    id: razorpayOrderId,
+                    entity: 'order',
+                    status: 'paid',
+                    amount: minted ? minted.amount : undefined,
+                    amount_paid: minted ? minted.amount : 0,
+                    notes: minted ? minted.notes : {},
+                }
+                : null,
+        };
+    }
+
     const payment = await razorpay.payments.fetch(paymentId);
     const orderId = razorpayOrderId || payment?.order_id;
     const rzpOrder = orderId ? await razorpay.orders.fetch(orderId) : null;
@@ -117,6 +180,100 @@ async function settleSiblingDineInRounds(order, paymentMethod) {
     } catch (err) {
         logger.warn('Failed to settle sibling dine-in rounds:', err.message);
     }
+}
+
+// Settle the linked split doc(s) of the same checkout. A mixed cart
+// (kitchen + counter items) is saved as two orders — the counter doc
+// carries `splitParent` = the primary doc's _id (orderCreateService).
+// The customer pays the whole checkout once, against the primary doc, so
+// verify-payment / the webhook / reconciliation used to leave the counter
+// doc "Unpaid". Same convention as settleSiblingDineInRounds: the capture
+// stays recorded on the primary doc and the split doc is marked Paid with
+// amountPaid 0 (its share is inside that capture) so revenue isn't
+// double-counted.
+//
+// Only when the money collected on the primary doc covers the split
+// doc(s) too (₹1 rounding tolerance): a payment made for the primary
+// doc alone (e.g. the staff screen settling just that order) must not
+// give the counter items away. Best-effort — never blocks the primary
+// settlement.
+async function settleSplitSiblings(order, paymentMethod) {
+    if (!order || !order._id) return;
+    try {
+        const tf = order.restaurant ? { restaurant: order.restaurant } : {};
+        const splits = await Order.find({
+            splitParent: order._id,
+            status: { $ne: 'cancelled' },
+            paymentStatus: { $nin: ['Paid', 'Refunded'] },
+            ...tf,
+        });
+        if (!splits.length) return;
+        const dueOf = (o) => Math.max(0, (Number(o.total) || 0) - (Number(o.manualDiscount) || 0) - (Number(o.amountPaid) || 0));
+        const needed = Math.max(0, (Number(order.total) || 0) - (Number(order.manualDiscount) || 0))
+            + splits.reduce((s, o) => s + dueOf(o), 0);
+        const collected = Number(order.amountPaid) || 0;
+        if (collected < roundPaise(needed) - 1) {
+            logger.warn('Split checkout: payment covers only the primary order — linked split order(s) left unpaid', {
+                orderId: order.orderId,
+                collected,
+                needed: roundPaise(needed),
+                splitOrderIds: splits.map((s) => s.orderId),
+            });
+            return;
+        }
+        for (const sib of splits) {
+            const updated = await Order.findOneAndUpdate(
+                { _id: sib._id, paymentStatus: { $nin: ['Paid', 'Refunded'] } },
+                {
+                    $set: {
+                        paymentStatus: 'Paid',
+                        paymentMethod: paymentMethod || order.paymentMethod || 'online',
+                        amountPaid: Number(sib.amountPaid) || 0, // capture recorded on `order`
+                        paidAt: sib.paidAt || order.paidAt || new Date(),
+                    },
+                },
+                { returnDocument: 'after' }
+            );
+            if (!updated) continue;
+            try { await createTipForPaidOrder(updated, updated.restaurant || order.restaurant); } catch { /* tip best-effort */ }
+            await freeTableIfReady(updated);
+        }
+        logger.info(`Settled ${splits.length} linked split order(s) with ${order.orderId}`);
+    } catch (err) {
+        logger.warn('Failed to settle linked split orders:', err.message);
+    }
+}
+
+// Atomically flip an order to Paid for a captured Razorpay payment.
+// The filter only matches an order that is not yet Paid/Refunded, so of
+// several concurrent settlers (double-tapped verify, duplicate webhook
+// deliveries, verify racing the webhook) exactly one wins and runs the
+// side effects (loyalty, tip, siblings). Returns the updated order, or
+// null when someone else already settled it.
+//
+// A prior partial payment (wallet) is kept: amountPaid = prior + captured,
+// walletAmountPaid = prior, method 'mixed'. order.total is never touched.
+async function markOrderPaidAtomically(order, { paymentId, razorpayOrderId, capturedAmount, priorPaid = 0, paidAt }) {
+    const total = roundPaise(order.total);
+    const set = { paymentStatus: 'Paid', razorpayPaymentId: paymentId };
+    if (razorpayOrderId) set.razorpayOrderId = razorpayOrderId;
+    if (priorPaid > 0 && priorPaid < total) {
+        set.paymentMethod = 'mixed';
+        set.amountPaid = roundPaise(priorPaid + capturedAmount);
+        set.walletAmountPaid = priorPaid;
+    } else {
+        set.paymentMethod = 'online';
+        set.amountPaid = roundPaise(capturedAmount);
+    }
+    set.paidAt = order.paidAt || paidAt || new Date();
+    const update = { $set: set };
+    // Keep the settling checkout in the order's checkout history (4a).
+    if (razorpayOrderId) update.$addToSet = { razorpayOrderIds: razorpayOrderId };
+    return Order.findOneAndUpdate(
+        { _id: order._id, paymentStatus: { $nin: ['Paid', 'Refunded'] } },
+        update,
+        { returnDocument: 'after' }
+    );
 }
 
 // ─── Razorpay instance ──────────────────────────────────────────────────────
@@ -214,12 +371,36 @@ function broadcastPaymentEvent(order, title, description) {
 // Request body: { amount (in ₹), cafeOrderId (our Order _id), receipt? }
 // Response:     { success, razorpayOrder }
 
+const { describeRazorpayError } = require('../utils/razorpayErrors');
+const rzpMock = require('../utils/razorpayMock');
+
+/** Razorpay rejects any receipt longer than this. */
+const RAZORPAY_RECEIPT_MAX = 40;
+
+/**
+ * Build a receipt that fits Razorpay's 40-char limit.
+ *
+ * Keeps the TAIL of the order id rather than the head: the last hex
+ * digits of a Mongo ObjectId are the counter/random section, so they
+ * vary between adjacent orders, whereas the leading bytes are a shared
+ * timestamp. Truncating from the front would make receipts collide.
+ */
+function buildReceipt(explicit, cafeOrderId) {
+    if (explicit) return String(explicit).slice(0, RAZORPAY_RECEIPT_MAX);
+    const id = String(cafeOrderId || 'new');
+    const stamp = Date.now().toString(36);          // 8 chars, not 13
+    const prefix = 'rcpt_';
+    const budget = RAZORPAY_RECEIPT_MAX - prefix.length - 1 - stamp.length;
+    return `${prefix}${id.slice(-budget)}_${stamp}`;
+}
+
 exports.createRazorpayOrder = async (req, res) => {
     try {
         const { amount, cafeOrderId, receipt } = req.body;
 
         // Validate amount — must be a positive finite number within Razorpay limits
-        if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0 || amount > 10_000_000) {
+        // Razorpay refuses orders under 100 paise — reject before the gateway.
+        if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 1 || amount > 10_000_000) {
             return res.status(400).json({ success: false, message: 'Amount must be a valid number between ₹1 and ₹1,00,00,000' });
         }
 
@@ -248,16 +429,15 @@ exports.createRazorpayOrder = async (req, res) => {
                 message: 'Restaurant context is required to create a payment.',
             });
         }
+        let ownedOrder = null;
         if (cafeOrderId && cafeOrderId !== 'none') {
             const tf = tenantFilter(req);
-            let ownedOrder = null;
+            const fields = '_id orderId total amountPaid paymentStatus status razorpayOrderId';
             if (mongoose.Types.ObjectId.isValid(cafeOrderId)) {
-                ownedOrder = await Order.findOne({ _id: cafeOrderId, ...tf })
-                    .select('_id orderId total').lean();
+                ownedOrder = await Order.findOne({ _id: cafeOrderId, ...tf }).select(fields).lean();
             }
             if (!ownedOrder) {
-                ownedOrder = await Order.findOne({ orderId: cafeOrderId, ...tf })
-                    .select('_id orderId total').lean();
+                ownedOrder = await Order.findOne({ orderId: cafeOrderId, ...tf }).select(fields).lean();
             }
             if (!ownedOrder) {
                 logger.warn('createRazorpayOrder: cafeOrderId not owned by caller — blocking', {
@@ -271,11 +451,32 @@ exports.createRazorpayOrder = async (req, res) => {
                     message: 'Order not found for this restaurant.',
                 });
             }
-            if (typeof ownedOrder.total === 'number' && amount < ownedOrder.total - 1) {
+            // Decision 4b: never open a checkout the customer could pay
+            // for an order that can no longer take the money — verify
+            // would refuse it and the customer would be charged for
+            // nothing. Refused before the gateway is called.
+            if (ownedOrder.paymentStatus === 'Paid' || ownedOrder.paymentStatus === 'Refunded') {
+                return res.status(409).json({
+                    success: false,
+                    code: 'ORDER_ALREADY_PAID',
+                    message: 'This order is already paid.',
+                });
+            }
+            if (ownedOrder.status === 'cancelled') {
+                return res.status(409).json({
+                    success: false,
+                    code: 'ORDER_CANCELLED',
+                    message: 'This order has been cancelled and cannot be paid.',
+                });
+            }
+            // Compare with what is still DUE (total − a prior wallet part),
+            // the same rule verify-payment applies to the capture.
+            const { due } = orderAmountDue(ownedOrder);
+            if (typeof ownedOrder.total === 'number' && amount < due - 1) {
                 return res.status(400).json({
                     success: false,
                     code: 'AMOUNT_MISMATCH',
-                    message: `Payment amount ₹${amount} does not cover order total ₹${ownedOrder.total}.`,
+                    message: `Payment amount ₹${amount} does not cover the amount due ₹${due}.`,
                 });
             }
         }
@@ -283,7 +484,13 @@ exports.createRazorpayOrder = async (req, res) => {
         const options = {
             amount: Math.round(amount * 100), // Razorpay expects paise
             currency: 'INR',
-            receipt: receipt || `rcpt_${cafeOrderId || 'new'}_${Date.now()}`,
+            // Razorpay caps `receipt` at 40 characters and rejects the
+            // whole order with a 400 when it's longer. The old template
+            // was rcpt_ (5) + ObjectId (24) + _ (1) + Date.now() (13)
+            // = 43, so EVERY order carrying a cafeOrderId failed. Build
+            // it within budget and clamp as a belt-and-braces guard in
+            // case a caller passes a long `receipt` of their own.
+            receipt: buildReceipt(receipt, cafeOrderId),
             notes: {
                 cafeOrderId: cafeOrderId || 'none',
                 // R-04: authoritative tenant marker for the webhook.
@@ -302,7 +509,20 @@ exports.createRazorpayOrder = async (req, res) => {
         const scanSessionId = verifiedScanSessionId(req);
         if (scanSessionId) options.notes.scanSessionId = scanSessionId;
 
-        const razorpayOrder = await razorpay.orders.create(options);
+        // DEV-ONLY mock gateway. Returns the same shape the real API
+        // would, so nothing downstream knows the difference. Hard-off in
+        // production — see utils/razorpayMock.js for the three guards.
+        let razorpayOrder;
+        if (rzpMock.isMockEnabled()) {
+            razorpayOrder = rzpMock.createMockOrder(options);
+            rememberMockOrder(razorpayOrder);
+            logger.warn('⚠️  MOCK PAYMENT — no money moves. RAZORPAY_MOCK=true', {
+                rzpOrderId: razorpayOrder.id,
+                amountPaise: options.amount,
+            });
+        } else {
+            razorpayOrder = await razorpay.orders.create(options);
+        }
 
         // R-04: immediately stamp `razorpayOrderId` onto the cafe order
         // under tenant scope. That makes the globally-unique Razorpay ID
@@ -310,11 +530,21 @@ exports.createRazorpayOrder = async (req, res) => {
         // longer has to trust the client-supplied notes.cafeOrderId to
         // find the right order. Wrapped so a stamp failure never blocks
         // the checkout; webhook still has `notes.restaurantId` as backup.
-        if (cafeOrderId && mongoose.Types.ObjectId.isValid(cafeOrderId)) {
+        //
+        // Decision 4a: the new checkout is ADDED to the order's checkout
+        // history (razorpayOrderIds) instead of replacing the previous
+        // one, so a payment through an older, still-open checkout of the
+        // same order is still accepted by verify / webhook. A legacy
+        // order's single razorpayOrderId is carried into the history.
+        if (ownedOrder) {
             try {
-                await Order.findOneAndUpdate(
-                    { _id: cafeOrderId, ...tenantFilter(req) },
-                    { razorpayOrderId: razorpayOrder.id }
+                const history = [ownedOrder.razorpayOrderId, razorpayOrder.id].filter(Boolean);
+                await Order.updateOne(
+                    { _id: ownedOrder._id, ...tenantFilter(req) },
+                    {
+                        $set: { razorpayOrderId: razorpayOrder.id },
+                        $addToSet: { razorpayOrderIds: { $each: history } },
+                    }
                 );
             } catch (stampErr) {
                 logger.warn('Failed to stamp razorpayOrderId on cafe order (non-fatal)', {
@@ -335,10 +565,13 @@ exports.createRazorpayOrder = async (req, res) => {
                 currency: razorpayOrder.currency,
                 receipt: razorpayOrder.receipt,
             },
+            // Tells the client to bypass Razorpay's hosted checkout.
+            // Absent (undefined) on every real order.
+            mock: razorpayOrder.mock === true || undefined,
             key: process.env.RAZORPAY_KEY_ID, // frontend needs this to open checkout
         });
     } catch (err) {
-        logger.error('Razorpay create order error:', { error: err.message });
+        logger.error('Razorpay create order error:', describeRazorpayError(err));
         return res.status(500).json({ success: false, message: 'Failed to create payment order' });
     }
 };
@@ -365,14 +598,28 @@ exports.verifyPayment = async (req, res) => {
         }
 
         // ── Signature verification ────────────────────────────────────────
-        const body = razorpay_order_id + '|' + razorpay_payment_id;
-        const expectedSignature = crypto
-            .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-            .update(body)
-            .digest('hex');
+        // A mock payment has no real signature to check. The bypass is
+        // deliberately narrow: mock mode must be on AND both ids must
+        // carry the `_mock_` prefixes this server minted. So a genuine
+        // Razorpay payment is still verified normally even in mock mode,
+        // and a forged signature on a real order id is still rejected.
+        const isMockPayment = rzpMock.shouldBypassSignature(razorpay_order_id, razorpay_payment_id);
 
-        if (!safeEqual(expectedSignature, razorpay_signature)) {
-            return res.status(400).json({ success: false, message: 'Payment verification failed — invalid signature' });
+        if (isMockPayment) {
+            logger.warn('⚠️  MOCK PAYMENT accepted without signature verification', {
+                rzpOrderId: razorpay_order_id,
+                rzpPaymentId: razorpay_payment_id,
+            });
+        } else {
+            const body = razorpay_order_id + '|' + razorpay_payment_id;
+            const expectedSignature = crypto
+                .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+                .update(body)
+                .digest('hex');
+
+            if (!safeEqual(expectedSignature, razorpay_signature)) {
+                return res.status(400).json({ success: false, message: 'Payment verification failed — invalid signature' });
+            }
         }
 
         // No cafe order to settle (e.g. advance-booking pre-check): the
@@ -472,26 +719,42 @@ exports.verifyPayment = async (req, res) => {
             return res.status(409).json({ success: false, code: 'PAYMENT_ALREADY_USED', message: 'This payment has already been used.' });
         }
 
-        const reconciledAmount = binding.amount;
-        const priorPaid = binding.priorPaid;
-        order.paymentStatus = 'Paid';
-        if (priorPaid > 0 && priorPaid < order.total) {
-            order.paymentMethod = 'mixed';
-            order.amountPaid = Math.round((priorPaid + reconciledAmount) * 100) / 100;
-            order.walletAmountPaid = priorPaid;
-        } else {
-            order.paymentMethod = 'online';
-            order.amountPaid = reconciledAmount;
-        }
-        order.razorpayOrderId = razorpay_order_id;
-        order.razorpayPaymentId = razorpay_payment_id;
-        if (!order.paidAt) order.paidAt = new Date();
+        // Atomic Paid transition: a concurrent verify of the same payment
+        // (a claim replay) loses here and skips the side effects, so
+        // loyalty points are awarded once.
+        let paidOrder;
         try {
-            await order.save();
+            paidOrder = await markOrderPaidAtomically(order, {
+                paymentId: razorpay_payment_id,
+                razorpayOrderId: razorpay_order_id,
+                capturedAmount: binding.amount,
+                priorPaid: binding.priorPaid,
+            });
         } catch (saveErr) {
-            await releaseClaim(razorpay_payment_id, { purpose: 'order_payment', ref: String(order._id) });
+            if (!claim.replay) {
+                await releaseClaim(razorpay_payment_id, { purpose: 'order_payment', ref: String(order._id) });
+            }
             throw saveErr;
         }
+        if (!paidOrder) {
+            const current = await Order.findById(order._id).select('razorpayPaymentId').lean();
+            if (current && current.razorpayPaymentId === razorpay_payment_id) {
+                return res.status(200).json({
+                    success: true,
+                    message: 'Payment verified successfully',
+                    paymentId: razorpay_payment_id,
+                });
+            }
+            if (!claim.replay) {
+                await releaseClaim(razorpay_payment_id, { purpose: 'order_payment', ref: String(order._id) });
+            }
+            return res.status(409).json({
+                success: false,
+                code: 'ORDER_ALREADY_PAID',
+                message: 'This order is already paid. Please contact staff about this payment.',
+            });
+        }
+        order = paidOrder;
 
         // ── Side effects — best effort; the order is already settled ─────
         try {
@@ -505,6 +768,9 @@ exports.verifyPayment = async (req, res) => {
             // Aggregated dine-in bill: this capture covers every unpaid
             // round on the table, so settle the siblings too.
             await settleSiblingDineInRounds(order, 'online');
+
+            // Mixed-cart checkout: the linked counter-side split doc(s).
+            await settleSplitSiblings(order, 'online');
 
             // Release the table if the order was already served.
             await freeTableIfReady(order);
@@ -541,6 +807,65 @@ exports.verifyPayment = async (req, res) => {
         logger.error('Razorpay verify error:', { error: err.message });
         return res.status(500).json({ success: false, message: 'Payment verification failed' });
     }
+};
+
+// ─── Deferred checkout → POST /orders (decision 4c) ─────────────────────────
+// "Pay first, then order" (takeaway / kiosk): the browser holds the
+// checkout result BEFORE the cafe order exists. services/orderCreateService
+// calls this when POST /orders carries that result, so the payment is
+// linked to the order the moment the order is written — after which
+// /razorpay/orphan-refund refuses it (the food was ordered).
+//
+// `order` is the order-to-be: { _id, orderId, restaurant, user, total,
+// amountPaid }. Returns
+//   { ok: true, confirmed: true,  razorpayOrderId, paymentId, amount }
+//   { ok: true, confirmed: false, razorpayOrderId, paymentId }
+//        — signature valid but the gateway could not be reached: the
+//          ids are still stamped (so the webhook / reconciliation can
+//          settle it and orphan-refund refuses it) but nothing is
+//          claimed; verify-payment does the full check later.
+//   { ok: false, status, code, message }  — refuse the order.
+const CHECKOUT_ID_RE = /^[A-Za-z0-9_]{1,64}$/;
+exports.verifyCheckoutForNewOrder = async (req, { checkout, order }) => {
+    const razorpayOrderId = checkout?.razorpay_order_id;
+    const paymentId = checkout?.razorpay_payment_id;
+    const signature = checkout?.razorpay_signature;
+    if (typeof razorpayOrderId !== 'string' || !CHECKOUT_ID_RE.test(razorpayOrderId)
+        || typeof paymentId !== 'string' || !CHECKOUT_ID_RE.test(paymentId)
+        || typeof signature !== 'string' || signature.length > 256) {
+        return { ok: false, status: 400, code: 'PAYMENT_DETAILS_INVALID', message: 'Payment details are invalid.' };
+    }
+    const isMock = rzpMock.shouldBypassSignature(razorpayOrderId, paymentId);
+    if (!isMock && !isValidCheckoutSignature({
+        razorpayOrderId,
+        razorpayPaymentId: paymentId,
+        signature,
+        secret: process.env.RAZORPAY_KEY_SECRET,
+    })) {
+        return { ok: false, status: 400, code: 'PAYMENT_SIGNATURE_INVALID', message: 'Payment verification failed — invalid signature.' };
+    }
+
+    let payment;
+    let rzpOrder;
+    try {
+        ({ payment, rzpOrder } = await fetchPaymentAndOrder(paymentId, razorpayOrderId));
+    } catch (fetchErr) {
+        logger.warn('Order create: gateway unreachable — linking the signed checkout unconfirmed', {
+            razorpayOrderId, paymentId, error: fetchErr.message,
+        });
+        return { ok: true, confirmed: false, razorpayOrderId, paymentId };
+    }
+
+    const binding = checkOrderPaymentBinding({
+        order, payment, rzpOrder, razorpayOrderId, tenant: tenantId(req),
+    });
+    if (!binding.ok) {
+        logger.warn('Order create: checkout refused for the new order', {
+            code: binding.code, razorpayOrderId, paymentId,
+        });
+        return binding;
+    }
+    return { ok: true, confirmed: true, razorpayOrderId, paymentId, amount: binding.amount };
 };
 
 // ─── POST /api/razorpay/webhook ────────────────────────────────────────────
@@ -703,7 +1028,11 @@ exports.handleWebhook = async (req, res) => {
         let lookupPath = null;
 
         if (rzpOrderId) {
-            order = await Order.findOne({ razorpayOrderId: rzpOrderId });
+            // Decision 4a: the checkout may be an older one of the order
+            // (razorpayOrderIds history), not only the latest.
+            order = await Order.findOne({
+                $or: [{ razorpayOrderId: rzpOrderId }, { razorpayOrderIds: rzpOrderId }],
+            });
             if (order) lookupPath = 'razorpayOrderId';
         }
 
@@ -763,7 +1092,8 @@ exports.handleWebhook = async (req, res) => {
         // we found the order via notes.cafeOrderId but it's been linked to
         // a different Razorpay checkout, so this webhook isn't for this
         // order. Drop quietly.
-        if (order.razorpayOrderId && rzpOrderId && order.razorpayOrderId !== rzpOrderId) {
+        const linkedCheckouts = orderCheckoutIds(order);
+        if (linkedCheckouts.length && rzpOrderId && !linkedCheckouts.includes(rzpOrderId)) {
             logger.warn('Webhook: Razorpay order_id mismatch with stored value — rejecting', {
                 orderId: order.orderId,
                 expected: order.razorpayOrderId,
@@ -775,6 +1105,23 @@ exports.handleWebhook = async (req, res) => {
 
         // 4. Handle Events
         if (event === 'payment.captured' && order.paymentStatus !== 'Paid') {
+            const capturedAmount = paiseToRupees(payment.amount);
+
+            // Same coverage rule as verify-payment: an underpaid capture
+            // (e.g. a stale checkout after items were added) must not
+            // close the bill. Leave the order unpaid for staff to resolve.
+            const cover = checkCaptureCoversDue({ order, amount: capturedAmount });
+            if (!cover.ok) {
+                logger.error('Webhook: captured amount does not cover the amount due — not settling order', {
+                    paymentId: payment.id,
+                    orderId: order.orderId,
+                    captured: capturedAmount,
+                    total: order.total,
+                    amountPaid: order.amountPaid,
+                });
+                return res.status(200).json({ status: 'ok' });
+            }
+
             // Bug #10 — a payment id settles at most one order. If it was
             // already claimed for something else, don't apply it here.
             const whClaim = await claimPayment(payment.id, {
@@ -783,7 +1130,7 @@ exports.handleWebhook = async (req, res) => {
                 razorpayOrderId: rzpOrderId || null,
                 restaurant: order.restaurant || null,
                 user: order.user || null,
-                amount: payment.amount / 100,
+                amount: capturedAmount,
             });
             if (!whClaim.claimed) {
                 logger.error('Webhook: payment already claimed elsewhere — not applying to order', {
@@ -794,70 +1141,111 @@ exports.handleWebhook = async (req, res) => {
                 });
                 return res.status(200).json({ status: 'ok' });
             }
-            const capturedAmount = payment.amount / 100;
-            order.paymentStatus = 'Paid';
-            order.paymentMethod = 'online';
-            order.razorpayPaymentId = payment.id;
-            order.amountPaid = capturedAmount;
-            // Reconcile total with the actual captured amount so the
-            // order details modal's Total/Amount Paid pair agrees. See
-            // verifyPayment above for the full rationale.
-            order.total = capturedAmount;
-            if (!order.paidAt) {
-                order.paidAt = payment.created_at
-                    ? new Date(payment.created_at * 1000)
-                    : new Date();
+
+            // Atomic Paid transition — a concurrent duplicate delivery (a
+            // claim replay) or a racing verify-payment loses here and runs
+            // no side effects. order.total is never rewritten.
+            // Status stays 'new' on payment — chef decides when to start
+            // cooking via the KDS.
+            const paidOrder = await markOrderPaidAtomically(order, {
+                paymentId: payment.id,
+                razorpayOrderId: rzpOrderId || null,
+                capturedAmount,
+                priorPaid: cover.priorPaid,
+                paidAt: payment.created_at ? new Date(payment.created_at * 1000) : null,
+            });
+            if (!paidOrder) {
+                logger.info('Webhook: order already settled by a concurrent request — skipping side effects', {
+                    paymentId: payment.id,
+                    orderId: order.orderId,
+                });
+                return res.status(200).json({ status: 'ok' });
             }
 
-            // Status stays 'new' on payment — chef decides when to start
-            // cooking via the KDS. See verifyPayment for the full rationale.
-
-            await order.save();
-            await awardLoyaltyPoints(order);
+            await awardLoyaltyPoints(paidOrder);
 
             // Webhook is the safety net when the user closed the tab
             // before verifyPayment ran. Without this call the tip on
             // those orders was never recorded. Idempotent.
-            await createTipForPaidOrder(order, order.restaurant);
+            await createTipForPaidOrder(paidOrder, paidOrder.restaurant);
+
+            // Aggregated dine-in bill — same as verifyPayment: this
+            // capture covers every unpaid round on the table.
+            await settleSiblingDineInRounds(paidOrder, 'online');
+
+            // Mixed-cart checkout: the linked counter-side split doc(s).
+            await settleSplitSiblings(paidOrder, 'online');
 
             // Same table-release path verifyPayment uses. Required here
             // too because the webhook is the only signal we get when the
             // customer's browser tab dies between paying and the verify
             // call landing — without it the table sits stuck at occupied.
-            await freeTableIfReady(order);
+            await freeTableIfReady(paidOrder);
 
-            broadcastPaymentEvent(order, 'Payment Confirmed (Webhook)',
-                `₹${order.amountPaid} payment verified for order ${order.orderId}`);
+            broadcastPaymentEvent(paidOrder, 'Payment Confirmed (Webhook)',
+                `₹${paidOrder.amountPaid} payment verified for order ${paidOrder.orderId}`);
 
         } else if (event === 'payment.failed') {
-            order.paymentStatus = 'Failed';
-            await order.save();
-            logger.info(`Webhook: Payment failed for order ${order.orderId}`);
+            // Order.paymentStatus has no 'Failed' state. A failed attempt
+            // leaves the order as it was (the customer can retry) — just
+            // record it in the log.
+            logger.info(`Webhook: Payment failed for order ${order.orderId}`, {
+                paymentId: payment.id,
+                paymentStatus: order.paymentStatus,
+                errorCode: payment.error_code || null,
+                errorDescription: payment.error_description || null,
+            });
         } else if (event === 'refund.processed') {
-            const refundAmount = (payment.amount || 0) / 100;
-            const refundId = parsed.payload?.refund?.entity?.id || payment.id || null;
-            // Dedupe webhook retries — if we already recorded this refund
-            // id, skip. Prevents double-counting when Razorpay retries.
-            const alreadyRecorded = refundId && (order.refunds || []).some(r => r.razorpayRefundId === refundId);
-            if (!alreadyRecorded) {
-                order.refundedAmount = (order.refundedAmount || 0) + refundAmount;
-                if (order.refundedAmount >= order.amountPaid) {
-                    order.paymentStatus = 'Refunded';
-                }
-                order.refunds = order.refunds || [];
-                order.refunds.push({
-                    amount: refundAmount,
-                    reason: parsed.payload?.refund?.entity?.notes?.reason || 'Razorpay refund',
-                    razorpayRefundId: refundId,
-                    source: 'webhook',
-                    createdAt: new Date(),
+            const refundEntity = parsed.payload?.refund?.entity || null;
+            // The refund's own amount — payload.payment.entity.amount is the
+            // ORIGINAL capture and would turn every partial refund into a full one.
+            const refundAmount = refundEntity ? paiseToRupees(refundEntity.amount) : 0;
+            const refundId = refundEntity?.id || null;
+            if (!(refundAmount > 0) || !refundId) {
+                logger.warn('Webhook: refund.processed without a usable refund entity — ignoring', {
+                    orderId: order.orderId,
+                    refundId,
                 });
-                await order.save();
+                return res.json({ status: 'ok' });
+            }
+            // Atomic dedupe: the push + increment only applies when this
+            // refund id is not yet recorded, so concurrent duplicate
+            // deliveries (and refunds already recorded by the admin path)
+            // count once.
+            const updated = await Order.findOneAndUpdate(
+                { _id: order._id, 'refunds.razorpayRefundId': { $ne: refundId } },
+                {
+                    $inc: { refundedAmount: refundAmount },
+                    $push: {
+                        refunds: {
+                            amount: refundAmount,
+                            reason: refundEntity?.notes?.reason || 'Razorpay refund',
+                            razorpayRefundId: refundId,
+                            source: 'webhook',
+                            createdAt: new Date(),
+                        },
+                    },
+                },
+                { returnDocument: 'after' }
+            );
+            if (updated) {
+                // Round the running total to paise and flip to Refunded once
+                // fully refunded. Conditional on the value we just produced,
+                // so a concurrent refund's own pass handles the final state.
+                const rounded = roundPaise(updated.refundedAmount);
+                const set = { refundedAmount: rounded };
+                if (updated.paymentStatus === 'Paid' && rounded >= roundPaise(updated.amountPaid)) {
+                    set.paymentStatus = 'Refunded';
+                }
+                await Order.updateOne(
+                    { _id: order._id, refundedAmount: updated.refundedAmount },
+                    { $set: set }
+                );
             }
             // Revoke still-pending tips so the waiter isn't settled for
             // a refunded transaction. Settled tips are left alone.
             await revokeTipsForOrder(order, { reason: 'razorpay refund webhook' });
-            logger.info(`Webhook: refund.processed for order ${order.orderId}, amount ₹${refundAmount}`);
+            logger.info(`Webhook: refund.processed for order ${order.orderId}, amount ₹${refundAmount}${updated ? '' : ' (already recorded)'}`);
         }
 
         return res.json({ status: 'ok' });
@@ -974,7 +1362,20 @@ async function handleSubscriptionEvent(event, payload) {
             // plan upgrade now that the customer has actually paid.
             // Safe to call repeatedly (no-op once pendingUpgrade is
             // cleared, so retried webhooks don't double-apply).
-            const upgradeApplied = applyPendingUpgrade(restaurant);
+            // The charge must actually pay for the pending plan (amount ≥
+            // plan price, right order) — otherwise a cheaper charge would
+            // unlock whatever plan is pending. Checked when Razorpay sends
+            // the payment entity (it normally does on subscription.charged).
+            const chargedPayment = payload?.payment?.entity || null;
+            const upgradeMismatch = chargedPayment
+                ? pendingPaymentMismatch(restaurant.subscription?.pendingUpgrade, chargedPayment)
+                : '';
+            let upgradeApplied = false;
+            if (upgradeMismatch) {
+                logger.error(`Subscription charged: payment ${chargedPayment.id} NOT applied to pending upgrade for ${restaurant.slug}: ${upgradeMismatch}`);
+            } else {
+                upgradeApplied = applyPendingUpgrade(restaurant);
+            }
             if (upgradeApplied) {
                 logger.info(`Subscription charged: applied pending upgrade for ${restaurant.slug} → ${restaurant.subscription.planName}`);
             }
@@ -987,13 +1388,21 @@ async function handleSubscriptionEvent(event, payload) {
             // If the tenant was previously suspended for non-payment
             // (razorpayStatus === 'halted'), auto-reactivate now that
             // the charge has gone through.
-            if (restaurant.status === 'suspended' && previousRzpStatus === 'halted') {
+            // Also covers the 24h grace period (decision 5): a tenant still
+            // `past_due` after a halt is restored, and the scheduled lockout
+            // and halt counters are cleared.
+            const inHaltGrace = restaurant.status === 'past_due' && previousRzpStatus === 'halted';
+            const suspendedForHalt = restaurant.status === 'suspended' && previousRzpStatus === 'halted';
+            if (inHaltGrace || suspendedForHalt) {
                 restaurant.status = restaurant.subscription.trialEndDate && restaurant.subscription.trialEndDate > new Date()
                     ? 'trial'
                     : 'active';
                 restaurant.suspendedAt = undefined;
                 restaurant.suspendedReason = '';
             }
+            restaurant.subscription.haltedCount = 0;
+            restaurant.subscription.firstHaltedAt = undefined;
+            restaurant.subscription.scheduledSuspendAt = undefined;
             logger.info(`Subscription charged for ${restaurant.slug}: next ${sub.current_end ? new Date(sub.current_end * 1000).toISOString() : 'n/a'}`);
 
             // Phase 5 step 5 — persist the charge as a
@@ -1020,8 +1429,10 @@ async function handleSubscriptionEvent(event, payload) {
                         restaurant: restaurant._id,
                         createdAt: { $gte: startOfDay },
                     });
-                    const ymd = startOfDay.toISOString().slice(0, 10).replace(/-/g, '');
-                    const invoiceNumber = `INV-${ymd}-${String(todayCount + 1).padStart(4, '0')}`;
+                    // Local calendar date — the same basis as the local
+                    // midnight `startOfDay` (toISOString() gave the UTC
+                    // date, i.e. yesterday east of UTC).
+                    const ymd = localYmd(startOfDay);
 
                     // Period end the charge paid for is the
                     // `sub.current_end` we just set. Period start is
@@ -1033,21 +1444,42 @@ async function handleSubscriptionEvent(event, payload) {
                     const periodEnd = sub.current_end ? new Date(sub.current_end * 1000) : null;
                     const periodStart = sub.start_at ? new Date(sub.start_at * 1000) : new Date();
 
-                    await SubscriptionInvoice.create({
-                        restaurant: restaurant._id,
-                        restaurantName: restaurant.name,
-                        invoiceNumber,
-                        planName: restaurant.subscription?.planName || '',
-                        planSlug: restaurant.subscription?.planSlug || '',
-                        amount: pmt.amount || 0,
-                        currency: pmt.currency || 'INR',
-                        periodStart,
-                        periodEnd,
-                        razorpayPaymentId: pmt.id,
-                        razorpaySubscriptionId: sub.id,
-                        status: 'paid',
-                        paidAt: pmt.created_at ? new Date(pmt.created_at * 1000) : new Date(),
-                    });
+                    // countDocuments + 1 races with a concurrent invoice for
+                    // the same tenant/day: on an invoiceNumber E11000 take the
+                    // next slot (bounded, same as applyPaidPlanUpgrade). A
+                    // razorpayPaymentId E11000 falls through to the outer
+                    // catch as the expected retried-webhook no-op.
+                    let invoiceNumber = '';
+                    let saved = null;
+                    for (let attempt = 0, seq = todayCount + 1; attempt < 50 && !saved; attempt++, seq++) {
+                        invoiceNumber = `INV-${ymd}-${String(seq).padStart(4, '0')}`;
+                        try {
+                            saved = await SubscriptionInvoice.create({
+                                restaurant: restaurant._id,
+                                restaurantName: restaurant.name,
+                                invoiceNumber,
+                                planName: restaurant.subscription?.planName || '',
+                                planSlug: restaurant.subscription?.planSlug || '',
+                                amount: pmt.amount || 0,
+                                currency: pmt.currency || 'INR',
+                                periodStart,
+                                periodEnd,
+                                razorpayPaymentId: pmt.id,
+                                razorpaySubscriptionId: sub.id,
+                                status: 'paid',
+                                paidAt: pmt.created_at ? new Date(pmt.created_at * 1000) : new Date(),
+                            });
+                        } catch (insertErr) {
+                            if (insertErr?.code === 11000 && /invoiceNumber/.test(insertErr.message || '')) {
+                                logger.info(`SubscriptionInvoice number ${invoiceNumber} race-lost for ${restaurant.slug}, retrying`);
+                                continue;
+                            }
+                            throw insertErr;
+                        }
+                    }
+                    if (!saved) {
+                        throw new Error(`Could not allocate a unique invoiceNumber after 50 attempts (tenant ${restaurant.slug})`);
+                    }
                     logger.info(`SubscriptionInvoice created for ${restaurant.slug}: ${invoiceNumber}`);
                 } else {
                     logger.warn(`subscription.charged for ${restaurant.slug} had no payment entity — skipping invoice creation`);
@@ -1066,10 +1498,21 @@ async function handleSubscriptionEvent(event, payload) {
         }
 
         case 'subscription.halted': {
-            restaurant.status = 'suspended';
-            restaurant.suspendedAt = new Date();
-            restaurant.suspendedReason = 'Payment failed — subscription halted by Razorpay';
-            logger.warn(`Subscription halted for ${restaurant.slug} — tenant auto-suspended`);
+            // Decision 5 (2026-10, CRIT-18): no instant lockout. The tenant
+            // goes `past_due` (still fully usable) and is suspended 24h
+            // after the FIRST halt of this streak by
+            // utils/haltedSubscriptionSuspender unless a charge lands first.
+            // A redelivered / repeated halt never extends the deadline, and
+            // a tenant already suspended for another reason stays suspended.
+            const { scheduledSuspendAtFor } = require('../utils/haltedSubscriptionSuspender');
+            const now = new Date();
+            restaurant.subscription.haltedCount = (Number(restaurant.subscription.haltedCount) || 0) + 1;
+            if (!restaurant.subscription.firstHaltedAt) restaurant.subscription.firstHaltedAt = now;
+            if (!restaurant.subscription.scheduledSuspendAt) {
+                restaurant.subscription.scheduledSuspendAt = scheduledSuspendAtFor(restaurant.subscription.firstHaltedAt);
+            }
+            if (restaurant.status !== 'suspended') restaurant.status = 'past_due';
+            logger.warn(`Subscription halted for ${restaurant.slug} — past_due, suspension scheduled for ${restaurant.subscription.scheduledSuspendAt.toISOString()}`);
             break;
         }
 
@@ -1183,9 +1626,10 @@ exports.refundPayment = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Only paid orders can be refunded' });
         }
 
-        const refundAmount = amount;
-        const alreadyRefunded = order.refundedAmount || 0;
-        const maxRefundable = order.amountPaid - alreadyRefunded;
+        // Paise-rounded so an exact remainder is never lost to float drift.
+        const refundAmount = roundPaise(amount);
+        const alreadyRefunded = roundPaise(order.refundedAmount);
+        const maxRefundable = roundPaise(order.amountPaid - alreadyRefunded);
 
         if (refundAmount <= 0 || refundAmount > maxRefundable) {
             return res.status(400).json({
@@ -1200,20 +1644,22 @@ exports.refundPayment = async (req, res) => {
         const settings = await getSettings(req);
         const loyalty = resolveLoyaltySettings(settings);
         const refundMode = loyalty.refundMode;
+        const walletRefund = !!order.user && (isWalletPaid(order) || refundMode === 'wallet');
 
         // Step 1: External API call (Razorpay) — must happen OUTSIDE the DB session
         //         because we can't roll back an external API call.
         if (order.paymentMethod === 'online' && order.razorpayPaymentId && refundMode === 'original') {
             try {
-                const refund = await razorpay.refunds.create({
-                    payment_id: order.razorpayPaymentId,
+                // SDK 2.9.x: refunds go through payments.refund(); there is
+                // no refunds.create.
+                const refund = await razorpay.payments.refund(order.razorpayPaymentId, {
                     amount: Math.round(refundAmount * 100),
                     notes: { reason: reason || 'Refund', orderId: order.orderId },
                 });
                 razorpayRefundId = refund.id;
                 logger.info(`Razorpay refund initiated: ${razorpayRefundId} for ₹${refundAmount}`);
             } catch (rzpErr) {
-                logger.error('Razorpay API Refund Error:', { error: rzpErr.message, description: rzpErr.description });
+                logger.error('Razorpay API Refund Error:', describeRazorpayError(rzpErr));
                 return res.status(400).json({
                     success: false,
                     message: 'Refund could not be processed via payment gateway. Please try again or contact support.'
@@ -1221,7 +1667,7 @@ exports.refundPayment = async (req, res) => {
             }
         } else if (order.paymentMethod === 'online' && !order.razorpayPaymentId) {
             return res.status(400).json({ success: false, message: 'Online payment record has no transaction ID to refund' });
-        } else if (order.user && (order.paymentMethod === 'Wallet' || refundMode === 'wallet') && !order.restaurant) {
+        } else if (walletRefund && !order.restaurant) {
             return res.status(400).json({ success: false, message: 'Cannot process wallet refund — order has no restaurant context' });
         }
 
@@ -1231,7 +1677,7 @@ exports.refundPayment = async (req, res) => {
         try {
             await session.withTransaction(async () => {
                 // ── Update order ──────────────────────────────────────────
-                order.refundedAmount = alreadyRefunded + refundAmount;
+                order.refundedAmount = roundPaise(alreadyRefunded + refundAmount);
                 order.paymentStatus = order.refundedAmount >= order.amountPaid ? 'Refunded' : 'Paid';
                 order.refunds = order.refunds || [];
                 order.refunds.push({
@@ -1246,7 +1692,7 @@ exports.refundPayment = async (req, res) => {
                 await order.save({ session });
 
                 // ── Credit wallet if wallet refund ────────────────────────
-                if (order.user && (order.paymentMethod === 'Wallet' || refundMode === 'wallet')) {
+                if (walletRefund) {
                     const walletScope = { user: order.user, restaurant: order.restaurant };
                     await Wallet.findOneAndUpdate(
                         walletScope,
@@ -1258,7 +1704,8 @@ exports.refundPayment = async (req, res) => {
 
                 // ── Deduct loyalty points proportionally ──────────────────
                 if (order.user) {
-                    const pointsToDeduct = Math.floor(refundAmount * loyalty.pointsPerRupee);
+                    // Only a share of what THIS order earned.
+                    const pointsToDeduct = await loyaltyPointsToClawBack(order, refundAmount, loyalty, session);
                     if (pointsToDeduct > 0) {
                         await Wallet.findOneAndUpdate(
                             { user: order.user, loyaltyPoints: { $gte: pointsToDeduct }, ...tf },
@@ -1272,8 +1719,7 @@ exports.refundPayment = async (req, res) => {
                 if (order.user) {
                     const wallet = await Wallet.findOne({ user: order.user, ...tf }).session(session);
                     const currentBalance = wallet ? wallet.balance : 0;
-                    const isWalletRefund = (order.paymentMethod === 'Wallet' || refundMode === 'wallet');
-                    const balanceBefore = isWalletRefund ? currentBalance - refundAmount : currentBalance;
+                    const balanceBefore = walletRefund ? roundPaise(currentBalance - refundAmount) : currentBalance;
 
                     await Transaction.create([{
                         user: order.user,
@@ -1281,7 +1727,7 @@ exports.refundPayment = async (req, res) => {
                         order: order._id,
                         type: 'refund',
                         amount: refundAmount,
-                        paymentMethod: order.paymentMethod === 'online' ? 'upi' : order.paymentMethod.toLowerCase(),
+                        paymentMethod: ledgerPaymentMethod(order.paymentMethod),
                         status: 'completed',
                         description: `Refund of ₹${refundAmount} for order ${order.orderId}: ${reason || 'No reason'}`,
                         transactionId: idGen.transactionId(),
@@ -1322,7 +1768,7 @@ exports.refundPayment = async (req, res) => {
                     recipient: order.user,
                     recipientRole: 'customer',
                     title: 'Refund Processed',
-                    description: `₹${refundAmount} has been refunded to your ${refundMode === 'wallet' ? 'wallet' : 'original payment method'}.`,
+                    description: `₹${refundAmount} has been refunded to your ${walletRefund ? 'wallet' : 'original payment method'}.`,
                     category: 'Wallet',
                     priority: 'medium',
                     meta: { orderId: order.orderId, amount: refundAmount },
@@ -1475,7 +1921,10 @@ exports.refundOrphanPayment = async (req, res) => {
         // customer could pay, eat, and refund themselves.
         const rzpOrderId = payment.order_id || null;
         const orderRefs = [{ razorpayPaymentId: razorpay_payment_id }];
-        if (rzpOrderId) orderRefs.push({ razorpayOrderId: rzpOrderId });
+        if (rzpOrderId) {
+            orderRefs.push({ razorpayOrderId: rzpOrderId });
+            orderRefs.push({ razorpayOrderIds: rzpOrderId });
+        }
         const bookingRefs = [{ 'payment.razorpayPaymentId': razorpay_payment_id }];
         if (rzpOrderId) {
             bookingRefs.push({ 'payment.razorpayOrderId': rzpOrderId });
@@ -1524,9 +1973,8 @@ exports.refundOrphanPayment = async (req, res) => {
         // Razorpay dashboard reads like a story instead of a guid.
         let refund;
         try {
-            refund = await razorpay.refunds.create({
-                payment_id: razorpay_payment_id,
-                amount: refundableAmount,
+            refund = await razorpay.payments.refund(razorpay_payment_id, {
+                amount: refundableAmount, // paise
                 notes: {
                     type: 'orphan_refund',
                     reason: String(reason || 'Order creation failed after payment'),
@@ -1616,8 +2064,9 @@ exports.createWalletRechargeOrder = async (req, res) => {
     try {
         const { amount } = req.body;
 
-        if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
-            return res.status(400).json({ success: false, message: 'Amount must be a valid positive number' });
+        // Razorpay refuses orders under 100 paise — reject before the gateway.
+        if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 1) {
+            return res.status(400).json({ success: false, message: 'Amount must be at least ₹1' });
         }
         if (amount > 10000) {
             return res.status(400).json({ success: false, message: 'Maximum recharge amount is ₹10,000' });
@@ -1821,6 +2270,53 @@ exports.verifyWalletRecharge = async (req, res) => {
 //
 // Access: Admin only
 
+// Payments across EVERY checkout opened for the order (decision 4a) —
+// a capture on an older checkout is recovered too.
+async function fetchOrderCheckoutPayments(order) {
+    const items = [];
+    for (const id of orderCheckoutIds(order)) {
+        const res = await razorpay.orders.fetchPayments(id);
+        for (const p of res?.items || []) items.push({ ...p, order_id: p.order_id || id });
+    }
+    return { items };
+}
+
+// Apply one captured payment found by reconciliation. Same rules as
+// verify-payment / the webhook: the capture must cover what is due, the
+// payment id is claimed once, and the Paid transition is atomic.
+async function settleReconciledCapture(order, captured) {
+    const capturedAmount = paiseToRupees(captured.amount);
+    const cover = checkCaptureCoversDue({ order, amount: capturedAmount });
+    if (!cover.ok) {
+        return { status: 'underpaid', amount: capturedAmount };
+    }
+    const reconClaim = await claimPayment(captured.id, {
+        purpose: 'order_payment',
+        ref: String(order._id),
+        razorpayOrderId: captured.order_id || order.razorpayOrderId,
+        restaurant: order.restaurant || null,
+        user: order.user || null,
+        amount: capturedAmount,
+    });
+    if (!reconClaim.claimed) {
+        return { status: 'payment_used_elsewhere' };
+    }
+    // Status stays as-is — chef owns the new→preparing transition.
+    const paidOrder = await markOrderPaidAtomically(order, {
+        paymentId: captured.id,
+        razorpayOrderId: captured.order_id || order.razorpayOrderId,
+        capturedAmount,
+        priorPaid: cover.priorPaid,
+        paidAt: captured.created_at ? new Date(captured.created_at * 1000) : null,
+    });
+    if (!paidOrder) {
+        return { status: 'already_settled' };
+    }
+    await awardLoyaltyPoints(paidOrder);
+    await settleSplitSiblings(paidOrder, 'online');
+    return { status: 'recovered', amount: paidOrder.amountPaid };
+}
+
 exports.reconcilePayments = async (req, res) => {
     try {
         const staleMinutes = Math.max(1, Math.min(1440, parseInt(req.query.minutes) || 30));
@@ -1839,39 +2335,12 @@ exports.reconcilePayments = async (req, res) => {
         for (const order of staleOrders) {
             try {
                 // Fetch payments for this Razorpay order
-                const payments = await razorpay.orders.fetchPayments(order.razorpayOrderId);
+                const payments = await fetchOrderCheckoutPayments(order);
                 const captured = payments.items?.find(p => p.status === 'captured');
-                const reconClaim = captured ? await claimPayment(captured.id, {
-                    purpose: 'order_payment',
-                    ref: String(order._id),
-                    razorpayOrderId: order.razorpayOrderId,
-                    restaurant: order.restaurant || null,
-                    user: order.user || null,
-                    amount: captured.amount / 100,
-                }) : null;
-
-                if (captured && !reconClaim.claimed) {
-                    results.push({ orderId: order.orderId, status: 'payment_used_elsewhere' });
-                } else if (captured) {
-                    order.paymentStatus = 'Paid';
-                    order.paymentMethod = 'online';
-                    order.amountPaid = captured.amount / 100;
-                    order.razorpayPaymentId = captured.id;
-                    if (!order.paidAt) {
-                        order.paidAt = captured.created_at
-                            ? new Date(captured.created_at * 1000)
-                            : new Date();
-                    }
-                    // Status stays as-is — chef owns the new→preparing
-                    // transition. See verifyPayment for the full rationale.
-                    await order.save();
-
-                    await awardLoyaltyPoints(order);
-
-                    results.push({ orderId: order.orderId, status: 'recovered', amount: order.amountPaid });
+                const outcome = captured ? await settleReconciledCapture(order, captured) : { status: 'still_pending' };
+                results.push({ orderId: order.orderId, ...outcome });
+                if (outcome.status === 'recovered') {
                     logger.info(`Reconciled: order ${order.orderId} marked as Paid`);
-                } else {
-                    results.push({ orderId: order.orderId, status: 'still_pending' });
                 }
             } catch (fetchErr) {
                 results.push({ orderId: order.orderId, status: 'error', error: fetchErr.message });
@@ -1912,36 +2381,19 @@ exports.runScheduledReconciliation = async () => {
 
                 for (const order of staleOrders) {
                     try {
-                        const payments = await razorpay.orders.fetchPayments(order.razorpayOrderId);
+                        const payments = await fetchOrderCheckoutPayments(order);
                         const captured = payments.items?.find(p => p.status === 'captured');
-                        const reconClaim = captured ? await claimPayment(captured.id, {
-                            purpose: 'order_payment',
-                            ref: String(order._id),
-                            razorpayOrderId: order.razorpayOrderId,
-                            restaurant: order.restaurant || null,
-                            user: order.user || null,
-                            amount: captured.amount / 100,
-                        }) : null;
-                        if (captured && !reconClaim.claimed) {
+                        if (!captured) continue;
+                        const outcome = await settleReconciledCapture(order, captured);
+                        if (outcome.status === 'payment_used_elsewhere') {
                             logger.warn(`Auto-reconcile: payment ${captured.id} already claimed elsewhere — skipping ${order.orderId}`);
-                        } else if (captured) {
-                            order.paymentStatus = 'Paid';
-                            order.paymentMethod = 'online';
-                            order.amountPaid = captured.amount / 100;
-                            order.razorpayPaymentId = captured.id;
-                            if (!order.paidAt) {
-                                order.paidAt = captured.created_at
-                                    ? new Date(captured.created_at * 1000)
-                                    : new Date();
-                            }
-                            // Status stays as-is — chef owns the new→preparing
-                            // transition. See verifyPayment for the full rationale.
-                            await order.save();
-                            await awardLoyaltyPoints(order);
+                        } else if (outcome.status === 'underpaid') {
+                            logger.warn(`Auto-reconcile: payment ${captured.id} (₹${outcome.amount}) does not cover ${order.orderId} — left unpaid`);
+                        } else if (outcome.status === 'recovered') {
                             logger.info(`Auto-reconciled: order ${order.orderId} (${restaurant.slug}) marked as Paid`);
                         }
                     } catch (fetchErr) {
-                        logger.warn(`Auto-reconcile error for ${order.orderId}:`, { error: fetchErr.message });
+                        logger.warn(`Auto-reconcile error for ${order.orderId}:`, describeRazorpayError(fetchErr));
                     }
                 }
                 totalChecked += staleOrders.length;

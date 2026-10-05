@@ -26,6 +26,9 @@ const EVENTS = Object.freeze({
 
     // Tables / sessions
     TABLE_UPDATED: 'table:updated',
+    // QA #14 — sent to the `table:<id>` room when the admin deletes or
+    // disables a table, so seated diners stop ordering immediately.
+    TABLE_UNAVAILABLE: 'table:unavailable',
     SESSION_ENDED: 'session:ended',
 
     // Customer service requests (waiter calls, bill requests …)

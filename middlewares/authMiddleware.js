@@ -237,6 +237,16 @@ const optionalAuth = async (req, res, next) => {
             const user = await loadUserForToken(decoded);
             if (user && user.status === 'active') {
                 req.user = user;
+            } else {
+                // A well-formed session token whose session was revoked
+                // (tokenVersion bump / user gone) or whose account is
+                // deactivated. Continue as guest, but remember why so
+                // attachTenant can answer 401 instead of 400
+                // TENANT_REQUIRED when no tenant can be resolved — the
+                // client must log the user out, not show the picker.
+                req.authFailure = user
+                    ? { code: 'ACCOUNT_DEACTIVATED', message: 'Account is deactivated. Contact your administrator.' }
+                    : { code: 'SESSION_REVOKED', message: 'Your session has ended. Please sign in again.' };
             }
         } catch {
             // Token invalid/expired/revoked/wrong type — continue as guest

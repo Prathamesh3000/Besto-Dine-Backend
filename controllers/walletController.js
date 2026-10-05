@@ -99,6 +99,14 @@ exports.addPoints = async (req, res) => {
     const tf = tenantFilter(req);
     const restaurant = tenantId(req);
 
+    // Loyalty points belong to customers only (same rule as adjustWallet)
+    // — without this a manager could mint points onto their own account
+    // (the default target) and redeem them into wallet balance.
+    const targetUser = await require('../models/user').findById(userId).select('role').lean();
+    if (!targetUser || targetUser.role !== 'customer') {
+      return res.status(400).json({ success: false, message: 'Points can only be added to customer accounts' });
+    }
+
     // ADM-057 — refuse if admin has blocked/suspended this wallet.
     try { await assertWalletActiveOrNull(userId, tf); }
     catch (gateErr) {
@@ -344,7 +352,12 @@ exports.adjustWallet = async (req, res) => {
       ? (wallet.balance - change)
       : (wallet.loyaltyPoints - change);
 
-    // Record transaction with error handling
+    // Record transaction with error handling.
+    // Units: an admin POINTS deduction is stored as type 'points_redeemed'
+    // with a NEGATIVE amount in POINTS (same convention as points spent on
+    // an order / booking). Positive points_redeemed rows are customer
+    // conversions and carry the RUPEES credited to the wallet. Reports
+    // tell the two apart by sign (see getWalletReports).
     try {
       await Transaction.create({
         user: targetUserId,
@@ -829,14 +842,16 @@ exports.getWalletReports = async (req, res) => {
         const highest = wallets.reduce((max, w) => Math.max(max, w.balance || 0), 0);
 
         // Distribution buckets
+        // Contiguous (lo, hi] edges so fractional balances (₹500.50) land
+        // in exactly one bucket and the counts always sum to totalWallets.
         const buckets = [
-          { label: '₹0-500', min: 0, max: 500 },
-          { label: '₹501-2000', min: 501, max: 2000 },
-          { label: '₹2001-5000', min: 2001, max: 5000 },
-          { label: '₹5001+', min: 5001, max: Infinity }
+          { label: '₹0-500', lo: -Infinity, hi: 500 },
+          { label: '₹501-2000', lo: 500, hi: 2000 },
+          { label: '₹2001-5000', lo: 2000, hi: 5000 },
+          { label: '₹5001+', lo: 5000, hi: Infinity }
         ];
         const distribution = buckets.map(b => {
-          const count = wallets.filter(w => w.balance >= b.min && w.balance <= b.max).length;
+          const count = wallets.filter(w => (w.balance || 0) > b.lo && (w.balance || 0) <= b.hi).length;
           return {
             label: b.label,
             count,
@@ -852,11 +867,13 @@ exports.getWalletReports = async (req, res) => {
 
       case 'Points Issued vs Redeemed': {
         // Unit normalisation: `points_earned.amount` is stored in POINTS
-        // (e.g., 245), while `points_redeemed.amount` is stored in the
-        // RUPEE-equivalent that was credited to the wallet (e.g., ₹87.7
-        // for 877 redeemed points). Subtracting them directly mixes
-        // units, so we convert redeemed-rupees back to points via the
-        // tenant's pointsToRupee setting.
+        // (e.g., 245). `points_redeemed` has two shapes:
+        //   amount > 0 — customer conversion; RUPEES credited to the
+        //                wallet (₹87.7 for 877 points) → divide by ptr
+        //   amount < 0 — points spent on an order / booking or an admin
+        //                deduction; already in POINTS → |amount|
+        // Mixing the two (dividing everything by ptr) reported an admin
+        // deduction of 100 points as 1,000 points redeemed.
         const { getSettings: _getSettings } = require('../utils/settingsCache');
         const _settings = await _getSettings(req);
         const ptr = _settings?.wallet?.pointsToRupee || 0.1;
@@ -865,19 +882,24 @@ exports.getWalletReports = async (req, res) => {
           { $match: { ...dateFilter, type: 'points_earned', status: 'completed' } },
           { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
         ]);
+        // Points equivalent of one points_redeemed row (see above).
+        const redeemedPointsExpr = { $cond: [
+          { $gt: ['$amount', 0] },
+          ptr > 0 ? { $divide: ['$amount', ptr] } : 0,
+          { $abs: '$amount' },
+        ] };
         const redeemed = await Transaction.aggregate([
           { $match: { ...dateFilter, type: 'points_redeemed', status: 'completed' } },
-          { $group: { _id: null, total: { $sum: { $abs: '$amount' } }, count: { $sum: 1 } } }
+          { $group: { _id: null, total: { $sum: redeemedPointsExpr }, count: { $sum: 1 } } }
         ]);
 
         const totalIssued = Math.round(issued[0]?.total || 0);
-        const redeemedRupees = redeemed[0]?.total || 0;
-        const totalRedeemed = ptr > 0 ? Math.round(redeemedRupees / ptr) : 0;
+        const totalRedeemed = Math.round(redeemed[0]?.total || 0);
 
         // Top redeemers — also normalised to points
         const topRedeemers = await Transaction.aggregate([
           { $match: { ...dateFilter, type: 'points_redeemed', status: 'completed' } },
-          { $group: { _id: '$user', totalRedeemed: { $sum: { $abs: '$amount' } } } },
+          { $group: { _id: '$user', totalRedeemed: { $sum: redeemedPointsExpr } } },
           { $sort: { totalRedeemed: -1 } },
           { $limit: 5 },
           { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'userInfo' } },
@@ -894,7 +916,7 @@ exports.getWalletReports = async (req, res) => {
             topRedeemers: topRedeemers.map((r, i) => ({
               rank: i + 1,
               name: r.name,
-              pts: ptr > 0 ? Math.round(r.totalRedeemed / ptr) : 0,
+              pts: Math.round(r.totalRedeemed),
             }))
           }
         });
@@ -1006,7 +1028,12 @@ exports.getWalletReports = async (req, res) => {
             totalRecharge: { $sum: { $cond: [
               { $or: [
                 { $eq: ['$type', 'wallet_recharge'] },
-                { $eq: ['$type', 'points_redeemed'] },
+                // Only positive rows (rupees credited by a conversion);
+                // negative rows are points spent / admin deductions.
+                { $and: [
+                  { $eq: ['$type', 'points_redeemed'] },
+                  { $gt: ['$amount', 0] },
+                ]},
                 { $and: [
                   { $eq: ['$type', 'refund'] },
                   { $gt: ['$balanceAfter', '$balanceBefore'] },
@@ -1079,7 +1106,8 @@ exports.getWalletReports = async (req, res) => {
         const inputMatch = (range) => ({
           $or: [
             { type: 'wallet_recharge', status: 'completed', ...range, ...tf, ...bf },
-            { type: 'points_redeemed', status: 'completed', ...range, ...tf, ...bf },
+            // amount > 0 only: negative rows are points units, not rupees.
+            { type: 'points_redeemed', status: 'completed', amount: { $gt: 0 }, ...range, ...tf, ...bf },
             { type: 'refund', status: 'completed', ...range, ...tf, ...bf,
               $expr: { $gt: ['$balanceAfter', '$balanceBefore'] } },
           ],

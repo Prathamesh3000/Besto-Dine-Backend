@@ -11,7 +11,7 @@ const logger = require('../utils/logger');
 const { getSettings } = require('../utils/settingsCache');
 const { getIO, emitToStaff } = require('../utils/socket');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
-const { freeTableOrUnmergeGroup } = require('../utils/tableMerge');
+const { releaseTableAfterOrderClosed } = require('../utils/tableOccupancy');
 const { httpError, reply } = require('./orderErrors');
 const { orderAccessForCaller } = require('./orderAccess');
 const { notifyCustomerCancellation, notify } = require('./orderNotifications');
@@ -123,6 +123,7 @@ async function cancelOrder(req) {
   // scan session the order was placed under, or staff may cancel.
   // Previously guests (no req.user) skipped the check entirely and
   // could cancel any order by id.
+  // Branch-pinned staff get BRANCH_MISMATCH for another branch's order.
   const access = orderAccessForCaller(req, order);
   if (!access.allowed) {
     throw httpError(403, { success: false, code: access.reason, message: 'Not authorized to cancel this order' });
@@ -155,8 +156,10 @@ async function cancelOrder(req) {
   // the table is part of a merge so all siblings go back to 'free'
   // together — leaving them in 'merged' after a cancel would ghost
   // the admin dashboard.
+  // Another party's still-open order on the same table keeps it
+  // occupied (releaseTableAfterOrderClosed repoints activeOrder instead).
   if (order.type === 'dine-in' && order.table) {
-    try { await freeTableOrUnmergeGroup(order.table, tf); }
+    try { await releaseTableAfterOrderClosed(order, tf); }
     catch (err) { logger.warn('Failed to free table on cancel:', err.message); }
   }
 
@@ -188,7 +191,10 @@ async function rateOrder(req) {
   const { id } = req.params;
   const { rating, feedback } = req.body;
 
-  if (!rating || rating < 1 || rating > 5) {
+  // Numeric 1-5 only — a non-numeric string used to slip past the
+  // range check and 500 on the Number cast at save.
+  const ratingValue = typeof rating === 'string' && rating.trim() !== '' ? Number(rating) : rating;
+  if (typeof ratingValue !== 'number' || !Number.isFinite(ratingValue) || ratingValue < 1 || ratingValue > 5) {
     throw httpError(400, { success: false, message: 'Rating must be between 1 and 5' });
   }
 
@@ -200,9 +206,12 @@ async function rateOrder(req) {
   if (!order) order = await Order.findOne({ orderId: id, ...tf });
   if (!order) throw httpError(404, { success: false, message: 'Order not found' });
 
-  // Ownership check: only the customer who placed the order can rate it
-  if (req.user && order.user && order.user.toString() !== req.user.id.toString()) {
-    throw httpError(403, { success: false, message: 'Not authorized to rate this order' });
+  // Ownership check: only the customer who placed the order, or — for
+  // an ownerless guest order — the caller holding its scan session, may
+  // rate it. Anonymous callers and other customers are refused.
+  const access = orderAccessForCaller(req, order);
+  if (!access.allowed || access.isStaff) {
+    throw httpError(403, { success: false, code: access.reason, message: 'Not authorized to rate this order' });
   }
 
   // Only delivered/served orders can be rated
@@ -213,7 +222,7 @@ async function rateOrder(req) {
   // Sanitize feedback (trim + length cap)
   const cleanFeedback = (feedback || '').toString().trim().slice(0, 500);
 
-  order.rating = rating;
+  order.rating = ratingValue;
   order.feedback = cleanFeedback;
   order.ratedAt = new Date();
   await order.save();
@@ -260,7 +269,7 @@ async function cleanupStaleReadyOrders(req) {
   const pinned = pinnedBranchId(req);
   if (pinned) filter.branch = pinned;
 
-  const candidates = await Order.find(filter).select('orderId type branch paymentStatus amountPaid updatedAt total note');
+  const candidates = await Order.find(filter).select('orderId type table branch paymentStatus amountPaid updatedAt total note');
 
   if (dryRun) {
     return reply(200, {
@@ -295,6 +304,17 @@ async function cleanupStaleReadyOrders(req) {
       { _id: o._id, ...tenantFilter(req) },
       { $set: { status: 'cancelled', note: ((o.note ? o.note + ' | ' : '') + note) } }
     );
+    // A cancelled dine-in order must release (or repoint) its table like
+    // every other cancel path — otherwise the table stays occupied with
+    // activeOrder pointing at a cancelled order.
+    if (o.type === 'dine-in' && o.table) {
+      try {
+        const { freedIds } = await releaseTableAfterOrderClosed(o, tenantFilter(req));
+        for (const tid of freedIds) {
+          emitToStaff(getIO(), o.branch || null, 'table:updated', { tableId: tid, status: 'free' });
+        }
+      } catch (err) { logger.warn('Failed to free table on stale cleanup:', err.message); }
+    }
   }
 
   // Audit log + admin notification. Paid orders go into a "needs refund"

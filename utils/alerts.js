@@ -37,6 +37,30 @@ const User = require('../models/user');
 const Order = require('../models/order');
 const AuditLog = require('../models/auditLog');
 
+// Tenant-chosen values (name, slug, contact email, …) are interpolated
+// into the alert HTML — escape them so a tenant cannot inject links or
+// markup into an operator email. Subjects stay plain text.
+function esc(str = '') {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// HTML body → plain-text alternative (strip tags, then decode the
+// entities esc() produced).
+function htmlToText(html = '') {
+    return String(html)
+        .replace(/<[^>]+>/g, '')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, '&');
+}
+
 const DORMANCY_DAYS = 7;
 const DORMANCY_COOLDOWN_DAYS = 7;
 
@@ -129,7 +153,7 @@ async function sendAlert({ action, restaurant, subject, body, detailsExtra = {} 
         //    / resend / mailgun / dev-console fallback).
         for (const to of recipients) {
             try {
-                await sendEmail({ to, subject, html: body, text: body.replace(/<[^>]+>/g, '') });
+                await sendEmail({ to, subject, html: body, text: htmlToText(body) });
             } catch (err) {
                 logger.error(`alert email failed for ${to}: ${err.message}`);
             }
@@ -156,14 +180,14 @@ async function notifyTenantHalted(restaurant) {
         restaurant,
         subject: `[BestoDine] Subscription halted — ${restaurant.name}`,
         body: `
-<p><strong>${restaurant.name}</strong> has had its Razorpay subscription halted.</p>
+<p><strong>${esc(restaurant.name)}</strong> has had its Razorpay subscription halted.</p>
 <p>The tenant has been auto-suspended and staff are now locked out until
 the payment is recovered. You may want to contact the owner to recover
 the subscription or authorize a new payment method.</p>
 <ul>
-  <li>Tenant: ${restaurant.name} (${restaurant.slug})</li>
-  <li>Owner email: ${restaurant.contactEmail || '—'}</li>
-  <li>Plan: ${restaurant.subscription?.planName || '—'}</li>
+  <li>Tenant: ${esc(restaurant.name)} (${esc(restaurant.slug)})</li>
+  <li>Owner email: ${esc(restaurant.contactEmail || '—')}</li>
+  <li>Plan: ${esc(restaurant.subscription?.planName || '—')}</li>
   <li>Suspended at: ${new Date().toISOString()}</li>
 </ul>
 <p><a href="${tenantLink(restaurant._id)}">Open tenant in Super Admin →</a></p>
@@ -187,12 +211,12 @@ async function notifyTenantCancelled(restaurant) {
         restaurant,
         subject: `[BestoDine] Subscription cancelled — ${restaurant.name}`,
         body: `
-<p><strong>${restaurant.name}</strong>'s subscription has been cancelled.</p>
+<p><strong>${esc(restaurant.name)}</strong>'s subscription has been cancelled.</p>
 <p>Access will continue until the current billing period ends.</p>
 <ul>
-  <li>Tenant: ${restaurant.name} (${restaurant.slug})</li>
-  <li>Owner email: ${restaurant.contactEmail || '—'}</li>
-  <li>Plan: ${restaurant.subscription?.planName || '—'}</li>
+  <li>Tenant: ${esc(restaurant.name)} (${esc(restaurant.slug)})</li>
+  <li>Owner email: ${esc(restaurant.contactEmail || '—')}</li>
+  <li>Plan: ${esc(restaurant.subscription?.planName || '—')}</li>
   <li>Access until: ${periodEnd ? new Date(periodEnd).toISOString() : '—'}</li>
 </ul>
 <p><a href="${tenantLink(restaurant._id)}">Open tenant in Super Admin →</a></p>
@@ -215,13 +239,13 @@ async function notifyTenantDormant(restaurant) {
         restaurant,
         subject: `[BestoDine] Dormant tenant — ${restaurant.name}`,
         body: `
-<p><strong>${restaurant.name}</strong> has not processed any orders in
+<p><strong>${esc(restaurant.name)}</strong> has not processed any orders in
 the last ${DORMANCY_DAYS} days. Worth a check-in before silent churn.</p>
 <ul>
-  <li>Tenant: ${restaurant.name} (${restaurant.slug})</li>
-  <li>Owner email: ${restaurant.contactEmail || '—'}</li>
-  <li>Status: ${restaurant.status}</li>
-  <li>Plan: ${restaurant.subscription?.planName || '—'}</li>
+  <li>Tenant: ${esc(restaurant.name)} (${esc(restaurant.slug)})</li>
+  <li>Owner email: ${esc(restaurant.contactEmail || '—')}</li>
+  <li>Status: ${esc(restaurant.status)}</li>
+  <li>Plan: ${esc(restaurant.subscription?.planName || '—')}</li>
 </ul>
 <p><a href="${tenantLink(restaurant._id)}">Open tenant in Super Admin →</a></p>
         `.trim(),

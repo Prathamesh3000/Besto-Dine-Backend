@@ -57,6 +57,30 @@ const createBookingValidation = validate([
     optionalShortString('razorpayPaymentId', 200),
     optionalShortString('razorpay_order_id', 200),
     optionalShortString('razorpay_signature', 512),
+    // Parking (QA N10/N11). Business rules — known vehicle type, max
+    // duration from settings — live in utils/parkingConfig; these only
+    // check shape so a junk payload is a clean 400.
+    body('parkingVehicles')
+        .optional({ values: 'null' })
+        .isArray({ max: 10 }).withMessage('parkingVehicles must be a list (max 10 vehicle types)'),
+    body('parkingVehicles.*.vehicleType')
+        .isString().withMessage('Each parking row needs a vehicle type').bail()
+        .trim().isLength({ min: 1, max: 30 }).withMessage('Vehicle type must be 1-30 characters'),
+    body('parkingVehicles.*.count')
+        .isInt({ min: 0, max: 500 }).withMessage('Vehicle count must be between 0 and 500'),
+    body('parkingMode')
+        .optional({ values: 'falsy' })
+        .isIn(['event', 'custom']).withMessage('Parking mode must be "event" or "custom"'),
+    body('parkingStartTime')
+        .optional({ values: 'falsy' })
+        .matches(/^([01]\d|2[0-3]):[0-5]\d$/).withMessage('Parking start time must be HH:MM'),
+    body('parkingDuration')
+        .optional({ values: 'null' })
+        .isInt({ min: 1, max: 24 }).withMessage('Parking duration must be 1-24 hours'),
+    optionalShortString('selectedVehicle', 30),
+    body('vehicleCount')
+        .optional({ values: 'null' })
+        .isInt({ min: 0, max: 500 }).withMessage('Vehicle count must be between 0 and 500'),
 ]);
 
 // Create a new booking (Logged in users only)
@@ -120,7 +144,14 @@ const detailsValidation = validate([
         .trim().isLength({ min: 1, max: 100 }).withMessage('Add-on name must be 1-100 characters'),
     body('addons.*.price').isFloat({ min: 0, max: 1000000 }).withMessage('Add-on price must be between 0 and 1000000'),
     body('parking').optional().custom((v) => v && typeof v === 'object' && !Array.isArray(v)).withMessage('Invalid parking details'),
-    body('parking.vehicleCount').if(body('parking').exists()).isInt({ min: 0, max: 500 }).withMessage('Vehicle count must be between 0 and 500'),
+    // Multi-vehicle edit sends `vehicles`; the legacy single-type edit sends `vehicleCount`.
+    body('parking').optional().custom((v) => Array.isArray(v.vehicles) || v.vehicleCount !== undefined)
+        .withMessage('Parking needs vehicles or a vehicle count'),
+    body('parking.vehicleCount').optional().isInt({ min: 0, max: 500 }).withMessage('Vehicle count must be between 0 and 500'),
+    body('parking.vehicles').optional().isArray({ max: 10 }).withMessage('Parking vehicles must be a list (max 10)'),
+    body('parking.vehicles.*.vehicleType').isString().withMessage('Vehicle type is required').bail()
+        .trim().isLength({ min: 1, max: 30 }).withMessage('Vehicle type must be 1-30 characters'),
+    body('parking.vehicles.*.count').isInt({ min: 0, max: 500 }).withMessage('Vehicle count must be between 0 and 500'),
     body('parking.hours').if(body('parking').exists()).isInt({ min: 0, max: 48 }).withMessage('Parking hours must be between 0 and 48'),
     body('discount').optional().isFloat({ min: 0, max: 100000000 }).withMessage('Discount must be 0 or more'),
 ]);

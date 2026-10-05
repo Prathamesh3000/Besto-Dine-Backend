@@ -460,6 +460,13 @@ const attachTenant = async (req, res, next) => {
             }
         }
 
+        // A revoked / deactivated session token (flagged by optionalAuth)
+        // is an auth failure, not a missing tenant: answer 401 so the
+        // client logs out instead of redirecting to the restaurant picker.
+        if (req.authFailure) {
+            return res.status(401).json({ success: false, code: req.authFailure.code, message: req.authFailure.message });
+        }
+
         // No tenant context at all — reject. The escape hatch that
         // used to fall through to req.restaurant = null was removed
         // for CRIT-01. Fail closed.

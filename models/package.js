@@ -27,7 +27,7 @@ const packageSchema = new mongoose.Schema({
   // (anniversary, festival, etc.) for tenants who want them without
   // requiring a schema migration.
   type: { type: String, default: '' },
-  price: { type: Number, required: true },
+  price: { type: Number, required: true, min: [0, 'Price cannot be negative'] },
   description: String,
   items: [String], // Legacy, keeping for compatibility
   
@@ -41,8 +41,8 @@ const packageSchema = new mongoose.Schema({
   category: { type: String, enum: ['All', 'Classic', 'Royal', 'Gold', 'Elite'], default: 'All' },
   badge: { type: String, default: 'Silver' },
   badgeColor: { type: String, default: 'bg-gray-100 text-gray-600' },
-  minPeople: { type: Number, default: 0 },
-  maxPeople: { type: Number, default: 0 },
+  minPeople: { type: Number, default: 0, min: [0, 'Minimum people cannot be negative'] },
+  maxPeople: { type: Number, default: 0, min: [0, 'Maximum people cannot be negative'] },
   isActive: { type: Boolean, default: true }
 }, { timestamps: true });
 

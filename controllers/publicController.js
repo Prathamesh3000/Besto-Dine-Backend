@@ -196,7 +196,7 @@ exports.getRestaurantBranches = async (req, res) => {
         const tenant = await Restaurant.findOne({
             slug: String(slug).toLowerCase().trim(),
             status: { $in: ['active', 'trial'] },
-        }).select('_id').lean();
+        }).select('_id name').lean();
         if (!tenant) {
             return res.status(200).json({ success: true, data: [] });
         }
@@ -693,6 +693,14 @@ exports.submitLead = async (req, res) => {
         } = req.body || {};
 
         // ── Required-field validation ──────────────────────────────
+        // Text fields only — a number / object / array is a client error,
+        // not a TypeError (500) on .trim().
+        const textFields = { name, restaurantName, phone, email, message, source };
+        for (const [key, value] of Object.entries(textFields)) {
+            if (value !== undefined && value !== null && typeof value !== 'string') {
+                return res.status(400).json({ success: false, message: `Invalid ${key}.` });
+            }
+        }
         const cleanName = (name || '').trim();
         const cleanRestaurant = (restaurantName || '').trim();
         const cleanPhone = (phone || '').trim();

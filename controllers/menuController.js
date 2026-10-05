@@ -132,6 +132,47 @@ function buildBranchFilter(query, req) {
     return null;
 }
 
+/**
+ * "Copy from Main" clones Category docs into the new branch (new ids)
+ * but shared menu items keep pointing at the source (Main / tenant-level)
+ * categories, and a Branch Admin only sees their branch's categories.
+ * Map source category ids to the branch's same-named copy so a pinned
+ * viewer's items land in (and can be filtered by) their own categories.
+ */
+async function branchCategoryAliases(req, branchId) {
+    const branchCats = await Category.find({ ...tenantFilter(req), branch: branchId })
+        .select('_id name image status').lean();
+    const toBranch = new Map();   // source category id → branch category
+    const fromBranch = new Map(); // branch category id → [source ids]
+    if (!branchCats.length) return { toBranch, fromBranch };
+    const byName = new Map(branchCats.map((c) => [String(c.name).toLowerCase(), c]));
+    const sources = await Category.find({
+        ...tenantFilter(req),
+        branch: { $ne: branchId },
+        name: { $in: branchCats.map((c) => c.name) },
+    }).select('_id name').lean();
+    for (const src of sources) {
+        const bc = byName.get(String(src.name).toLowerCase());
+        if (!bc) continue;
+        toBranch.set(String(src._id), bc);
+        const list = fromBranch.get(String(bc._id)) || [];
+        list.push(src._id);
+        fromBranch.set(String(bc._id), list);
+    }
+    return { toBranch, fromBranch };
+}
+
+function remapItemCategories(items, toBranch) {
+    if (!toBranch?.size) return items;
+    for (const item of items) {
+        const cid = item?.category?._id || item?.category;
+        const bc = cid && toBranch.get(String(cid));
+        if (!bc) continue;
+        item.category = item.category?._id ? { ...item.category, ...bc } : bc._id;
+    }
+    return items;
+}
+
 // @desc    Get all menu items (searching, filtering, pagination)
 // @route   GET /api/menu
 // @access  Public
@@ -149,6 +190,8 @@ exports.getAllMenuItems = async (req, res) => {
         // branch" scope. Admin queries can override via ?branch=all.
         const branchClause = buildBranchFilter(req.query, req);
         if (branchClause) Object.assign(queryObj, branchClause);
+        const pinnedForCats = pinnedBranchId(req);
+        const catAliases = pinnedForCats ? await branchCategoryAliases(req, pinnedForCats) : null;
 
         // Restrict to an explicit id set (used by the Menu page's
         // "Needs Attention First" filter, which passes the ids of items with
@@ -174,7 +217,8 @@ exports.getAllMenuItems = async (req, res) => {
         if (category && category !== 'All Category' && category !== 'Select Category') {
             // Only filter by category if it's a valid ObjectId — ignore invalid values
             if (mongoose.Types.ObjectId.isValid(category)) {
-                queryObj.category = category;
+                const aliases = catAliases?.fromBranch.get(String(category));
+                queryObj.category = aliases ? { $in: [category, ...aliases] } : category;
             }
         }
 
@@ -236,6 +280,7 @@ exports.getAllMenuItems = async (req, res) => {
                 .lean()
         ]);
         applyCustomerBranchPricing(menuItems, req);
+        if (catAliases) remapItemCategories(menuItems, catAliases.toBranch);
 
         // Cache public (unauthenticated) menu reads; skip cache for admin/staff
         // so the dashboard always shows fresh data after edits or re-seeds.
@@ -293,6 +338,22 @@ exports.createMenuItem = async (req, res) => {
         const branchCheck = await resolveBranch(req, req.body.branch);
         if (!branchCheck.ok) {
             return res.status(400).json({ success: false, message: branchCheck.message });
+        }
+
+        // ── Enforce the plan's maxMenuItems limit (0 / missing = uncapped,
+        // same reading as maxTables and the superadmin usage check).
+        const maxMenuItems = req.restaurant?.getLimit?.('maxMenuItems') ?? 0;
+        if (maxMenuItems > 0) {
+            const itemCount = await MenuItem.countDocuments({ ...tenantFilter(req) });
+            if (itemCount >= maxMenuItems) {
+                return res.status(403).json({
+                    success: false,
+                    code: 'MENU_ITEM_LIMIT_REACHED',
+                    message: `Your plan allows ${maxMenuItems} menu item(s). You currently have ${itemCount}. Upgrade your plan to add more.`,
+                    current: itemCount,
+                    limit: maxMenuItems,
+                });
+            }
         }
 
         // Stamp the new item with the current tenant. Body restaurant
@@ -450,6 +511,16 @@ exports.importMenuItemsCsv = async (req, res) => {
         const errors = [];
         let created = 0;
 
+        // Plan maxMenuItems (0 / missing = uncapped) — rows past the cap
+        // are reported as row errors instead of being created.
+        const maxMenuItems = req.restaurant?.getLimit?.('maxMenuItems') ?? 0;
+        let itemCount = maxMenuItems > 0 ? await MenuItem.countDocuments({ ...tenantFilter(req) }) : 0;
+        // HH:MM window bounds; legacy "H:MM" padded, anything else dropped.
+        const csvTime = (raw) => {
+            const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(raw);
+            return m ? m[1].padStart(2, '0') + ':' + m[2] : undefined;
+        };
+
         for (let i = 1; i < rows.length; i++) {
             // CSV row numbers are 1-based and the header is row 1, so the
             // first data row is row 2 from the user's perspective.
@@ -463,6 +534,9 @@ exports.importMenuItemsCsv = async (req, res) => {
                 const categoryName = get('category');
                 const basePriceRaw = get('basePrice');
 
+                if (maxMenuItems > 0 && itemCount >= maxMenuItems) {
+                    throw new Error(`Plan limit reached (${maxMenuItems} menu items). Upgrade your plan to add more.`);
+                }
                 if (!name)        throw new Error('name is required');
                 if (!description) throw new Error('description is required');
                 if (!categoryName) throw new Error('category is required');
@@ -571,7 +645,7 @@ exports.importMenuItemsCsv = async (req, res) => {
                     category: categoryId,
                     basePrice,
                     offerPercentage,
-                    finalPrice: basePrice - (basePrice * (offerPercentage / 100)),
+                    finalPrice: Math.round((basePrice - (basePrice * (offerPercentage / 100))) * 100) / 100,
                     vegType: vegTypeRaw,
                     prepStation: prepStationRaw,
                     unit: get('unit') || 'pieces',
@@ -580,8 +654,8 @@ exports.importMenuItemsCsv = async (req, res) => {
                     prepTimeMinutes: toNum(get('prepTimeMinutes')) ?? 15,
                     serveUpto:       get('serveUpto') || undefined,
                     availableDays,
-                    startTime:       get('startTime') || undefined,
-                    endTime:         get('endTime')   || undefined,
+                    startTime:       csvTime(get('startTime')),
+                    endTime:         csvTime(get('endTime')),
                     ingredients:        splitList(get('ingredients')),
                     sizes:              parseSizes(get('sizes')),
                     toppings:           parseToppings(get('toppings')),
@@ -595,6 +669,7 @@ exports.importMenuItemsCsv = async (req, res) => {
                     branch: branchId,
                 });
                 created += 1;
+                itemCount += 1;
             } catch (rowErr) {
                 errors.push({ row: rowNum, message: rowErr.message });
             }
@@ -714,7 +789,7 @@ exports.updateMenuItem = async (req, res) => {
             if (existing) {
                 const basePrice = updateData.basePrice ?? existing.basePrice;
                 const offerPct = updateData.offerPercentage ?? existing.offerPercentage ?? 0;
-                updateData.finalPrice = basePrice - (basePrice * (offerPct / 100));
+                updateData.finalPrice = Math.round((basePrice - (basePrice * (offerPct / 100))) * 100) / 100;
             }
         }
 
@@ -1018,6 +1093,16 @@ exports.setBranchPrices = async (req, res) => {
                 isActive: true,
             });
             if (!exists) continue;
+
+            // One override per branch — duplicates would make the price
+            // a customer pays depend on array order.
+            if (validated.some((v) => String(v.branch) === String(entry.branch))) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'DUPLICATE_BRANCH_PRICE',
+                    message: 'Each branch can have only one price override.',
+                });
+            }
 
             validated.push({
                 branch: entry.branch,

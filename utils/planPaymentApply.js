@@ -1,6 +1,7 @@
 const Restaurant = require('../models/restaurant');
 const SubscriptionInvoice = require('../models/subscriptionInvoice');
 const logger = require('./logger');
+const { describeRazorpayError } = require('./razorpayErrors');
 
 // Apply a pending plan upgrade onto the live subscription. Idempotent:
 // no-op once pendingUpgrade has been cleared, so retried webhooks /
@@ -20,13 +21,15 @@ function applyPendingUpgrade(restaurant) {
         restaurant.subscription.razorpaySubscriptionId = pending.razorpaySubscriptionId;
         if (oldSubId) {
             try {
-                const razorpay = require('./razorpay');
-                if (razorpay && razorpay.subscriptions) {
-                    razorpay.subscriptions.cancel(oldSubId, { cancel_at_cycle_end: 0 })
-                        .catch(err => logger.warn(`Failed to cancel old subscription ${oldSubId}: ${err.message}`));
-                }
+                // Immediate cancel (cancelAtCycleEnd=false) — the tenant
+                // has just paid on the NEW subscription; leaving the old
+                // one running would double-bill them. Lazy require keeps
+                // the Razorpay SDK out of this module's load path.
+                const { cancelRazorpaySubscription } = require('./razorpayBilling');
+                cancelRazorpaySubscription(oldSubId, false)
+                    .catch(err => logger.warn(`Failed to cancel old subscription ${oldSubId}`, describeRazorpayError(err)));
             } catch (err) {
-                logger.warn(`Razorpay client error during sub cancel: ${err.message}`);
+                logger.warn('Razorpay client error during sub cancel', describeRazorpayError(err));
             }
         }
     }
@@ -47,6 +50,43 @@ function applyPendingUpgrade(restaurant) {
     // silently downgrade them away from the plan they just paid for.
     restaurant.subscription.scheduledDowngrade = undefined;
     return true;
+}
+
+// Local-calendar YYYYMMDD — same basis as the local-midnight
+// `startOfDay` the per-day invoice counter uses. (`toISOString()` would
+// give the UTC date, i.e. yesterday for any server east of UTC.)
+function localYmd(d) {
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// +1 calendar month, clamped to the last day of the next month
+// (31 Jan → 28/29 Feb, not 3 Mar).
+function addOneMonth(from) {
+    const d = new Date(from);
+    const day = d.getDate();
+    d.setDate(1);
+    d.setMonth(d.getMonth() + 1);
+    const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    d.setDate(Math.min(day, lastDay));
+    return d;
+}
+
+// Does this captured payment actually pay for the stashed pendingUpgrade?
+// Returns '' when it does (or when there is nothing pending), otherwise a
+// short reason. Money: payment.amount is PAISE, pending.price is RUPEES.
+function pendingPaymentMismatch(pending, payment) {
+    if (!pending || !pending.planSlug) return '';
+    if (pending.razorpayOrderId && payment.order_id !== pending.razorpayOrderId) {
+        return `order ${payment.order_id || '(none)'} is not the pending upgrade order ${pending.razorpayOrderId}`;
+    }
+    const price = Number(pending.price);
+    if (Number.isFinite(price) && price > 0) {
+        const required = Math.round(price * 100);
+        if (!(Number(payment.amount) >= required)) {
+            return `amount ${payment.amount || 0} paise is below the plan price ${required} paise`;
+        }
+    }
+    return '';
 }
 
 // Shared apply-paid-plan logic used by BOTH the Razorpay webhook
@@ -73,6 +113,17 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
         return { applied: false, invoiceCreated: false, alreadyInvoiced: true };
     }
 
+    // The payment must actually pay for the pending plan: right order
+    // (fallback Orders path) and at least the plan price. Otherwise a
+    // ₹1 capture, or an older cheaper plan order, would unlock whatever
+    // plan is currently pending. Skip — nothing applied, nothing
+    // invoiced — and leave it for manual reconciliation.
+    const mismatch = pendingPaymentMismatch(restaurant.subscription?.pendingUpgrade, payment);
+    if (mismatch) {
+        logger.error(`${logTag}: payment ${payment.id} NOT applied to pending upgrade for ${restaurant.slug}: ${mismatch}`);
+        return { applied: false, invoiceCreated: false, alreadyInvoiced: false, skipped: true, reason: mismatch };
+    }
+
     const applied = applyPendingUpgrade(restaurant);
     restaurant.subscription = restaurant.subscription || {};
     restaurant.subscription.razorpayStatus = 'active';
@@ -80,8 +131,7 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
 
     // Orders-API one-shot: no real cycle date, assume +1 month so the
     // "next billing" badge in the UI has something to render.
-    const oneMonthFromNow = new Date();
-    oneMonthFromNow.setMonth(oneMonthFromNow.getMonth() + 1);
+    const oneMonthFromNow = addOneMonth(new Date());
     restaurant.subscription.currentPeriodEnd = oneMonthFromNow;
     await restaurant.save();
 
@@ -94,7 +144,7 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
     try {
         const startOfDay = new Date();
         startOfDay.setHours(0, 0, 0, 0);
-        const ymd = startOfDay.toISOString().slice(0, 10).replace(/-/g, '');
+        const ymd = localYmd(startOfDay);
         // Atomic-ish invoice numbering. The old `countDocuments + 1`
         // approach raced — two concurrent webhooks on the same day for
         // the same tenant both computed the same N and produced
@@ -198,11 +248,21 @@ function applyScheduledDowngrade(restaurant, { force = false } = {}) {
     restaurant.subscription.razorpayStatus = '';
     restaurant.subscription.scheduledDowngrade = undefined;
 
-    if (restaurant.status === 'suspended') restaurant.status = 'active';
+    // Only lift a payment-related suspension (same rule as
+    // superadminController.confirmPayment) — a tenant suspended for a
+    // ToS / fraud reason must stay suspended.
+    if (restaurant.status === 'suspended' && /payment/i.test(restaurant.suspendedReason || '')) {
+        restaurant.status = 'active';
+        restaurant.suspendedAt = undefined;
+        restaurant.suspendedReason = '';
+    }
     return { applied: true };
 }
 
 module.exports = {
+    localYmd,
+    addOneMonth,
+    pendingPaymentMismatch,
     applyPendingUpgrade,
     applyScheduledDowngrade,
     applyPaidPlanUpgrade,

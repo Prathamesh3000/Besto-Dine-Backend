@@ -35,6 +35,24 @@ const refreshSessionSchema = new mongoose.Schema({
         type: Number,
         default: 0,
     },
+    // ── Absolute session ceiling ──────────────────────────────────
+    // Set ONCE when the family is created (at login) and carried
+    // through every rotation UNCHANGED. `expiresAt` below is per-token
+    // and resets on each refresh — on its own that is a sliding window
+    // with no ceiling, so any client that refreshes before it lapses
+    // stays signed in forever. A tab left open overnight does exactly
+    // that: background polling triggers a refresh every ~30 minutes,
+    // each one buying another full TTL.
+    //
+    // This field is what actually ends a session. Once passed, refresh
+    // is refused however recently the user was active, and they must
+    // sign in again.
+    familyExpiresAt: {
+        type: Date,
+        required: true,
+        index: true,
+    },
+
     expiresAt: {
         type: Date,
         required: true,
@@ -43,6 +61,13 @@ const refreshSessionSchema = new mongoose.Schema({
     revokedAt: {
         type: Date,
         default: null,
+    },
+    // When this token was issued — i.e. when the session was last used
+    // (each refresh issues a new row). Customer sessions end after
+    // CUSTOMER_IDLE_TIMEOUT_MINUTES without use (authController.refresh).
+    lastUsedAt: {
+        type: Date,
+        default: Date.now,
     },
     // Set when the row was revoked because it was rotated (as opposed to
     // logout / theft). Used for the concurrent-refresh grace window.

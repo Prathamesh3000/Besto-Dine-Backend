@@ -32,6 +32,15 @@ const areaSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    // Customer-facing description of the seating option (QA N12) —
+    // shown on the booking review step. Optional; the review falls back
+    // to a generated description when empty.
+    description: {
+        type: String,
+        trim: true,
+        maxlength: [300, 'Description cannot exceed 300 characters'],
+        default: ''
+    },
     isActive: {
         type: Boolean,
         default: true

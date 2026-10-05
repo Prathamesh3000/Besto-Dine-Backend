@@ -3,8 +3,33 @@ const Shift = require('../models/shift');
 const { runShiftAutoClose } = require('../utils/shiftAutoCloser');
 const { getIO, emitToAdmin } = require('../utils/socket');
 
-const { tenantFilter, tenantId } = require('../utils/tenantScope');
+const User = require('../models/user');
+const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const EVENTS = require('../realtime/events');
+
+// Roles that own attendance (mirrors authMiddleware.staffOnly, which
+// guards the clock-in / clock-out routes; re-checked here as defence in
+// depth so customers / superadmins can never write a Shift).
+const SHIFT_ROLES = new Set(['waiter', 'captain', 'chef', 'manager', 'admin']);
+
+/**
+ * Branch gate for admin actions on another staff member's shifts.
+ * Shift has no branch field, so a branch-pinned admin may only act on
+ * staff whose User.branch is their pinned branch. Returns null when the
+ * caller is allowed (tenant-wide admins always are), otherwise the
+ * { status, message } to send: 404 for an unknown staff id, 403 for
+ * staff of another branch.
+ */
+async function staffBranchDenial(req, staffId) {
+    const pinned = pinnedBranchId(req);
+    if (!pinned) return null;
+    const staff = await User.findOne({ _id: staffId, ...tenantFilter(req) }).select('branch').lean();
+    if (!staff) return { status: 404, message: 'Staff member not found' };
+    if (String(staff.branch || '') !== String(pinned)) {
+        return { status: 403, message: 'Staff member does not belong to your branch.' };
+    }
+    return null;
+}
 
 // WAI-029 — broadcast a duty change so the admin staff dashboard can
 // re-query without waiting for React Query's 60s staleTime. Best-effort:
@@ -107,6 +132,9 @@ exports.getStaffShifts = async (req, res) => {
         const limit = Math.min(parseInt(req.query.limit) || 30, 200);
         const skip = (page - 1) * limit;
 
+        const denied = await staffBranchDenial(req, userId);
+        if (denied) return res.status(denied.status).json({ success: false, message: denied.message });
+
         const filter = { staff: userId, ...tenantFilter(req) };
         const totalCount = await Shift.countDocuments(filter);
         const shifts = await Shift.find(filter)
@@ -149,6 +177,12 @@ exports.getStaffShifts = async (req, res) => {
 // POST /api/shifts/clock-in — Start a shift
 exports.clockIn = async (req, res) => {
     try {
+        if (!SHIFT_ROLES.has(req.user?.role)) {
+            return res.status(403).json({ success: false, message: 'Only staff can clock in.' });
+        }
+        if (!tenantId(req)) {
+            return res.status(400).json({ success: false, code: 'TENANT_REQUIRED', message: 'Restaurant context required.' });
+        }
         const staffId = req.user._id;
 
         // "Active shift" check is per-tenant: if a staff member ever
@@ -163,12 +197,23 @@ exports.clockIn = async (req, res) => {
             return res.status(400).json({ success: false, message: 'You already have an active shift' });
         }
 
-        const shift = await Shift.create({
-            staff: staffId,
-            clockIn: new Date(),
-            status: 'active',
-            restaurant: tenantId(req),
-        });
+        // The unique partial index { restaurant, staff } where
+        // status:'active' (models/shift.js) makes concurrent clock-ins
+        // safe: only one insert wins, the rest get E11000 → 400.
+        let shift;
+        try {
+            shift = await Shift.create({
+                staff: staffId,
+                clockIn: new Date(),
+                status: 'active',
+                restaurant: tenantId(req),
+            });
+        } catch (err) {
+            if (err?.code === 11000) {
+                return res.status(400).json({ success: false, message: 'You already have an active shift' });
+            }
+            throw err;
+        }
 
         emitDutyChanged(req, req.user, 'clock-in');
         res.status(201).json({ success: true, shift });
@@ -185,10 +230,18 @@ exports.forceClockOut = async (req, res) => {
     try {
         const { id } = req.params;
         const { note } = req.body || {};
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ success: false, message: 'Invalid shift id' });
+        }
 
         const shift = await Shift.findOne({ _id: id, ...tenantFilter(req) });
         if (!shift) {
             return res.status(404).json({ success: false, message: 'Shift not found' });
+        }
+        const denied = await staffBranchDenial(req, shift.staff);
+        if (denied) {
+            // A shift whose staff row is gone is still out of a pinned admin's reach.
+            return res.status(403).json({ success: false, message: 'Staff member does not belong to your branch.' });
         }
         if (shift.status !== 'active') {
             return res.status(400).json({ success: false, message: 'Shift is not active' });
@@ -229,8 +282,11 @@ exports.runAutoCloseNow = async (req, res) => {
 // POST /api/shifts/clock-out — End active shift
 exports.clockOut = async (req, res) => {
     try {
+        if (!SHIFT_ROLES.has(req.user?.role)) {
+            return res.status(403).json({ success: false, message: 'Only staff can clock out.' });
+        }
         const staffId = req.user._id;
-        const { note } = req.body;
+        const { note } = req.body || {};
 
         const shift = await Shift.findOne({
             staff: staffId,

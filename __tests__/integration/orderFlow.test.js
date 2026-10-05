@@ -354,22 +354,28 @@ describe('append items (second KOT round)', () => {
 });
 
 describe('table capacity', () => {
+    // QA #13 — the scan itself now reserves the seat. Previously the
+    // early scanner held nothing until it ordered, so a second party
+    // could also scan and whoever ordered first won; now the first
+    // scan takes the only seat and every later party is refused at
+    // scan time (before building a cart) and at order time.
     test('a second party cannot scan into or order at a full 1-seat table', async () => {
         const table = await createTable(A, { name: 'Cap-1', capacity: 1 });
-        // Party 2 scans BEFORE party 1 orders, so it holds a valid token.
-        const early = await scanTable(ctx.api, table);
-        expect(early.res.status).toBe(200);
-
-        const p1 = await guestOrder(A, table);
-        expect(p1.res.status).toBe(201);
+        const p1 = await scanTable(ctx.api, table);
+        expect(p1.res.status).toBe(200);
 
         const late = await scanTable(ctx.api, table);
         expect(late.res.status).toBe(409);
         expect(late.res.body.code).toBe('TABLE_CAPACITY_REACHED');
 
-        const p2 = await guestOrder(A, table, { scanToken: early.scanToken });
-        expect(p2.res.status).toBe(409);
-        expect(p2.res.body.code).toBe('TABLE_CAPACITY_REACHED');
+        const first = await guestOrder(A, table, { scanToken: p1.scanToken });
+        expect(first.res.status).toBe(201);
+
+        // A party holding a token from before the table filled up (its
+        // seat released by a staff reset, say) is refused at order time.
+        await Table.updateOne({ _id: table._id }, { $set: { seats: [] } });
+        const intruder = await scanTable(ctx.api, table); // order-only party still counts → full
+        expect(intruder.res.status).toBe(409);
 
         // The seated party can keep ordering.
         const p1again = await guestOrder(A, table, { scanToken: p1.scanToken });

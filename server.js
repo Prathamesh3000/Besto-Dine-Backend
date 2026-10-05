@@ -26,6 +26,17 @@ if (missingAlways.length) {
     console.error(`FATAL: missing required env ${missingAlways.join(', ')}`);
     process.exit(1);
 }
+// A production deploy carrying RAZORPAY_MOCK=true would let anyone
+// order without paying. Die loudly rather than ignore the flag —
+// "quietly ignored" is one refactor away from "quietly honoured".
+try {
+    require('./utils/razorpayMock').assertMockSafe();
+} catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`FATAL: ${err.message}`);
+    process.exit(1);
+}
+
 try {
     config.assertProductionConfig();
 } catch (err) {
@@ -133,7 +144,7 @@ async function runMigrations() {
 // See app.js. /readyz reports 503 once graceful shutdown has begun.
 let isShuttingDown = false;
 const { createApp } = require('./app');
-const { app, allowedOrigins } = createApp({ isShuttingDown: () => isShuttingDown });
+const { app, isOriginAllowed } = createApp({ isShuttingDown: () => isShuttingDown });
 
 // ─── Background jobs (#35) ───────────────────────────────────────────────────
 // Every recurring job below goes through utils/scheduler.scheduleJob, which
@@ -187,7 +198,7 @@ process.on('uncaughtException', (err) => {
 // ─── Create HTTP Server + Socket.io (M1) ────────────────────────────────────
 const server = http.createServer(app);
 const socketUtil = require('./utils/socket');
-socketUtil.init(server, allowedOrigins);
+socketUtil.init(server, isOriginAllowed);
 logger.debug('Socket.io initialized');
 
 // ─── Payment Reconciliation — check stale Pending orders every 30 min ───────
@@ -196,6 +207,11 @@ logger.debug('Socket.io initialized');
 const { runScheduledReconciliation } = require('./controllers/razorpayController');
 const scheduler = require('./utils/scheduler');
 scheduler.scheduleJob('payment-reconciliation', 30 * 60 * 1000, runScheduledReconciliation);
+
+// ─── Halted subscriptions — suspend after the 24h grace period ─────────────
+// subscription.halted marks the tenant past_due and schedules the lockout
+// (decision 5, 2026-10); this job applies it once the grace period ends.
+require('./utils/haltedSubscriptionSuspender').startHaltedSubscriptionSuspender();
 
 // ─── Stale takeaway order sweeper — observe-only, notifies admins ───────────
 // Flags takeaway orders stuck in 'ready' for longer than the threshold

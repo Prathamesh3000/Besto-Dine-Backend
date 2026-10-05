@@ -14,7 +14,53 @@ const sanitizeHtml = require('sanitize-html');
 //   - markdown link / image / reference-definition targets with a
 //     dangerous scheme are neutralised to `#`.
 
+// Entities the browser decodes inside an attribute before it parses a
+// URL. sanitize-html runs with decodeEntities:false (see below), so its
+// own scheme check sees the RAW text — "&#106;avascript:" or
+// "jav&#x09;ascript:" carry no recognisable scheme and would be kept.
+const NAMED_ENTITIES = {
+    colon: ':', tab: '\t', newline: '\n', nbsp: ' ', amp: '&', lt: '<', gt: '>',
+    quot: '"', apos: "'", sol: '/', bsol: '\\', period: '.', comma: ',', semi: ';',
+    lpar: '(', rpar: ')', excl: '!', num: '#', percnt: '%', equals: '=', quest: '?',
+};
+function decodeAttrEntities(value) {
+    let out = String(value);
+    // Decode repeatedly so "&amp;#106;" style double encodings resolve too.
+    for (let i = 0; i < 3; i++) {
+        const next = out
+            .replace(/&#x([0-9a-f]+);?/gi, (m, h) => safeCodePoint(parseInt(h, 16), m))
+            .replace(/&#(\d+);?/g, (m, d) => safeCodePoint(Number(d), m))
+            .replace(/&([a-z]+);/gi, (m, name) => NAMED_ENTITIES[name.toLowerCase()] ?? m);
+        if (next === out) break;
+        out = next;
+    }
+    return out;
+}
+function safeCodePoint(cp, fallback) {
+    try { return String.fromCodePoint(cp); } catch { return fallback; }
+}
+
+const SAFE_URL_SCHEMES = ['http', 'https', 'mailto', 'tel'];
+/** True when a URL attribute, as the browser will read it, has a non-allowed scheme. */
+function hasUnsafeScheme(rawUrl) {
+    // Browsers strip ASCII whitespace / control chars from URLs before
+    // reading the scheme (so "java\tscript:" is javascript:).
+    const url = decodeAttrEntities(rawUrl).replace(/[\u0000- \u007f-\u009f]/g, '');
+    const m = /^([a-z][a-z0-9+.-]*):/i.exec(url);
+    return !!m && !SAFE_URL_SCHEMES.includes(m[1].toLowerCase());
+}
+
+function dropUnsafeUrlAttrs(tagName, attribs) {
+    const clean = { ...attribs };
+    for (const attr of ['href', 'src', 'cite']) {
+        if (clean[attr] !== undefined && hasUnsafeScheme(clean[attr])) delete clean[attr];
+    }
+    return { tagName, attribs: clean };
+}
+
 const SANITIZE_OPTIONS = {
+    // Entity-aware scheme check (runs before sanitize-html's own filter).
+    transformTags: { '*': dropUnsafeUrlAttrs },
     allowedTags: [
         'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'br', 'hr', 'div', 'span',
         'a', 'img', 'figure', 'figcaption',
@@ -110,4 +156,4 @@ function escapeAttr(s) {
         .replace(/'/g, '&#39;');
 }
 
-module.exports = { sanitizeBlogContent };
+module.exports = { sanitizeBlogContent, hasUnsafeScheme };

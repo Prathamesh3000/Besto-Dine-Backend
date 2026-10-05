@@ -18,7 +18,7 @@ const { notify } = require('../services/notificationService');
 const EVENTS = require('../realtime/events');
 const { getSettings } = require('../utils/settingsCache');
 const { tenantFilter, tenantId, strictBranchFilter } = require('../utils/tenantScope');
-const { processOrderRefund } = require('../utils/orderRefund');
+const { processOrderRefund, roundPaise } = require('../utils/orderRefund');
 
 // ─── Customer creates a refund request (explicit, separate from cancel) ───
 exports.createRefundRequest = async (req, res) => {
@@ -37,10 +37,11 @@ exports.createRefundRequest = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Order not found' });
         }
 
-        // Owner check — customers can only request refunds on their own orders.
+        // Owner check — customers can only request refunds on their own
+        // orders. An ownerless (guest) order belongs to nobody logged in,
+        // so a customer can never claim it.
         if (req.user?.role === 'customer'
-            && order.user
-            && order.user.toString() !== req.user.id.toString()) {
+            && (!order.user || order.user.toString() !== String(req.user.id || req.user._id))) {
             return res.status(403).json({ success: false, message: 'Not authorized for this order' });
         }
 
@@ -48,7 +49,7 @@ exports.createRefundRequest = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Only paid orders can be refunded' });
         }
 
-        const balance = Number(order.amountPaid || 0) - Number(order.refundedAmount || 0);
+        const balance = roundPaise(Number(order.amountPaid || 0) - Number(order.refundedAmount || 0));
         if (balance <= 0) {
             return res.status(400).json({ success: false, message: 'Nothing to refund — this order is already fully refunded' });
         }
@@ -65,6 +66,7 @@ exports.createRefundRequest = async (req, res) => {
             if (!Number.isFinite(amount) || amount <= 0) {
                 return res.status(400).json({ success: false, message: 'Refund amount must be a positive number' });
             }
+            amount = roundPaise(amount);
         }
         if (amount > balance + 0.001) {
             return res.status(400).json({ success: false, message: `Refund amount cannot exceed refundable balance (₹${balance.toFixed(2)})` });
@@ -191,45 +193,84 @@ exports.approveRefundRequest = async (req, res) => {
         const { note } = req.body || {};
         const tf = tenantFilter(req);
 
-        const rr = await RefundRequest.findOne({ _id: id, ...tf, ...strictBranchFilter(req) });
+        let rr = await RefundRequest.findOne({ _id: id, ...tf, ...strictBranchFilter(req) });
         if (!rr) return res.status(404).json({ success: false, message: 'Refund request not found' });
         if (rr.status !== 'pending') {
             return res.status(400).json({ success: false, message: `Refund request is already ${rr.status}` });
         }
 
-        const order = await Order.findOne({ _id: rr.order, ...tf });
-        if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+        const orderExists = await Order.exists({ _id: rr.order, ...tf });
+        if (!orderExists) return res.status(404).json({ success: false, message: 'Order not found' });
 
-        // Re-validate the refundable balance — guards against the case
-        // where someone else partially refunded the order in another
-        // window between request creation and approval.
-        const balance = Number(order.amountPaid || 0) - Number(order.refundedAmount || 0);
-        const amount = Math.min(Number(rr.amount || 0), balance);
-        if (amount <= 0) {
-            return res.status(400).json({ success: false, message: 'Order has no refundable balance left' });
+        // Atomically claim the request (pending → approved) BEFORE any money
+        // moves, so two admins approving at once can't both refund. The
+        // claim is returned to 'pending' if the refund does not go through.
+        const decidedBy = req.user?._id || req.user?.id || null;
+        const claimed = await RefundRequest.findOneAndUpdate(
+            { _id: rr._id, status: 'pending' },
+            { $set: { status: 'approved', decidedBy, decidedAt: new Date(), decisionNote: String(note || '').trim() } },
+            { returnDocument: 'after' }
+        );
+        if (!claimed) {
+            const current = await RefundRequest.findById(rr._id).select('status').lean();
+            return res.status(400).json({ success: false, message: `Refund request is already ${current?.status || 'decided'}` });
+        }
+        const unclaim = async () => {
+            try {
+                await RefundRequest.updateOne(
+                    { _id: rr._id, status: 'approved' },
+                    { $set: { status: 'pending', decisionNote: '' }, $unset: { decidedBy: 1, decidedAt: 1 } }
+                );
+            } catch (unclaimErr) {
+                logger.error('approveRefundRequest: could not return request to pending', {
+                    refundRequestId: String(rr._id), error: unclaimErr.message,
+                });
+            }
+        };
+
+        let amount;
+        let result;
+        try {
+            // Read the order AFTER the claim so the balance is current.
+            const order = await Order.findOne({ _id: rr.order, ...tf });
+            if (!order) {
+                await unclaim();
+                return res.status(404).json({ success: false, message: 'Order not found' });
+            }
+
+            // Re-validate the refundable balance — guards against the case
+            // where someone else partially refunded the order in another
+            // window between request creation and approval.
+            const balance = roundPaise(Number(order.amountPaid || 0) - Number(order.refundedAmount || 0));
+            amount = roundPaise(Math.min(Number(rr.amount || 0), balance));
+            if (amount <= 0) {
+                await unclaim();
+                return res.status(400).json({ success: false, message: 'Order has no refundable balance left' });
+            }
+
+            const settings = await getSettings(req);
+            result = await processOrderRefund(order, {
+                amount,
+                reason: `Approved refund request: ${rr.reason || 'No reason'}`,
+                settings,
+                tenantId: tenantId(req),
+            });
+        } catch (refundErr) {
+            await unclaim();
+            throw refundErr;
         }
 
-        const settings = await getSettings(req);
-        const result = await processOrderRefund(order, {
-            amount,
-            reason: `Approved refund request: ${rr.reason || 'No reason'}`,
-            settings,
-            tenantId: tenantId(req),
-        });
-
         if (!result.success) {
-            // Leave the request in 'pending' so the admin can retry after
-            // resolving whatever the gateway/data issue was.
+            // Back to 'pending' so the admin can retry after resolving
+            // whatever the gateway/data issue was.
+            await unclaim();
             return res.status(400).json({ success: false, message: result.error || 'Refund processing failed' });
         }
 
-        rr.status = 'approved';
-        rr.decidedBy = req.user?._id || req.user?.id || null;
-        rr.decidedAt = new Date();
-        rr.decisionNote = String(note || '').trim();
-        rr.refundMode = result.mode || '';
-        rr.razorpayRefundId = result.razorpayRefundId || '';
-        await rr.save();
+        claimed.refundMode = result.mode || '';
+        claimed.razorpayRefundId = result.razorpayRefundId || '';
+        await claimed.save();
+        rr = claimed;
 
         // Customer notification — they're waiting for this status flip.
         if (rr.user) {
@@ -267,17 +308,28 @@ exports.rejectRefundRequest = async (req, res) => {
         const { note } = req.body || {};
         const tf = tenantFilter(req);
 
-        const rr = await RefundRequest.findOne({ _id: id, ...tf, ...strictBranchFilter(req) });
+        let rr = await RefundRequest.findOne({ _id: id, ...tf, ...strictBranchFilter(req) });
         if (!rr) return res.status(404).json({ success: false, message: 'Refund request not found' });
         if (rr.status !== 'pending') {
             return res.status(400).json({ success: false, message: `Refund request is already ${rr.status}` });
         }
 
-        rr.status = 'rejected';
-        rr.decidedBy = req.user?._id || req.user?.id || null;
-        rr.decidedAt = new Date();
-        rr.decisionNote = String(note || '').trim();
-        await rr.save();
+        // Atomic pending → rejected so a concurrent approve can't also win.
+        const decided = await RefundRequest.findOneAndUpdate(
+            { _id: rr._id, status: 'pending' },
+            { $set: {
+                status: 'rejected',
+                decidedBy: req.user?._id || req.user?.id || null,
+                decidedAt: new Date(),
+                decisionNote: String(note || '').trim(),
+            } },
+            { returnDocument: 'after' }
+        );
+        if (!decided) {
+            const current = await RefundRequest.findById(rr._id).select('status').lean();
+            return res.status(400).json({ success: false, message: `Refund request is already ${current?.status || 'decided'}` });
+        }
+        rr = decided;
 
         if (rr.user) {
             await notify({

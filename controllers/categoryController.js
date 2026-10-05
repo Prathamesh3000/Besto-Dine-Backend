@@ -248,8 +248,12 @@ exports.reorderCategories = async (req, res) => {
         }
 
         const tf = tenantFilter(req);
+        // A Branch Admin may only reorder their own branch's categories
+        // (same scope as update / delete).
+        const pinned = pinnedBranchId(req);
+        const bf = pinned ? strictBranchFilter(req) : {};
         const updatePromises = categories.map(cat =>
-            Category.findOneAndUpdate({ _id: cat.id, ...tf }, { displayOrder: cat.displayOrder })
+            Category.findOneAndUpdate({ _id: cat.id, ...tf, ...bf }, { displayOrder: cat.displayOrder })
         );
 
         await Promise.all(updatePromises);

@@ -6,9 +6,9 @@
  * real app through createApp() (__tests__/integration/helpers/createTestApp.js).
  *
  *   const { createApp } = require('./app');
- *   const { app, allowedOrigins } = createApp({ isShuttingDown: () => false });
+ *   const { app, isOriginAllowed } = createApp({ isShuttingDown: () => false });
  *   const server = http.createServer(app);
- *   require('./utils/socket').init(server, allowedOrigins);
+ *   require('./utils/socket').init(server, isOriginAllowed);
  *
  * Options:
  *   isShuttingDown  () => boolean — read by /readyz (503 while draining).
@@ -111,10 +111,13 @@ function createApp({ isShuttingDown = () => false } = {}) {
             return false;
         }
     };
+    // Shared with socket.io (server.js → utils/socket.init) so a phone on
+    // the LAN can open the realtime connection too, not just REST calls.
+    const isOriginAllowed = (origin) =>
+        !origin || allowedOrigins.includes(origin) || (corsAllowLan && isDevLocalOrigin(origin));
     app.use(cors({
         origin: (origin, callback) => {
-            if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-            if (corsAllowLan && isDevLocalOrigin(origin)) return callback(null, true);
+            if (isOriginAllowed(origin)) return callback(null, true);
             logger.warn(`CORS: Origin not allowed: ${origin}`);
             const corsErr = new Error('CORS: Origin not allowed');
             corsErr.status = 403;
@@ -460,7 +463,7 @@ function createApp({ isShuttingDown = () => false } = {}) {
         return res.status(status).json({ success: false, message });
     });
 
-    return { app, allowedOrigins };
+    return { app, allowedOrigins, isOriginAllowed };
 }
 
 module.exports = { createApp };

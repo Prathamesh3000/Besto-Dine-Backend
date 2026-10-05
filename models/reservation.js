@@ -125,6 +125,13 @@ const reservationSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    // Late-arrival deduction (applyLateDeduction). `deductedAt` set =
+    // the one-time deduction has been taken; a second one is refused.
+    lateArrival: {
+        isLate: { type: Boolean, default: false },
+        deductionAmount: { type: Number, default: 0 },
+        deductedAt: { type: Date, default: null }
+    },
     status: {
         type: String,
         enum: ['Pending', 'Approved', 'Rejected', 'Seated', 'Cancelled', 'Completed'],

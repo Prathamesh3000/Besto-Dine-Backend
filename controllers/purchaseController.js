@@ -8,6 +8,9 @@ const asyncHandler = require('../utils/asyncHandler');
 
 const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const round2 = (n) => Math.round((n || 0) * 100) / 100;
+// Stock quantities use the inventory precision (3 decimals) — never
+// round2, which silently moved existing 3-decimal stock (0.955 → 0.96).
+const { roundQty } = Inventory;
 
 // Branch + shared(null) scope — see supplierController.branchScopeFilter.
 function branchFilter(req) {
@@ -51,11 +54,11 @@ function computeTotals(po) {
 
 function computeReceiveStatus(po) {
     if (po.status === 'cancelled' || po.status === 'draft') return po.status;
-    const totalOrdered = po.lines.reduce((s, l) => s + (l.orderedQty || 0), 0);
     const totalReceived = po.lines.reduce((s, l) => s + (l.receivedQty || 0), 0);
     if (totalReceived <= 0) return 'ordered';
-    if (po.lines.every(l => (l.receivedQty || 0) >= (l.orderedQty || 0))) return 'received';
-    return totalReceived < totalOrdered ? 'partially-received' : 'received';
+    // 'received' only when EVERY line is fully in; over-delivery on one
+    // line must not close a PO while another line is still outstanding.
+    return po.lines.every(l => (l.receivedQty || 0) >= (l.orderedQty || 0)) ? 'received' : 'partially-received';
 }
 
 function computePaymentStatus(po) {
@@ -223,6 +226,11 @@ exports.update = asyncHandler(async (req, res) => {
         po.lines = cleanLines;
     }
     computeTotals(po);
+    // Never edit below what has already been paid (would leave a negative
+    // outstanding / silent supplier credit).
+    if ((po.amountPaid || 0) > po.grandTotal + 0.01) {
+        return res.status(400).json({ success: false, message: `PO total (₹${po.grandTotal}) cannot be less than the amount already paid (₹${po.amountPaid})` });
+    }
     computePaymentStatus(po);
     await po.save();
     res.json({ success: true, order: po });
@@ -244,11 +252,11 @@ exports.receive = asyncHandler(async (req, res) => {
     const grnLines = [];
     const stockOps = []; // {inventoryItem, qty, expiryDate}
     for (const rl of lines) {
-        const qty = Number(rl.qty);
+        const qty = roundQty(Number(rl.qty));
         if (!(qty > 0)) continue; // skip zero rows
         const poLine = po.lines.find(l => String(l.inventoryItem) === String(rl.inventoryItem));
         if (!poLine) return res.status(400).json({ success: false, message: 'A received line does not match any PO line' });
-        poLine.receivedQty = round2((poLine.receivedQty || 0) + qty);
+        poLine.receivedQty = roundQty((poLine.receivedQty || 0) + qty);
         grnLines.push({
             inventoryItem: poLine.inventoryItem,
             name: poLine.name,
@@ -271,18 +279,23 @@ exports.receive = asyncHandler(async (req, res) => {
     // half-written PO; best-effort per item.
     for (const op of stockOps) {
         try {
-            const inv = await Inventory.findOne({ _id: op.inventoryItem, ...tf });
-            if (!inv) continue;
-            const previousStock = inv.currentStock;
-            inv.currentStock = round2(previousStock + op.qty);
-            inv.lastRestocked = new Date();
-            if (op.expiryDate) { inv.expiryDate = op.expiryDate; inv.expiryTracking = true; }
-            inv.adjustmentHistory.push({
-                type: 'restock', quantity: op.qty, previousStock, newStock: inv.currentStock,
-                reason: `GRN ${grnNumber} · PO ${po.poNumber}`, adjustedBy: req.user._id, date: new Date(),
+            // Relative, atomic increment rounded to the stock precision
+            // (Inventory.incStock) — no read-modify-write of currentStock.
+            const inc = await Inventory.incStock({ _id: op.inventoryItem, ...tf }, op.qty);
+            if (!inc) continue;
+            const { previousStock, newStock, doc } = inc;
+            const status = newStock <= 0 ? 'out-of-stock' : newStock <= (doc.minStock || 0) ? 'low-stock' : 'in-stock';
+            await Inventory.updateOne({ _id: op.inventoryItem, ...tf }, {
+                $set: {
+                    lastRestocked: new Date(),
+                    status,
+                    ...(op.expiryDate ? { expiryDate: op.expiryDate, expiryTracking: true } : {}),
+                },
+                $push: { adjustmentHistory: { $each: [{
+                    type: 'restock', quantity: op.qty, previousStock, newStock,
+                    reason: `GRN ${grnNumber} · PO ${po.poNumber}`, adjustedBy: req.user._id, date: new Date(),
+                }], $slice: -200 } },
             });
-            if (inv.adjustmentHistory.length > 200) inv.adjustmentHistory = inv.adjustmentHistory.slice(-200);
-            await inv.save(); // pre-save hook recomputes status
         } catch { /* per-item best effort */ }
     }
 

@@ -65,6 +65,29 @@ const SECTION_FIELD_RULES = {
             .withMessage('Grace period must be one of: 5 min, 10 min, 15 min, 30 min, 60 min'),
         field(`${p}deductionType`, c).optional({ values: 'null' })
             .isIn(['flat', 'percentage']).withMessage('Deduction type must be flat or percentage'),
+        // Parking (QA N10/N11) — models/settings.js reservation.parking.
+        field(`${p}parking`, c).optional({ values: 'null' })
+            .custom(isPlainObject).withMessage('Parking settings must be an object'),
+        field(`${p}parking.vehicles`, c).optional({ values: 'null' })
+            .isArray({ max: 10 }).withMessage('Parking vehicle types must be a list (max 10)').bail()
+            .custom((list) => {
+                const ids = list.map((v) => String(v?.id || v?.label || '').trim().toLowerCase());
+                if (ids.some((id) => !id)) throw new Error('Every parking vehicle type needs a name');
+                if (new Set(ids).size !== ids.length) throw new Error('Parking vehicle types must be unique');
+                return true;
+            }),
+        field(`${p}parking.vehicles.*.label`, c)
+            .isString().withMessage('Vehicle name is required').bail()
+            .trim().isLength({ min: 1, max: 40 }).withMessage('Vehicle name must be 1-40 characters'),
+        field(`${p}parking.vehicles.*.id`, c).optional({ values: 'falsy' })
+            .isString().bail()
+            .matches(/^[a-z0-9][a-z0-9 _-]{0,29}$/i).withMessage('Vehicle id may only use letters, numbers, spaces, - and _'),
+        field(`${p}parking.vehicles.*.pricePerHour`, c)
+            .isFloat({ min: 0, max: 100000 }).withMessage('Parking price per hour must be between 0 and 100000'),
+        field(`${p}parking.maxDuration`, c).optional({ values: 'null' })
+            .isInt({ min: 1, max: 24 }).withMessage('Max parking duration must be 1-24 hours'),
+        field(`${p}parking.eventHours`, c).optional({ values: 'null' })
+            .isInt({ min: 1, max: 24 }).withMessage('Whole-event parking hours must be 1-24'),
     ],
     wallet: (p, c) => [
         field(`${p}refundMode`, c).optional({ values: 'null' })

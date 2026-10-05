@@ -34,13 +34,17 @@ const COUNTER_NAME_PATTERNS = [
     /bisleri/i, /aquafina/i, /kinley/i, /himalayan/i,
     /baill?ey/i, /vedica/i, /aqua\s*pura/i, /aqua\s*fina/i,
     /tata\s*copper/i, /tata\s*gluco/i, /tata\s*water/i,
-    /catch\s*water/i, /qua/i, /oxyrich/i, /rail\s*neer/i,
+    // "Qua" water brand — whole word only (not Quattro / Squash / Aquarius).
+    /catch\s*water/i, /\bqua\b/i, /oxyrich/i, /rail\s*neer/i,
 
     // Carbonated soft drinks (sealed bottles/cans)
     /\bcoke\b/i, /coca[-\s]*cola/i, /diet\s*coke/i,
     /\bpepsi\b/i, /\bsprite\b/i, /\bfanta\b/i,
     /thums?\s*up/i, /mountain\s*dew/i, /7\s*up/i, /seven\s*up/i,
-    /limca/i, /maaza/i, /mirinda/i, /appy\s*fizz/i, /slice/i, /frooti/i,
+    /limca/i, /maaza/i, /mirinda/i, /appy\s*fizz/i, /frooti/i,
+    // "Slice" mango drink — whole word, and not a food slice ("Pizza
+    // Slice", "Slice of Cake").
+    /(?<!\b(?:pizza|cake|bread|cheese|pie|apple|lemon|lime|orange|watermelon|melon|pineapple)\s+)\bslice\b(?!\s+of\b)/i,
 
     // Energy drinks
     /red\s*bull/i, /monster\s+energy/i, /\bsting\b/i, /energy\s*drink/i,

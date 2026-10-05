@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Table = require('../models/table');
+const { exposeSeats } = require('../utils/tableSeats');
 const Area = require('../models/area');
 const Reservation = require('../models/reservation');
 const User = require('../models/user');
@@ -63,11 +64,21 @@ exports.getAdminBootstrap = async (req, res) => {
     if (want('tables')) {
         const filter = { ...tenantFilter(req), ...strictBranchFilter(req) };
         tasks.tables = Table.find(filter)
+            // qrToken is `select: false` on the schema, so it must be
+            // asked for explicitly. Without it the admin QR modal has no
+            // token to encode and silently falls back to the table's
+            // _id — producing a QR that scans to a 404 "Invalid or
+            // expired QR code", because the scan route only accepts
+            // `tb-<12 hex>`. Staff print this token on a physical label
+            // at the table, so it is not secret from them.
+            .select('+qrToken +seats')
             .populate('area', 'name isActive')
             .populate('branch', 'name slug')
             .populate('currentDiner.user', 'name mobile email')
             .sort({ name: 1 })
-            .lean();
+            .lean()
+            // Seat identities never leave the server — only the count.
+            .then((rows) => rows.map(exposeSeats));
     }
 
     if (want('areas')) {
@@ -107,8 +118,14 @@ exports.getAdminBootstrap = async (req, res) => {
         // and 15 other fields that nobody on this page reads. The
         // dedicated /staff endpoint (StaffDashboard) keeps returning
         // the fuller doc — only the bootstrap is trimmed.
+        // Contact details (email / mobile / staffId) only for the roles
+        // allowed to read GET /staff (adminOnly: admin, manager). Other
+        // staff get the name + role + avatar the dashboards render.
+        const canReadDirectory = ['admin', 'manager'].includes(req.user?.role);
         tasks.staff = User.find(filter)
-            .select('_id name email mobile avatar staffId role status branch isTenantOwner')
+            .select(canReadDirectory
+                ? '_id name email mobile avatar staffId role status branch isTenantOwner'
+                : '_id name avatar role status branch')
             .populate('branch', 'name slug city')
             .lean();
     }

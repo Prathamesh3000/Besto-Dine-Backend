@@ -69,10 +69,17 @@ function toTaxConfig(taxes) {
 /**
  * Compute the full bill for an order.
  *
- * Taxes are levied on the gross subtotal, then discounts come off the
- * taxed figure. That mirrors what the client has always done; changing
- * the order of operations is a pricing decision, not a refactor, so it
- * is deliberately preserved.
+ * GST is levied on the DISCOUNTED value: (subtotal − couponDiscount),
+ * floored at 0 — a coupon reduces the taxable value of the supply.
+ * Service charge and additional charges stay on the gross subtotal.
+ * Loyalty points are a payment method, not a discount, so they do NOT
+ * reduce the GST base. Then:
+ *
+ *   total = subtotal + gst + serviceCharge + additionalCharges
+ *           − coupon − points + tip + delivery            (≥ 0)
+ *
+ * e.g. ₹1000 food, 5% GST, ₹100 coupon → GST ₹45 → total ₹945.
+ * Must stay in lockstep with Frontend/src/utils/billing.js.
  */
 function computeBill({
     subtotal = 0,
@@ -90,7 +97,9 @@ function computeBill({
     const serviceApplies = SERVICE_CHARGE_TYPES.has(type);
     const servicePct = serviceApplies ? num(taxConfig.servicePct) : 0;
 
-    const gst = round2(sub * (gstPct / 100));
+    // GST base = subtotal after the coupon (never negative).
+    const gstBase = Math.max(0, round2(sub - num(couponDiscount)));
+    const gst = round2(gstBase * (gstPct / 100));
     const serviceCharge = round2(sub * (servicePct / 100));
 
     // A ₹0 cart attracts no flat charges — otherwise a packaging fee

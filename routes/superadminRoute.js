@@ -160,7 +160,8 @@ router.post('/audit-logs/purge', superAdminFull, ctrl.purgeExpiredAuditLogs);
 // is disabled (DORMANCY_SCAN_DISABLED=true) and an external cron
 // pings this endpoint instead. Returns the scan summary so the
 // scheduler can surface "alerted N tenants" in its own logs.
-router.post('/internal/run-dormancy-check', async (_req, res) => {
+// Mutating (sends tenant emails, writes alert audit rows) → full only.
+router.post('/internal/run-dormancy-check', superAdminFull, async (_req, res) => {
     const summary = await checkDormantTenants();
     res.json({ success: true, summary });
 });

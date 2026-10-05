@@ -43,9 +43,25 @@ function isStaffCaller(req) {
  *   - availableDays empty/missing → available every day
  *   - startTime or endTime blank   → no time window
  */
+// Zero-pad a legacy "H:MM" bound to "HH:MM" inside the aggregation
+// expression so string comparison matches clock order ("9:00" would
+// otherwise sort after "17:00"). The routes normalise new writes; this
+// keeps rows stored before that validation correct.
+function paddedTime(field) {
+    return {
+        $cond: [
+            { $eq: [{ $strLenCP: { $ifNull: [field, ''] } }, 4] },
+            { $concat: ['0', field] },
+            field,
+        ],
+    };
+}
+
 function buildAvailabilityFilter(now = new Date()) {
     const today = currentDayShort(now);
     const hhmm = currentTimeHHMM(now);
+    const start = paddedTime('$startTime');
+    const end = paddedTime('$endTime');
     return {
         $and: [
             // ── Day-of-week gate ────────────────────────────────────────
@@ -71,20 +87,20 @@ function buildAvailabilityFilter(now = new Date()) {
                         // Non-wrap: startTime <= endTime AND now in [start, end]
                         {
                             $and: [
-                                { $lte: ['$startTime', '$endTime'] },
-                                { $lte: ['$startTime', hhmm] },
-                                { $gte: ['$endTime', hhmm] },
+                                { $lte: [start, end] },
+                                { $lte: [start, hhmm] },
+                                { $gte: [end, hhmm] },
                             ],
                         },
                         // Wrap (overnight): startTime > endTime AND
                         // (now >= start OR now <= end)
                         {
                             $and: [
-                                { $gt: ['$startTime', '$endTime'] },
+                                { $gt: [start, end] },
                                 {
                                     $or: [
-                                        { $gte: [hhmm, '$startTime'] },
-                                        { $lte: [hhmm, '$endTime'] },
+                                        { $gte: [hhmm, start] },
+                                        { $lte: [hhmm, end] },
                                     ],
                                 },
                             ],

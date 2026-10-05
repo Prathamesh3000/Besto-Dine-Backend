@@ -7,6 +7,11 @@ const orderItemSchema = new mongoose.Schema({
   quantity: { type: Number, required: true, default: 1 },
   category: { type: String, default: '' },   // Category name snapshot (e.g. "Main Course")
   vegType: { type: String, enum: ['veg', 'non-veg', ''], default: '' }, // For kitchen routing
+  // Decision 6 — snapshot of the menu category's kind ('food' |
+  // 'beverages') at order time. utils/couponScope.classifyItem prefers it
+  // over the prep-station fallback when scoping food / beverages coupons.
+  // '' = unknown (legacy line / category without a kind).
+  categoryKind: { type: String, enum: ['food', 'beverages', ''], default: '' },
   // Snapshot of MenuItem.prepStation at order time. Used by the kitchen
   // KDS filter and the create-order auto-ready logic. Defaults to
   // 'kitchen' so legacy line items continue to flow through the chef.
@@ -227,6 +232,11 @@ const orderSchema = new mongoose.Schema({
   // the order's history. Sum invariant: amountPaid = capturedRzp + walletAmountPaid.
   walletAmountPaid: { type: Number, default: 0, min: [0, 'Wallet amount paid cannot be negative'] },
   razorpayOrderId: { type: String },    // Razorpay order ID (for reconciliation & refunds)
+  // Every Razorpay checkout ever opened for this order (decision 4a).
+  // razorpayOrderId is the latest / the one that settled it; a payment
+  // made through ANY checkout listed here may settle the order, so a
+  // customer who pays an older checkout is never charged for nothing.
+  razorpayOrderIds: { type: [String], default: undefined },
   razorpayPaymentId: { type: String },  // Razorpay payment ID (needed for refunds)
   paidAt: { type: Date },               // When paymentStatus first transitioned to Paid
   // Set once PATCH /orders/:id/payment has run the post-payment
@@ -260,6 +270,11 @@ const orderSchema = new mongoose.Schema({
   // just at the moment of settlement — and so the admin drawer + customer
   // bill agree on the final amount.
   manualDiscount: { type: Number, default: 0, min: [0, 'Manual discount cannot be negative'] },
+  // Mixed-cart split (services/orderCreateService.buildOrderDocs): the
+  // counter-side doc of a checkout points at the primary (kitchen) doc
+  // it was split from. One online payment of the checkout settles both —
+  // see razorpayController.settleSplitSiblings. null on every other order.
+  splitParent: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null, index: true },
   waiter: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   chef: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 
@@ -315,6 +330,10 @@ orderSchema.index({ restaurant: 1, paymentStatus: 1, createdAt: -1 });
 orderSchema.index({ restaurant: 1, branch: 1, status: 1, createdAt: -1 });
 // Branch-scoped payments dashboard + refund reports.
 orderSchema.index({ restaurant: 1, branch: 1, paymentStatus: 1, createdAt: -1 });
+
+// Webhook / orphan-refund lookups by Razorpay checkout id (decision 4a).
+orderSchema.index({ razorpayOrderId: 1 }, { sparse: true });
+orderSchema.index({ razorpayOrderIds: 1 }, { sparse: true });
 
 // CRIT-28 — Hard guarantee: only one active dine-in order per table
 // within a tenant. Prevents two waiters / two devices from concurrently

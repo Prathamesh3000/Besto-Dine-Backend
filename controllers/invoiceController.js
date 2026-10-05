@@ -4,6 +4,7 @@ const Invoice = require('../models/invoice');
 const Order = require('../models/order');
 const MenuItem = require('../models/menuItem');
 const logger = require('../utils/logger');
+const { lineItemsSubtotal } = require('../services/orderBillMath');
 
 const { tenantFilter, tenantId } = require('../utils/tenantScope');
 const { devError } = require('../utils/AppError');
@@ -66,12 +67,22 @@ function buildItemDescription(item) {
 // @access  Private/Admin
 exports.generateInvoice = asyncHandler(async (req, res) => {
     const { orderId } = req.params;
+    if (!mongoose.isValidObjectId(orderId)) {
+        return res.status(400).json({ success: false, message: 'Invalid order id' });
+    }
     // Scope the order lookup to the current tenant so one restaurant's
     // admin can't generate invoices for another restaurant's orders.
     const order = await Order.findOne({ _id: orderId, ...tenantFilter(req) }).populate('user');
 
     if (!order) {
         return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    // One invoice per order (unique { order, restaurant } index): a
+    // re-generate (e.g. a re-print) returns the existing invoice.
+    const existing = await Invoice.findOne({ order: order._id, restaurant: order.restaurant || tenantId(req) });
+    if (existing) {
+        return res.status(200).json({ success: true, invoice: existing, existing: true });
     }
 
     // Fetch menu item images for each order item — scope to the order's
@@ -87,7 +98,19 @@ exports.generateInvoice = asyncHandler(async (req, res) => {
         if (mi.images?.length) imageMap[mi.name] = mi.images[0];
     });
 
-    const subtotal = order.total - (order.tax || 0);
+    // Money breakdown from the fields the order actually stamps:
+    // subtotal = line items (+ toppings), tax = GST + service charge +
+    // additional charges, discount = coupon + manual (+ the rupee value
+    // of redeemed points, which the order stores only as a point count —
+    // recovered as the remainder so subtotal + tax − discount = total).
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    const subtotal = round2(lineItemsSubtotal(order.items));
+    const chargesTotal = Number(order.additionalChargesTotal)
+        || (order.additionalCharges || []).reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+    const tax = round2((Number(order.gst) || 0) + (Number(order.serviceCharge) || 0) + chargesTotal);
+    const explicitDiscount = round2((Number(order.couponDiscount) || 0) + (Number(order.manualDiscount) || 0));
+    const remainder = round2(subtotal + tax - (Number(order.total) || 0));
+    const discount = Math.max(explicitDiscount, remainder, 0);
 
     const invoice = new Invoice({
         invoiceNumber: `INV-${Date.now()}-${order.orderId || 'ORD'}`,
@@ -105,9 +128,16 @@ exports.generateInvoice = asyncHandler(async (req, res) => {
             description: buildItemDescription(item),
             addons: item.addon ? [{ name: item.addon, price: item.addonPrice || 0 }] : []
         })),
-        subtotal: subtotal,
-        tax: order.tax || 0,
-        discount: order.discount || 0,
+        subtotal,
+        tax,
+        discount,
+        gst: round2(order.gst),
+        gstPercentage: Number(order.gstPercentage) || 0,
+        serviceCharge: round2(order.serviceCharge),
+        serviceChargePercentage: Number(order.serviceChargePercentage) || 0,
+        additionalCharges: (order.additionalCharges || []).map((c) => ({
+            name: c.name, type: c.type, value: Number(c.value) || 0, amount: round2(c.amount),
+        })),
         total: order.total,
         paymentStatus: order.paymentStatus === 'Paid' ? 'paid' : 'unpaid',
         paymentMethod: order.paymentMethod || 'Cash',
@@ -118,7 +148,16 @@ exports.generateInvoice = asyncHandler(async (req, res) => {
         restaurant: order.restaurant || tenantId(req),
     });
 
-    await invoice.save();
+    try {
+        await invoice.save();
+    } catch (err) {
+        // Lost a race with a concurrent generate for the same order.
+        if (err?.code === 11000) {
+            const winner = await Invoice.findOne({ order: order._id, restaurant: invoice.restaurant });
+            if (winner) return res.status(200).json({ success: true, invoice: winner, existing: true });
+        }
+        throw err;
+    }
     res.status(201).json({ success: true, invoice });
 
 }, 'Failed to generate invoice');

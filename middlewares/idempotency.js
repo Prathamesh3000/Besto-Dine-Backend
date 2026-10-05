@@ -22,8 +22,12 @@ const logger = require('../utils/logger');
 //    who learned (or guessed) another user's key read that user's
 //    cached payment response. Identity is the logged-in user id, else
 //    the verified guest scan-session id, else the client IP.
-//  * Only success and client-error (4xx) responses are cached. 5xx
-//    failures are transient and the client should be free to retry.
+//  * Only 2xx and 409 responses are cached (see isCacheableStatus).
+//    5xx failures are transient, and so are most 4xx outcomes on these
+//    endpoints — e.g. 400 PAYMENT_NOT_CAPTURED while the payment is still
+//    in flight at Razorpay. Caching those for 24h replayed the stale
+//    failure to a retry made after capture, so the retry never settled.
+//    409 (already paid / payment already used) is a final answer.
 //  * On DB-lookup failure we proceed without dedup rather than
 //    hard-fail — better to risk a rare dup than to block all payments
 //    during a Mongo blip.
@@ -67,6 +71,13 @@ function scopedIdempotencyKey(req, clientKey) {
     return crypto.createHash('sha256').update(material).digest('hex');
 }
 
+// Which first responses are stored for replay. Success is final; 409 is a
+// settled conflict. Everything else may succeed on a later retry.
+function isCacheableStatus(status) {
+    const code = Number(status) || 200;
+    return (code >= 200 && code < 300) || code === 409;
+}
+
 function idempotency(opts = {}) {
     const required = !!opts.required;
 
@@ -108,7 +119,7 @@ function idempotency(opts = {}) {
         // Wrap res.json so we can persist the final response body
         const originalJson = res.json.bind(res);
         res.json = function (body) {
-            if (res.statusCode < 500) {
+            if (isCacheableStatus(res.statusCode)) {
                 IdempotencyRecord.create({
                     key,
                     endpoint: `${String(req.method || '').toUpperCase()} ${requestPath(req)}`,
@@ -132,3 +143,4 @@ function idempotency(opts = {}) {
 exports.idempotency = idempotency;
 exports.scopedIdempotencyKey = scopedIdempotencyKey;
 exports.callerIdentity = callerIdentity;
+exports.isCacheableStatus = isCacheableStatus;

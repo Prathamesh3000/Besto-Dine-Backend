@@ -89,7 +89,25 @@ const settingsSchema = new mongoose.Schema({
     enableLateArrival: { type: Boolean, default: true },
     gracePeriod: { type: String, default: '10 min', enum: ['5 min', '10 min', '15 min', '30 min', '60 min'] },
     deductionType: { type: String, enum: ['flat', 'percentage'], default: 'flat' },
-    priceDeduction: { type: Number, default: 0, min: [0, 'Price deduction cannot be negative'] }
+    priceDeduction: { type: Number, default: 0, min: [0, 'Price deduction cannot be negative'] },
+    // Parking for table bookings (QA N10/N11). Billed hourly per vehicle:
+    // Σ (pricePerHour × count) × hours. Customers pick "whole event"
+    // (billed at `eventHours`) or a start time + 1..`maxDuration` hours.
+    // An empty `vehicles` list means the built-in Bike/Car/Bus defaults
+    // (utils/parkingConfig.DEFAULT_PARKING_VEHICLES).
+    parking: {
+      vehicles: {
+        type: [{
+          id: { type: String, required: true, trim: true, lowercase: true, maxlength: 30 },
+          label: { type: String, required: true, trim: true, maxlength: 40 },
+          pricePerHour: { type: Number, default: 0, min: [0, 'Parking price cannot be negative'], max: [100000, 'Parking price is too high'] },
+          _id: false,
+        }],
+        default: [],
+      },
+      maxDuration: { type: Number, default: 6, min: [1, 'Max parking duration must be at least 1 hour'], max: [24, 'Max parking duration cannot exceed 24 hours'] },
+      eventHours: { type: Number, default: 3, min: [1, 'Whole-event parking must be at least 1 hour'], max: [24, 'Whole-event parking cannot exceed 24 hours'] },
+    }
   },
   // ── Home delivery ───────────────────────────────────────────────
   // Distance-slab based delivery charging. When `enabled`, the customer
@@ -122,7 +140,11 @@ const settingsSchema = new mongoose.Schema({
     maxRedeemPercent: { type: Number, default: 50, min: [0, 'Max redeem cannot be negative'], max: [100, 'Max redeem cannot exceed 100%'] },
     pointsToRupee: { type: Number, default: 0.1, min: [0, 'Points to rupee cannot be negative'] },
     pointsExpiryDays: { type: Number, default: 365, min: [0, '0 means never expire'] },
-    refundMode: { type: String, enum: ['wallet', 'original'], default: 'wallet' },
+    // Decision 1 (2026-10): refunds go back to the original payment method
+    // by default (same as PAYMENT_DEFAULTS.refundMode). Tenants that stored
+    // 'wallet' under the old default are flipped by
+    // migrations/setRefundModeOriginal.js.
+    refundMode: { type: String, enum: ['wallet', 'original'], default: 'original' },
     allowNegativeBalance: { type: Boolean, default: false },
     multiBranchMode: { type: Boolean, default: false },
     branchRefundMode: { type: String, enum: ['global', 'per_branch'], default: 'global' },

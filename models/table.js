@@ -88,23 +88,65 @@ const tableSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User'
     },
+    // QA #13 — seat reservations. One entry per diner PARTY currently
+    // seated (a phone that scanned the QR, optionally logged in). A seat
+    // is claimed atomically at scan time (utils/tableSeats.claimSeat) so
+    // a table can never hold more parties than its capacity — even when
+    // several phones scan / order at the same instant. `keys` are the
+    // party's identities ('s:<scanSessionId>', 'u:<userId>').
+    // For a merge group, seats live on the group LEADER only and are
+    // counted against the group's summed capacity.
+    // Released when the table is freed / unmerged / disabled / deleted;
+    // idle seats without an open order are pruned after
+    // TABLE_SEAT_IDLE_MINUTES. select:false — keys are session ids and
+    // must never reach a customer response; staff listings expose only
+    // the count (`seatsTaken`).
+    seats: {
+        type: [{
+            keys: { type: [String], default: [] },
+            joinedAt: { type: Date, default: Date.now },
+            lastSeenAt: { type: Date, default: Date.now },
+        }],
+        default: [],
+        select: false,
+    },
     mergedWith: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Table'
     }],
+    // A sub-document field literally named `type` must be spelled
+    // `type: { type: String }` — a bare `type: String` makes Mongoose
+    // read the whole element as the String type ([String]) and every
+    // alert object pushed here fails to cast.
     alerts: [{
         reason: String,
-        type: String,
+        type: { type: String },
         requestId: { type: mongoose.Schema.Types.ObjectId, ref: 'Request' },
         delay: String,
         timestamp: { type: Date, default: Date.now }
     }]
 }, {
-    timestamps: true
+    timestamps: true,
+    // Never serialise seat identities — replace them with a count.
+    toJSON: {
+        transform(doc, ret) {
+            if (Array.isArray(ret.seats)) {
+                ret.seatsTaken = ret.seats.length;
+                delete ret.seats;
+            }
+            return ret;
+        },
+    },
 });
 
-// Ensure table name is unique within an area
-tableSchema.index({ name: 1, area: 1 }, { unique: true });
+// Ensure table name is unique within an area — among LIVE tables only,
+// so a soft-deleted table's name can be reused. Explicit name: the old
+// full-collection unique index `name_1_area_1` must be dropped on
+// existing databases (Mongoose never drops indexes by itself).
+tableSchema.index(
+    { name: 1, area: 1 },
+    { unique: true, name: 'name_area_unique_live', partialFilterExpression: { isDeleted: false } },
+);
 // Performance indexes for dashboard queries
 tableSchema.index({ status: 1 });
 tableSchema.index({ area: 1, status: 1 });

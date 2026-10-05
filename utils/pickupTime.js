@@ -19,6 +19,12 @@ const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 
 const SCHEDULED_LEAD_MIN = 30;
 
+// A pickup slot earlier than createdAt by no more than this is today's
+// (just-passed) slot, not tomorrow's — see parsePickupAt. The customer
+// app only offers future same-day slots, so a genuine next-day wrap
+// ("01:00 AM" ordered late at night) is many hours in the past.
+const PAST_SLOT_GRACE_MS = 2 * 60 * 60 * 1000;
+
 // Returns the UTC ms offset between a wall-clock instant and the same
 // instant when interpreted in `timezone`. Positive when the timezone is
 // east of UTC. We use Intl.DateTimeFormat to read the wall-clock parts
@@ -89,12 +95,17 @@ function parsePickupAt(order) {
     const offsetMs = getTimezoneOffsetMs(APP_TIMEZONE, new Date(tentativeUTC));
     let pickupUTC = tentativeUTC - offsetMs;
 
-    // Same-day-by-default: when the parsed pickup falls before
+    // Same-day-by-default: when the parsed pickup falls well before
     // createdAt (e.g. order placed at 11 PM with pickup "01:00 AM"
     // meaning next-day), bump forward by a day. Without this the
     // pickup would land in the past and the chef KDS would surface
     // the order immediately.
-    if (pickupUTC < createdAt.getTime()) {
+    //
+    // A slot only slightly in the past is TODAY's slot: the takeaway
+    // order is saved after payment, so picking "01:30 PM" at 13:28 and
+    // paying at 13:31 stores createdAt after the slot. That order is
+    // due now (overdue), not tomorrow.
+    if (pickupUTC < createdAt.getTime() - PAST_SLOT_GRACE_MS) {
         pickupUTC += 24 * 60 * 60 * 1000;
     }
     return new Date(pickupUTC);

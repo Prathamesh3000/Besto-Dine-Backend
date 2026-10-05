@@ -1535,6 +1535,24 @@ exports.deleteBranch = async (req, res) => {
                 message: 'The Main branch cannot be disabled. It represents your tenant\'s primary location.',
             });
         }
+        if (!target) {
+            return res.status(404).json({ success: false, message: 'Branch not found' });
+        }
+        // Same blocker as hardDeleteBranch / preDisableCheck: never hide a
+        // branch from customers while it still has live kitchen tickets.
+        const activeOrders = await Order.countDocuments({
+            branch: id,
+            status: { $in: ['new', 'preparing', 'ready'] },
+            ...tenantFilter(req),
+        });
+        if (activeOrders > 0) {
+            return res.status(400).json({
+                success: false,
+                code: 'ACTIVE_ORDERS',
+                message: `This branch has ${activeOrders} active order(s). Complete or cancel them before disabling.`,
+                activeOrders,
+            });
+        }
         const branch = await Branch.findOneAndUpdate(
             { _id: id, ...tenantFilter(req) },
             { isActive: false },
@@ -1544,9 +1562,17 @@ exports.deleteBranch = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Branch not found' });
         }
 
-        // Unassign all staff pinned to this branch
+        // The branch's own Branch Admin(s) stay pinned to it — nulling
+        // their branch would make them tenant-wide admins. Deactivate
+        // them instead and revoke their sessions (tokenVersion bump).
+        const adminResult = await User.updateMany(
+            { role: 'admin', isTenantOwner: { $ne: true }, branch: id, ...tenantFilter(req) },
+            { $set: { status: 'inactive' }, $inc: { tokenVersion: 1 } }
+        );
+
+        // Unassign all other staff pinned to this branch
         const unassignResult = await User.updateMany(
-            { branch: id, ...tenantFilter(req) },
+            { branch: id, ...tenantFilter(req), $nor: [{ role: 'admin', isTenantOwner: { $ne: true } }] },
             { $set: { branch: null } }
         );
 
@@ -1554,7 +1580,8 @@ exports.deleteBranch = async (req, res) => {
             success: true,
             data: buildBranchPayload(branch),
             message: 'Branch disabled',
-            staffUnassigned: unassignResult.modifiedCount || 0,
+            staffUnassigned: (unassignResult.modifiedCount || 0) + (adminResult.modifiedCount || 0),
+            branchAdminsDeactivated: adminResult.modifiedCount || 0,
         });
     } catch (err) {
         logger.error('deleteBranch error: ' + err.message);
@@ -1592,6 +1619,11 @@ exports.reactivateBranch = async (req, res) => {
         if (!branch) {
             return res.status(404).json({ success: false, message: 'Branch not found' });
         }
+        // Undo deleteBranch: its Branch Admin(s) were deactivated (kept pinned).
+        await User.updateMany(
+            { role: 'admin', isTenantOwner: { $ne: true }, branch: id, status: 'inactive', ...tenantFilter(req) },
+            { $set: { status: 'active' } }
+        );
         return res.status(200).json({ success: true, data: buildBranchPayload(branch) });
     } catch (err) {
         logger.error('reactivateBranch error: ' + err.message);

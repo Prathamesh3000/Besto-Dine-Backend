@@ -51,7 +51,17 @@ const categorySchema = new mongoose.Schema({
         type: Boolean,
         default: true,
         index: true,
-    }
+    },
+    // Decision 6 (2026-10): the admin decides whether a category is Food
+    // or Drink. Values match Coupon.scope ('food' / 'beverages') so a
+    // scoped coupon classifies order items by their category's kind
+    // (utils/couponScope.classifyItem reads the item.categoryKind
+    // snapshot). Legacy categories default to food.
+    kind: {
+        type: String,
+        enum: { values: ['food', 'beverages'], message: 'Category type must be food or beverages' },
+        default: 'food',
+    },
 }, {
     timestamps: true,
     toJSON: { virtuals: true },

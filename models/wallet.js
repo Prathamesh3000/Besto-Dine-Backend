@@ -46,15 +46,51 @@ walletSchema.pre('save', function () {
   }
 });
 
-// Round after findOneAndUpdate ($inc can cause floating point drift)
+// Round after findOneAndUpdate ($inc can cause floating point drift).
+//
+// The rounding is done IN the database with a pipeline update that rounds
+// whatever value is stored at that moment, and only matches when a value
+// is actually off-paise. The old hook save()d the absolute balance it had
+// read, which overwrote any $inc that landed in between (concurrent
+// recharges lost money) and, when the caller did not ask for
+// returnDocument:'after', wrote back the stale pre-update value.
+const round2Expr = (field) => ({
+  $cond: [{ $isNumber: `$${field}` }, { $round: [`$${field}`, 2] }, `$${field}`],
+});
+const offPaiseExpr = (field) => ({
+  $and: [{ $isNumber: `$${field}` }, { $ne: [`$${field}`, { $round: [`$${field}`, 2] }] }],
+});
+
 walletSchema.post('findOneAndUpdate', async function (doc) {
-  if (!doc) return;
-  const roundedBalance = Math.round(doc.balance * 100) / 100;
-  const roundedPoints = Math.round(doc.loyaltyPoints * 100) / 100;
-  if (doc.balance !== roundedBalance || doc.loyaltyPoints !== roundedPoints) {
-    doc.balance = roundedBalance;
-    doc.loyaltyPoints = roundedPoints;
-    await doc.save({ validateBeforeSave: false });
+  if (!doc || !doc._id) return;
+  const opts = this.getOptions ? this.getOptions() : {};
+  const isAfterDoc = opts.returnDocument === 'after' || opts.new === true;
+  const round = (v) => Math.round(v * 100) / 100;
+  const drift = typeof doc.balance === 'number' && doc.balance !== round(doc.balance)
+    || typeof doc.loyaltyPoints === 'number' && doc.loyaltyPoints !== round(doc.loyaltyPoints);
+  // A post-update doc that is already on paise needs nothing. A pre-update
+  // doc tells us nothing about the stored value, so let the conditional
+  // update decide (it is a no-op match when nothing drifted).
+  if (isAfterDoc && !drift) return;
+
+  await this.model.updateOne(
+    { _id: doc._id, $expr: { $or: [offPaiseExpr('balance'), offPaiseExpr('loyaltyPoints')] } },
+    [{ $set: { balance: round2Expr('balance'), loyaltyPoints: round2Expr('loyaltyPoints') } }],
+    { session: opts.session || null, skipTenantScope: true, updatePipeline: true }
+  );
+
+  if (isAfterDoc) {
+    // Reflect the rounding in the returned doc without marking it dirty,
+    // so a later save() by the caller doesn't write an absolute balance.
+    for (const field of ['balance', 'loyaltyPoints']) {
+      if (typeof doc[field] !== 'number') continue;
+      if (typeof doc.set === 'function') {
+        doc.set(field, round(doc[field]));
+        doc.unmarkModified(field);
+      } else {
+        doc[field] = round(doc[field]); // lean result
+      }
+    }
   }
 });
 

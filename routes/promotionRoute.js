@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const promotionController = require('../controllers/promotionController');
-const { protect, optionalAuth, adminOnly } = require('../middlewares/authMiddleware');
+const { protect, optionalAuth, adminOnly, checkPermission } = require('../middlewares/authMiddleware');
 const { attachTenant } = require('../middlewares/tenantContext');
 const { featureGate } = require('../middlewares/featureGate');
 const { validate, body, objectIdParam, optionalObjectId } = require('../middlewares/validate');
@@ -111,7 +111,11 @@ router.get('/coupons/active', customerCouponGate, promotionController.getActiveC
 // per-user usage limits + abuse tracking. The Cart UI already hides
 // the coupon section for guests; this is the defence-in-depth gate.
 router.post('/apply-coupon',    protect, customerCouponGate, applyCouponRules, promotionController.applyCoupon);
-router.get('/customer/:userId', protect, customerCouponGate, promotionController.getCustomerCRM);
+// CRM profile (name, email, wallet, spend) — admin / manager with the
+// 'crm' permission only, and the controller only reveals customers with
+// activity in the caller's tenant (was protect-only: cross-tenant IDOR).
+router.get('/customer/:userId', protect, adminOnly, attachTenant, checkPermission('crm'), customerCouponGate,
+    validate([objectIdParam('userId', 'Invalid user id')]), promotionController.getCustomerCRM);
 
 // Admin-only routes — gated behind `couponPromotions`.
 // Specific paths must remain BEFORE the generic /coupons route.

@@ -401,7 +401,11 @@ exports.init = (server, allowedOrigins) => {
 
     io = new Server(server, {
         cors: {
-            origin: allowedOrigins,
+            // Either the explicit origin list, or app.js's isOriginAllowed
+            // predicate (honours CORS_ALLOW_LAN — LAN phones in dev).
+            origin: typeof allowedOrigins === 'function'
+                ? (origin, cb) => cb(null, allowedOrigins(origin))
+                : allowedOrigins,
             methods: ['GET', 'POST'],
             credentials: true,
         },

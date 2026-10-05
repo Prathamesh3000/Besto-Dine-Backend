@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Request = require('../models/request');
 const Table = require('../models/table');
 const User = require('../models/user');
@@ -10,6 +11,7 @@ const logger = require('../utils/logger');
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const { findWaitersForTable } = require('../utils/staffAssignment');
 const { devError } = require('../utils/AppError');
+const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 
 // Valid request types and priorities (centralized)
 const VALID_TYPES = ['water', 'waiter', 'bill', 'other'];
@@ -49,6 +51,42 @@ exports.createRequest = async (req, res) => {
         code: 'TABLE_UNAVAILABLE',
         message: 'This table is no longer available. Please re-scan the QR code at your table.',
       });
+    }
+
+    // Guests (and logged-in customers) must prove they are at THIS table:
+    // a signed X-Scan-Token issued by the QR scan for this table (or a
+    // table of its merge group) and this tenant — same proof dine-in
+    // orders require (orderCreateService.verifyDineInScan). Without it
+    // anyone holding a table id could page waiters / ask for the bill
+    // for any table. Staff may raise requests without a scan.
+    if (!req.user || req.user.role === 'customer') {
+      const scanToken = req.headers['x-scan-token'];
+      if (!scanToken) {
+        return res.status(403).json({ success: false, code: 'SCAN_TOKEN_REQUIRED', message: 'Please scan the QR code at your table to send a request.' });
+      }
+      let decoded;
+      try {
+        decoded = verifyTypedToken(scanToken, TOKEN_TYPES.SCAN);
+      } catch (err) {
+        const expired = err.name === 'TokenExpiredError';
+        return res.status(401).json({
+          success: false,
+          code: expired ? 'SCAN_TOKEN_EXPIRED' : 'SCAN_TOKEN_INVALID',
+          message: expired ? 'Your table session has expired. Please re-scan the QR code.' : 'Invalid table session. Please re-scan the QR code.',
+        });
+      }
+      // Scan tokens of a merged group are bound to the group leader, so
+      // accept the leader's token for a member table too.
+      const groupIds = [String(table._id), ...((table.mergedWith || []).map(String))];
+      let sameGroup = groupIds.includes(String(decoded.tableId));
+      if (!sameGroup && mongoose.Types.ObjectId.isValid(String(decoded.tableId))) {
+        sameGroup = !!(await Table.exists({ _id: decoded.tableId, mergedWith: table._id, ...tf }));
+      }
+      const currentTenant = tenantId(req);
+      if (!sameGroup
+          || (currentTenant && decoded.restaurantId && String(decoded.restaurantId) !== String(currentTenant))) {
+        return res.status(403).json({ success: false, code: 'SCAN_TOKEN_MISMATCH', message: 'Scan token does not match this table. Re-scan the QR code.' });
+      }
     }
 
     // Rate limit: prevent spam — block if same table created same type request in last 30 seconds
@@ -319,7 +357,9 @@ exports.updateRequestStatus = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Status must be accepted or completed' });
     }
 
-    const request = await Request.findOne({ _id: id, ...tenantFilter(req) });
+    // Same branch scope as getRequests: staff pinned to another branch
+    // cannot accept / close this branch's requests by id.
+    const request = await Request.findOne({ _id: id, ...tenantFilter(req), ...strictBranchFilter(req) });
     if (!request) return res.status(404).json({ success: false, message: 'Request not found' });
 
     // State machine: pending -> accepted -> completed (no reverse, no skip)

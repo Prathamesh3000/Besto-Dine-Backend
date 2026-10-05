@@ -16,8 +16,9 @@ const idGen = require('../utils/idGenerator');
 const logger = require('../utils/logger');
 const { getIO, emitToAdmin, emitToKitchen } = require('../utils/socket');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
-const { resolveMergeLeader, freeTableOrUnmergeGroup } = require('../utils/tableMerge');
-const { callerPartyKeys, checkTableCapacity, tableUnavailableError } = require('../utils/tableOccupancy');
+const { resolveMergeLeader } = require('../utils/tableMerge');
+const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
+const { claimSeat } = require('../utils/tableSeats');
 const { httpError, reply } = require('./orderErrors');
 const {
   isValidObjectId,
@@ -29,7 +30,7 @@ const {
   emitStaffTable,
   lineItemsSubtotal,
 } = require('./orderHelpers');
-const { scanSessionFromReq } = require('./orderAccess');
+const { scanSessionFromReq, orderAccessForCaller } = require('./orderAccess');
 const pricing = require('./orderPricingService');
 const { notifyCounterOrderReady } = require('./orderNotifications');
 
@@ -55,6 +56,7 @@ async function persistCounterSideOrder({
   scanSessionId,
   paymentMethod,
   note,
+  bare = false,
 }) {
   if (!Array.isArray(items) || items.length === 0) return null;
   const counterOrderIdValue = type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
@@ -79,8 +81,14 @@ async function persistCounterSideOrder({
       note: note || '',
     });
     // Repeat orders are real bills — tax them like createOrder does
-    // (they used to store the bare item subtotal).
-    await pricing.applyNewOrderBill(req, draft);
+    // (they used to store the bare item subtotal). `bare`: the counter
+    // half of a mixed repeat — like createOrder's split, the kitchen doc
+    // carries the tax lines and this doc holds the bare item subtotal.
+    if (bare) {
+      draft.total = Math.round(lineItemsSubtotal(items) * 100) / 100;
+    } else {
+      await pricing.applyNewOrderBill(req, draft);
+    }
     const doc = await draft.save();
     bumpMenuItemOrderCounts(doc.items, doc.restaurant);
 
@@ -103,6 +111,47 @@ async function persistCounterSideOrder({
     logger.warn('persistCounterSideOrder save failed:', err.message);
     return null;
   }
+}
+
+// A bill that has been settled (or refunded) must never grow: the extra
+// items would be cooked and served but never charged.
+const SETTLED_PAYMENT_STATUSES = new Set(['Paid', 'Refunded']);
+const isSettled = (order) => SETTLED_PAYMENT_STATUSES.has(order?.paymentStatus);
+
+// Repeat endpoints are optionalAuth. The caller must be staff, the
+// logged-in owner, or — for an ownerless guest order — hold the scan
+// session that placed it (same rule as cancel / payment). Anonymous
+// callers without a scan token get 401, everyone else 403.
+function assertCanRepeat(req, sourceOrder) {
+  const access = orderAccessForCaller(req, sourceOrder);
+  if (access.allowed) return;
+  if (!req.user && !req.headers['x-scan-token']) {
+    throw httpError(401, { success: false, code: 'SCAN_TOKEN_REQUIRED', message: 'Please log in or re-scan the table QR code to repeat this order.' });
+  }
+  throw httpError(403, { success: false, message: 'Not authorized to repeat this order' });
+}
+
+// A dine-in order must have a table (createOrder's TABLE_REQUIRED rule).
+// A past bill detached from its table (a later party ordered there) can't
+// spawn a table-less "ghost" dine-in order. Kiosk "Eat Here" orders are
+// table-less by design.
+function assertRepeatHasTable(sourceOrder, tableId) {
+  if (sourceOrder.type === 'dine-in' && !tableId && sourceOrder.source !== 'kiosk') {
+    throw httpError(400, {
+      success: false,
+      code: 'TABLE_REQUIRED',
+      message: 'This order is no longer linked to a table. Scan your table QR code and order from the menu.',
+    });
+  }
+}
+
+// The party a repeat belongs to — the source order's owner, else its
+// scan session (staff walk-ins: neither). Used so a repeat never folds
+// into ANOTHER party's open bill at the same table.
+function repeatPartyFilter(sourceOrder) {
+  if (sourceOrder.user) return { user: sourceOrder.user };
+  if (sourceOrder.scanSessionId) return { user: null, scanSessionId: sourceOrder.scanSessionId };
+  return { user: null, scanSessionId: null };
 }
 
 // Merge repeated items into an existing order and recompute its bill with
@@ -128,21 +177,29 @@ async function repeatOrderItem(req) {
   const sourceOrder = await Order.findOne({ _id: orderId, ...tenantFilter(req) });
   if (!sourceOrder) throw httpError(404, { success: false, message: 'Source order not found' });
 
-  // Ownership check — customers can only repeat items from their own orders
-  if (req.user?.role === 'customer' && sourceOrder.user && String(sourceOrder.user) !== String(req.user._id)) {
-    throw httpError(403, { success: false, message: 'Not authorized to repeat this order' });
-  }
+  // Ownership check — staff, the owner, or the guest's own scan session.
+  assertCanRepeat(req, sourceOrder);
 
   const itemToRepeat = sourceOrder.items.id(itemId);
   if (!itemToRepeat) throw httpError(404, { success: false, message: 'Item not found in order' });
 
   // A repeat is a new order on the source table — refuse it once the
-  // admin has deleted / disabled that table.
+  // admin has deleted / disabled that table, or when the bill was
+  // detached from its table (TABLE_REQUIRED).
+  assertRepeatHasTable(sourceOrder, sourceOrder.table);
   if (sourceOrder.type === 'dine-in' && sourceOrder.table) {
     const srcTable = await Table.findOne({ _id: sourceOrder.table, ...tenantFilter(req) })
       .select('isDeleted isActive status').lean();
     const unavailable = tableUnavailableError(srcTable);
     if (unavailable) throw httpError(unavailable.status, unavailable.body);
+    // Seat capacity (QA #13) — same rule as createOrder: a party that
+    // isn't seated at the table must claim a seat first.
+    const seat = await claimSeat({
+      table: { _id: sourceOrder.table },
+      tenantFilterObj: tenantFilter(req),
+      keys: callerPartyKeys(req, scanSessionFromReq(req)),
+    });
+    if (!seat.ok) throw httpError(seat.status, seat.body);
   }
 
   const parsedQty = parseInt(quantity, 10);
@@ -206,8 +263,9 @@ async function repeatOrderItem(req) {
 
   const itemForKitchen = kitchenPart[0]; // single item — guaranteed by partition
 
-  // If source order is ACTIVE, add to it
-  if (['new', 'preparing', 'ready'].includes(sourceOrder.status)) {
+  // If source order is ACTIVE (and not already paid — a prepaid order
+  // still in the kitchen must not grow), add to it
+  if (['new', 'preparing', 'ready'].includes(sourceOrder.status) && !isSettled(sourceOrder)) {
     // Stamp addedAt so the customer + chef views can split this
     // repeated item from the original batch on the timeline.
     const stampedItem = { ...itemForKitchen, addedAt: new Date() };
@@ -258,6 +316,7 @@ async function repeatOrderItem(req) {
     phone: sourceOrder.phone,
     items: [itemForKitchen],
     total: 0, // stamped by applyNewOrderBill below
+    scanSessionId: sourceOrder.scanSessionId || null,
     note: `Repeated from ${sourceOrder.orderId}`,
     waiter: req.user?.id, // Use current reporter as waiter
     pickupLocation: sourceOrder.pickupLocation,
@@ -300,10 +359,9 @@ async function loadRepeatSource(req, tf) {
     throw httpError(404, { success: false, message: 'Source order not found' });
   }
 
-  if (req.user && req.user.role === 'customer'
-    && sourceOrder.user && sourceOrder.user.toString() !== req.user.id.toString()) {
-    throw httpError(403, { success: false, message: 'Not authorized to repeat this order' });
-  }
+  // Staff, the owner, or the guest's own scan session only (the human
+  // order number is printed on bills / KOTs, so it proves nothing).
+  assertCanRepeat(req, sourceOrder);
 
   if (!sourceOrder.items || sourceOrder.items.length === 0) {
     throw httpError(400, { success: false, message: 'Source order has no items to repeat' });
@@ -343,16 +401,19 @@ async function resolveRepeatTarget(req, sourceOrder, tf, targetTableId) {
     const unavailable = tableUnavailableError(srcTable);
     if (unavailable) throw httpError(unavailable.status, unavailable.body);
   }
-  // Repeating onto a table the caller isn't seated at yet makes them a
-  // new party there — same capacity rule as createOrder.
-  if (sourceOrder.type === 'dine-in' && resolvedTargetTable
-    && String(resolvedTargetTable) !== String(sourceOrder.table)) {
-    const capTable = await Table.findOne({ _id: resolvedTargetTable, ...tf })
-      .select('name capacity mergedWith').lean();
-    if (capTable) {
-      const capacityCheck = await checkTableCapacity(capTable, tf, callerPartyKeys(req, scanSessionFromReq(req)));
-      if (!capacityCheck.ok) throw httpError(capacityCheck.status, capacityCheck.body);
-    }
+  assertRepeatHasTable(sourceOrder, resolvedTargetTable);
+  // Repeating onto a table the caller isn't seated at makes them a new
+  // party there — they must claim a seat (same rule as createOrder).
+  // This applies to the source's own table too: once that bill was
+  // settled the table may have been re-seated by other parties (#13).
+  // claimSeat just refreshes the seat of a party that is still seated.
+  if (sourceOrder.type === 'dine-in' && resolvedTargetTable) {
+    const seat = await claimSeat({
+      table: { _id: resolvedTargetTable },
+      tenantFilterObj: tf,
+      keys: callerPartyKeys(req, scanSessionFromReq(req)),
+    });
+    if (!seat.ok) throw httpError(seat.status, seat.body);
   }
   return { resolvedTargetTable, resolvedTargetBranch };
 }
@@ -398,7 +459,7 @@ function buildRepeatItems(sourceOrder, selections) {
 }
 
 // Counter side of a repeat — always a fresh ready order.
-async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf }) {
+async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf, bare = false }) {
   let counterSideOrder = null;
   if (repeatCounter.length > 0) {
     counterSideOrder = await persistCounterSideOrder({
@@ -414,6 +475,7 @@ async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resol
       pickupLocation: sourceOrder.pickupLocation,
       scanSessionId: sourceOrder.scanSessionId,
       note: `Repeated from ${sourceOrder.orderId}`,
+      bare,
     });
     if (counterSideOrder && counterSideOrder.type === 'dine-in' && counterSideOrder.table) {
       try {
@@ -436,9 +498,11 @@ async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resol
   return counterSideOrder;
 }
 
-// Kitchen side: append to the still-active source (same table) or to the
-// target table's active round. Returns a reply, or null to create new.
-async function appendRepeatToActiveOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, resolvedTargetTable, tf }) {
+// Kitchen side: where should the repeated kitchen items go? Returns the
+// still-active source (same table) or the caller's own open round on the
+// target table, or null to create a fresh order. Also detaches a stale
+// PAID bill from the target table.
+async function findRepeatAppendTarget(req, { sourceOrder, resolvedTargetTable, tf }) {
   // Source still active AND on the same table the customer is at →
   // append the kitchen-side items to it. Skip when the customer has
   // moved tables (eg. came back next day at a different table) —
@@ -447,37 +511,14 @@ async function appendRepeatToActiveOrder(req, { sourceOrder, repeatKitchen, kitc
   // Payment" button that goes nowhere because the active-table poll
   // on their current table finds nothing. In that case, fall through
   // to the create-new path so the order lands where the customer
-  // actually is.
-  const sourceIsActive = ['new', 'preparing', 'ready'].includes(sourceOrder.status);
+  // actually is. A source that is already PAID (prepaid online / kiosk
+  // while still in the kitchen) is never reopened — the repeat becomes
+  // a new unpaid order instead.
+  const sourceIsActive = ['new', 'preparing', 'ready'].includes(sourceOrder.status) && !isSettled(sourceOrder);
   const sameTableAsSource = !sourceOrder.table
     || !resolvedTargetTable
     || String(sourceOrder.table) === String(resolvedTargetTable);
-  if (sourceIsActive && sameTableAsSource) {
-    const deltaTotal = await appendRepeatItemsToOrder(req, sourceOrder, repeatKitchen, kitchenTotal);
-    revertStatusOnAppend(sourceOrder);
-    await sourceOrder.save();
-
-    // Re-emit kitchen ping when status reverted so the chef sees
-    // the order back in the active queue.
-    try {
-      const io = getIO();
-      emitToKitchen(io, sourceOrder.branch || null, 'order:new', { orderId: sourceOrder.orderId });
-    } catch { /* socket best-effort */ }
-
-    emitOrderEvent('order:appended', { orderId: sourceOrder.orderId, addedItems: repeatKitchen, deltaTotal }, sourceOrder);
-    emitOrderEvent('order:updated', { orderId: sourceOrder.orderId, status: sourceOrder.status }, sourceOrder);
-
-    return reply(200, {
-      success: true,
-      order: sourceOrder,
-      appended: true,
-      isSplit: !!counterSideOrder,
-      splitOrder: counterSideOrder || null,
-      message: counterSideOrder
-        ? 'Items added — counter items ready, kitchen items added to your existing order.'
-        : 'Items added to your existing order.',
-    });
-  }
+  if (sourceIsActive && sameTableAsSource) return sourceOrder;
 
   // Reconcile the target table BEFORE attempting to create a new
   // order. The legacy `one_active_order_per_table` unique index
@@ -489,13 +530,14 @@ async function appendRepeatToActiveOrder(req, { sourceOrder, repeatKitchen, kitc
   // still useful so the customer's "Repeat Order" tap doesn't append
   // to a stale paid bill.
   //
-  // Mirror Cart.createOrder's two-case handler:
   //   • Existing order on table is already PAID → it's a stale closed
-  //     bill. Detach (`table = null`) + free the physical table so
-  //     the new repeat order can claim the slot.
-  //   • Existing order is UNPAID → it's the live tab. Append the
+  //     bill. Detach it (`table = null`). The table itself is NOT freed
+  //     here (freeTableOrUnmergeGroup would also wipe every seat, and
+  //     other parties may be seated — #13); the repeat order re-occupies
+  //     it right after.
+  //   • The caller's OWN party has an unpaid active round → append the
   //     kitchen-side repeated items to it instead of creating a
-  //     duplicate.
+  //     duplicate. Another party's open bill is never touched.
   if (sourceOrder.type === 'dine-in' && resolvedTargetTable) {
     // Only fold the repeat into a still-ACTIVE round (new/preparing/
     // ready) — that round is mid-flight, so adding to it is correct and
@@ -510,11 +552,10 @@ async function appendRepeatToActiveOrder(req, { sourceOrder, repeatKitchen, kitc
     const existingOnTable = await Order.findOne({
       table: resolvedTargetTable,
       status: { $in: ['new', 'preparing', 'ready'] },
-      paymentStatus: { $ne: 'Paid' },
+      paymentStatus: { $nin: [...SETTLED_PAYMENT_STATUSES] },
+      ...repeatPartyFilter(sourceOrder),
       ...tf,
     });
-    // Detach any stale PAID order on the table first so the new
-    // create below has a clean slot.
     const stalePaidOnTable = await Order.findOne({
       table: resolvedTargetTable,
       status: { $in: ['new', 'preparing', 'ready', 'served'] },
@@ -525,41 +566,49 @@ async function appendRepeatToActiveOrder(req, { sourceOrder, repeatKitchen, kitc
       try {
         stalePaidOnTable.table = null;
         await stalePaidOnTable.save();
-        await freeTableOrUnmergeGroup(resolvedTargetTable, tf);
       } catch (err) {
         logger.warn('Repeat-all: failed to detach stale paid order from table:', err.message);
       }
     }
-    if (existingOnTable) {
-      const deltaTotal = await appendRepeatItemsToOrder(req, existingOnTable, repeatKitchen, kitchenTotal);
-      revertStatusOnAppend(existingOnTable);
-      await existingOnTable.save();
-
-      try {
-        const io = getIO();
-        emitToKitchen(io, existingOnTable.branch || null, 'order:new', { orderId: existingOnTable.orderId });
-      } catch { /* socket best-effort */ }
-
-      emitOrderEvent('order:appended', { orderId: existingOnTable.orderId, addedItems: repeatKitchen, deltaTotal }, existingOnTable);
-      emitOrderEvent('order:updated', { orderId: existingOnTable.orderId, status: existingOnTable.status }, existingOnTable);
-
-      return reply(200, {
-        success: true,
-        order: existingOnTable,
-        appended: true,
-        isSplit: !!counterSideOrder,
-        splitOrder: counterSideOrder || null,
-        message: counterSideOrder
-          ? "Items added — counter items ready, kitchen items added to this table's existing order."
-          : "Items added to this table's existing order.",
-      });
-    }
+    if (existingOnTable) return existingOnTable;
   }
   return null;
 }
 
+// Kitchen side: append the repeated items to `target` (see
+// findRepeatAppendTarget) and reply.
+async function appendRepeatToActiveOrder(req, { target, sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder }) {
+  const deltaTotal = await appendRepeatItemsToOrder(req, target, repeatKitchen, kitchenTotal);
+  revertStatusOnAppend(target);
+  await target.save();
+
+  // Re-emit kitchen ping when status reverted so the chef sees
+  // the order back in the active queue.
+  try {
+    const io = getIO();
+    emitToKitchen(io, target.branch || null, 'order:new', { orderId: target.orderId });
+  } catch { /* socket best-effort */ }
+
+  emitOrderEvent('order:appended', { orderId: target.orderId, addedItems: repeatKitchen, deltaTotal }, target);
+  emitOrderEvent('order:updated', { orderId: target.orderId, status: target.status }, target);
+
+  const isSource = target === sourceOrder;
+  return reply(200, {
+    success: true,
+    order: target,
+    appended: true,
+    isSplit: !!counterSideOrder,
+    splitOrder: counterSideOrder || null,
+    message: counterSideOrder
+      ? (isSource
+        ? 'Items added — counter items ready, kitchen items added to your existing order.'
+        : "Items added — counter items ready, kitchen items added to this table's existing order.")
+      : (isSource ? 'Items added to your existing order.' : "Items added to this table's existing order."),
+  });
+}
+
 // Kitchen side: create a fresh order for the repeated items.
-async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, resolvedTargetTable, resolvedTargetBranch, tf }) {
+async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf }) {
   // Source closed and no active order on the target table → create a fresh kitchen-side order.
   const newOrderId = sourceOrder.type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
   const newOrder = new Order({
@@ -573,10 +622,15 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
     phone: sourceOrder.phone,
     items: repeatKitchen,
     total: kitchenTotal, // replaced by the taxed bill below
+    scanSessionId: sourceOrder.scanSessionId || null,
     note: `Repeated from ${sourceOrder.orderId}`,
     pickupLocation: sourceOrder.pickupLocation,
   });
-  await pricing.applyNewOrderBill(req, newOrder);
+  // Mixed repeat: the counter doc holds its items' bare subtotal, so this
+  // doc carries the tax lines of the whole repeat (createOrder's split).
+  await pricing.applyNewOrderBill(req, newOrder, {
+    bareSiblingSubtotal: counterSideOrder && counterBare ? counterSideOrder.total : 0,
+  });
   const savedOrder = await newOrder.save();
   bumpMenuItemOrderCounts(savedOrder.items, savedOrder.restaurant);
 
@@ -657,7 +711,18 @@ async function repeatOrderAllItems(req) {
     ) * 100,
   ) / 100;
 
-  const counterSideOrder = await persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf });
+  // Decide where the kitchen items go BEFORE the counter doc exists, so
+  // the (ready, unpaid) counter doc can never be picked as the table's
+  // open round and get the kitchen items merged into it.
+  const kitchenTarget = repeatKitchen.length > 0
+    ? await findRepeatAppendTarget(req, { sourceOrder, resolvedTargetTable, tf })
+    : null;
+  // Mixed repeat creating a fresh kitchen order → split like createOrder:
+  // counter doc at its bare subtotal, kitchen doc carries the tax lines.
+  const counterBare = repeatKitchen.length > 0 && !kitchenTarget;
+  const counterSideOrder = await persistRepeatCounterSide(req, {
+    sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf, bare: counterBare,
+  });
 
   // Counter-only repeat → done. Skip the kitchen-side append/create
   // entirely so the chef KDS doesn't see the order.
@@ -677,10 +742,11 @@ async function repeatOrderAllItems(req) {
     });
   }
 
-  const appended = await appendRepeatToActiveOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, resolvedTargetTable, tf });
-  if (appended) return appended;
+  if (kitchenTarget) {
+    return appendRepeatToActiveOrder(req, { target: kitchenTarget, sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder });
+  }
 
-  return createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, resolvedTargetTable, resolvedTargetBranch, tf });
+  return createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf });
 }
 
 // ── Append items (waiter / captain) ─────────────────────────────────
@@ -744,6 +810,17 @@ async function appendOrderItems(req) {
     });
   }
 
+  // A settled bill must not grow — items added after payment would be
+  // cooked and served but never charged (and the freed table silently
+  // re-occupied by a closed bill). Start a new order instead.
+  if (isSettled(order)) {
+    throw httpError(409, {
+      success: false,
+      code: 'ORDER_ALREADY_PAID',
+      message: `Order ${order.orderId} is already ${String(order.paymentStatus).toLowerCase()} — place a new order for the extra items.`,
+    });
+  }
+
   // Branch-pinned staff cannot append to an order at another branch.
   const pinned = pinnedBranchId(req);
   if (pinned && order.branch && String(order.branch) !== String(pinned)) {
@@ -784,10 +861,13 @@ async function appendOrderItems(req) {
 
   const menuDocs = menuItemIds.length
     ? await MenuItem.find({ _id: { $in: menuItemIds }, ...tenantFilter(req) })
-      .populate('category', 'name').lean()
+      .populate('category', 'name kind').lean()
     : [];
   const menuById = new Map(menuDocs.map(m => [String(m._id), m]));
 
+  // Every line must resolve to an orderable menu item of this tenant
+  // (buildAppendItems refuses unknown / foreign / archived / out-of-
+  // window items — never a client-priced line).
   const { enrichedItems, deltaTotal } = pricing.buildAppendItems(items, menuById, order.branch);
 
   await preflightAppendStock(req, enrichedItems, order.branch);

@@ -13,8 +13,10 @@
 //
 // The Table schema has no explicit leader column — the leader is derived
 // at read time. A table already holding an `activeOrder` wins; if none do
-// (merge happened while all were free), the caller's own table becomes
-// the leader (which will then get the order on the next create).
+// (merge happened while all were free), the member with the lowest _id
+// is the leader — deterministic, so every scan / order / seat claim on
+// any sibling resolves to the SAME table (seat reservations live on the
+// leader; see utils/tableSeats.js).
 
 const Table = require('../models/table');
 const Request = require('../models/request');
@@ -32,8 +34,10 @@ function mergeGroupIdsOf(table) {
 // Given any tableId, return the merge-leader's Table doc.
 // - If the table isn't merged, returns the table itself.
 // - If merged, returns whichever group member currently holds an
-//   activeOrder; falls back to the originally-requested table when the
-//   group is merged but nobody has an order yet.
+//   activeOrder; falls back to the group member with the lowest _id
+//   when nobody has an order yet (deterministic — previously it fell
+//   back to the requested table, so two diners scanning different
+//   siblings of one group each became "leader" of their own sibling).
 async function resolveMergeLeader(tableId, tenantFilterObj = {}) {
     const table = await Table.findOne({ _id: tableId, ...tenantFilterObj }).lean();
     if (!table) return null;
@@ -47,7 +51,11 @@ async function resolveMergeLeader(tableId, tenantFilterObj = {}) {
         activeOrder: { $ne: null },
         ...tenantFilterObj,
     }).lean();
-    return withOrder || table;
+    if (withOrder) return withOrder;
+    const lowestId = groupIds.map(String).sort()[0];
+    if (lowestId === String(table._id)) return table;
+    const lowest = await Table.findOne({ _id: lowestId, isDeleted: { $ne: true }, ...tenantFilterObj }).lean();
+    return lowest || table;
 }
 
 // Fetch the full list of table names in the merge group, sorted by name,
@@ -72,7 +80,12 @@ async function getMergeGroupNames(tableId, tenantFilterObj = {}) {
 // members so the next customer gets a clean table. Returns the list of
 // freed table IDs so callers can emit a single `table:updated` socket
 // event covering the whole group.
-async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}) {
+// opts.clearSeats: true forces every seat to be released (staff "free
+// table" — an explicit reset for the next diner).
+// opts.keepSeats: true never releases seats (e.g. detaching a stale paid
+// bill while a newly seated party — possibly without an order yet —
+// holds a seat). clearSeats wins if both are passed.
+async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}, opts = {}) {
     const table = await Table.findOne({ _id: tableId, ...tenantFilterObj })
         .select('mergedWith status branch restaurant')
         .lean();
@@ -80,6 +93,32 @@ async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}) {
 
     const isMerged = table.status === 'merged' || (Array.isArray(table.mergedWith) && table.mergedWith.length > 0);
     const groupIds = isMerged ? mergeGroupIdsOf(table) : [table._id];
+
+    // Seat reservations (QA #13): release every seat once the table is
+    // really done — no open order left anywhere in the group. When one
+    // party settles while another party still has an open order, seats
+    // are kept: the settled party's seat has no open order any more and
+    // is pruned by utils/tableSeats after TABLE_SEAT_IDLE_MINUTES, while
+    // the parties still eating keep theirs.
+    let clearSeats = true;
+    if (opts.keepSeats && !opts.clearSeats) {
+        clearSeats = false;
+    } else if (!opts.clearSeats) {
+        try {
+            const Order = require('../models/order');
+            const stillOpen = await Order.exists({
+                table: { $in: groupIds },
+                ...tenantFilterObj,
+                $or: [
+                    { status: { $in: ['new', 'preparing', 'ready'] } },
+                    { status: 'served', paymentStatus: { $nin: ['Paid', 'Refunded'] } },
+                ],
+            });
+            clearSeats = !stillOpen;
+        } catch (err) {
+            logger.warn('freeTableOrUnmergeGroup: open-order check failed, clearing seats: ' + err.message);
+        }
+    }
 
     await Table.updateMany(
         { _id: { $in: groupIds }, ...tenantFilterObj },
@@ -92,6 +131,7 @@ async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}) {
                 // this table doesn't see / leak the previous diner's name
                 // in the admin drawer.
                 currentDiner: { user: null, name: '', phone: '', isRegistered: false, claimedAt: null },
+                ...(clearSeats ? { seats: [] } : {}),
             },
         }
     );

@@ -108,6 +108,11 @@ exports.settleTips = async (req, res) => {
       session.endSession();
       return res.status(400).json({ success: false, message: 'waiterId is required' });
     }
+    if (!mongoose.isValidObjectId(waiterId)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ success: false, message: 'Invalid waiterId' });
+    }
     if (!['Cash', 'Online'].includes(paymentMethod)) {
       await session.abortTransaction();
       session.endSession();
@@ -138,7 +143,9 @@ exports.settleTips = async (req, res) => {
     }
 
     // ── Calculate the real amount from DB (never trust frontend amount) ─
-    const calculatedAmount = tipsToSettle.reduce((sum, t) => sum + t.amount, 0);
+    // Rounded to the paisa so 0.1 + 0.2 settles as 0.3, matching the
+    // wallet balance and the ledger row.
+    const calculatedAmount = Math.round(tipsToSettle.reduce((sum, t) => sum + t.amount, 0) * 100) / 100;
 
     // ── Create settlement record ────────────────────────────────────────
     const settlement = new TipSettlement({
@@ -320,7 +327,17 @@ exports.getMyTips = async (req, res) => {
 // Get settlement history
 exports.getSettlementHistory = async (req, res) => {
   try {
-    const history = await TipSettlement.find(tenantFilter(req))
+    // TipSettlement has no branch field — a branch-pinned admin only sees
+    // settlements of waiters at their own branch (same rule as
+    // getPendingTipsByWaiter / settleTips).
+    const tf = tenantFilter(req);
+    const filter = { ...tf };
+    const pinned = pinnedBranchId(req);
+    if (pinned) {
+      const branchStaff = await User.find({ ...tf, branch: pinned }).select('_id').lean();
+      filter.waiter = { $in: branchStaff.map(u => u._id) };
+    }
+    const history = await TipSettlement.find(filter)
       .populate('waiter', 'name avatar staffId role')
       .populate('settledBy', 'name')
       .sort({ createdAt: -1 });

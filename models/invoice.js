@@ -56,6 +56,21 @@ const invoiceSchema = new mongoose.Schema({
     default: 0,
     min: [0, 'Discount cannot be negative']
   },
+  // Itemised copy of the order's stamped tax lines (2026-10) so receipts
+  // can print "GST (5%)", "Service charge (10%)" and each additional
+  // charge instead of one combined `tax` row. Optional — invoices issued
+  // before this carry only `tax`, and the receipt falls back to it.
+  gst: { type: Number, default: 0, min: 0 },
+  gstPercentage: { type: Number, default: 0, min: 0 },
+  serviceCharge: { type: Number, default: 0, min: 0 },
+  serviceChargePercentage: { type: Number, default: 0, min: 0 },
+  additionalCharges: [{
+    _id: false,
+    name: String,
+    type: { type: String },
+    value: Number,
+    amount: Number,
+  }],
   total: {
     type: Number,
     required: true,

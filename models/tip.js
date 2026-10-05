@@ -43,6 +43,9 @@ tipSchema.index({ waiter: 1, status: 1 });
 tipSchema.index({ createdAt: -1 });
 // Tenant-scoped tip queries (settlement dashboard)
 tipSchema.index({ restaurant: 1, waiter: 1, status: 1 });
+// One tip per order per tenant — makes createTipForPaidOrder idempotent
+// under concurrent callers (PATCH paid + pickup + razorpay verify/webhook).
+tipSchema.index({ order: 1, restaurant: 1 }, { unique: true });
 
 // BUGS_REPORT #30 — auto-scope queries to the request tenant (utils/tenantScopePlugin.js).
 tipSchema.plugin(require('../utils/tenantScopePlugin'));

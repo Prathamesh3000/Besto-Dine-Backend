@@ -175,7 +175,7 @@ exports.getMenuBootstrap = async (req, res) => {
                 .limit(limit)
                 .lean(),
             Combo.find(comboFilter)
-                .select('_id name description images items basePrice offerPercentage finalPrice status isFeatured')
+                .select('_id name description images categories price originalPrice discount discountType savings vegType serveUpto isSpecial isHealthy taxApplicable serviceCharge availableDays startTime endTime status')
                 .sort({ createdAt: -1 })
                 .lean(),
             Settings.findOne({ restaurant: restaurant._id, branch: settingsBranchId }).lean(),
@@ -254,9 +254,13 @@ exports.getMenuBootstrap = async (req, res) => {
         // never see. The page reads taxes, operatingHours, reservation,
         // and the general branding (logo/cafe name/banners). Wallet
         // settings and notifications config are admin concerns.
+        // general.legal (PAN / GSTIN / legal name / FSSAI) is private —
+        // same rule as settingsController.sanitizePublicSettings.
+        const publicGeneral = { ...(merged?.general || {}) };
+        delete publicGeneral.legal;
         const safeSettings = merged
             ? {
-                general: merged.general || {},
+                general: publicGeneral,
                 taxes: merged.taxes || {},
                 operatingHours: merged.operatingHours || [],
                 reservation: merged.reservation || {},

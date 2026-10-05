@@ -25,7 +25,12 @@ const { notifyCounterPaymentRequested, notifyPaymentConfirmed } = require('./ord
 // loyalty points, write the points + payment ledger rows and send the
 // payment notifications. Returns the tenant settings it read (the caller
 // reuses them for the order-ready gate).
-async function recordPaidOrderLedger(req, order, tf) {
+//
+// `prevOrder` (the pre-update doc) lets the payment row book only the
+// money collected now: on an order part-paid from the wallet (already
+// ledgered by POST /wallet/pay) only total − that wallet amount changes
+// hands at settlement.
+async function recordPaidOrderLedger(req, order, tf, prevOrder = null) {
   // M6: Read loyalty config from Settings instead of hardcoding (per-tenant)
   const settings = await getSettings(req);
   const loyalty = resolveLoyaltySettings(settings);
@@ -45,6 +50,12 @@ async function recordPaidOrderLedger(req, order, tf) {
   const pointsBefore = wallet.loyaltyPoints - earnedPoints;
   const balanceBefore = wallet.balance;
   const isWalletPayment = order.paymentMethod?.toLowerCase() === 'wallet';
+  const priorWalletPaid = prevOrder
+    && String(prevOrder.paymentMethod || '').toLowerCase() === 'wallet'
+    && prevOrder.paymentStatus !== 'Paid'
+    ? Math.max(0, Number(prevOrder.amountPaid) || 0)
+    : 0;
+  const collected = Math.max(0, Math.round(((Number(order.total) || 0) - priorWalletPaid) * 100) / 100);
 
   // Record Points Transaction + Payment Transaction in parallel
   // NOTE: Balance was already deducted in walletController.payWithWallet() via atomic operation.
@@ -62,7 +73,7 @@ async function recordPaidOrderLedger(req, order, tf) {
       user: order.user, order: order._id, type: 'order_payment',
       restaurant: tenant,
       branch: order.branch || null,
-      amount: isWalletPayment ? -order.total : order.total,
+      amount: isWalletPayment ? -collected : collected,
       paymentMethod: order.paymentMethod?.toLowerCase() || 'cash', transactionId: idGen.transactionId(),
       description: `Payment for Order ${order.orderId}`,
       balanceBefore: balanceBefore, balanceAfter: wallet.balance
@@ -102,6 +113,21 @@ async function requestCounterPayment(req) {
   if (!order) order = await Order.findOne({ orderId: id, ...tf });
   if (!order) throw httpError(404, { success: false, message: 'Order not found' });
 
+  // Ownership — same rule as customerPayment: staff, the logged-in
+  // owner, or a guest holding the order's scan session. Otherwise anyone
+  // with an order id could flip it to cash and page the floor staff.
+  const access = orderAccessForCaller(req, order);
+  if (!access.allowed) {
+    if (!req.user) {
+      throw httpError(401, {
+        success: false,
+        code: access.reason || 'SCAN_TOKEN_REQUIRED',
+        message: 'Please re-scan the table QR code (or log in) to continue.',
+      });
+    }
+    throw httpError(403, { success: false, code: access.reason, message: 'You can only request payment for your own orders' });
+  }
+
   if (order.paymentStatus === 'Paid') {
     throw httpError(400, {
       success: false,
@@ -129,9 +155,11 @@ async function requestCounterPayment(req) {
   // screen all show the WHOLE table's bill — so the cash-collect amount
   // must be the table's aggregated payable, not just this one round.
   // Sum every unpaid round's stored total (which already bakes in that
-  // round's taxes/tip/coupon/points) and subtract any manual discount.
-  // Falls back to the single order when it has no table (defensive).
-  let payableTotal = Number(order.total) || 0;
+  // round's taxes/tip/coupon/points), minus any manual discount and
+  // whatever was already paid on a 'Partially Paid' round (e.g. from the
+  // wallet). Falls back to the single order when it has no table.
+  const dueOf = (o) => (Number(o.total) || 0) - (Number(o.manualDiscount) || 0) - (Number(o.amountPaid) || 0);
+  let payableTotal = Math.round(Math.max(0, dueOf(order)) * 100) / 100;
   if (order.table) {
     try {
       const tableRounds = await Order.find({
@@ -139,10 +167,10 @@ async function requestCounterPayment(req) {
         status: { $in: ['new', 'preparing', 'ready', 'served'] },
         paymentStatus: { $ne: 'Paid' },
         ...tf,
-      }).select('total manualDiscount').lean();
+      }).select('total manualDiscount amountPaid').lean();
       if (tableRounds.length) {
         payableTotal = Math.round(
-          tableRounds.reduce((s, o) => s + (Number(o.total) || 0) - (Number(o.manualDiscount) || 0), 0) * 100,
+          Math.max(0, tableRounds.reduce((s, o) => s + dueOf(o), 0)) * 100,
         ) / 100;
       }
     } catch { /* fall back to single-order total */ }
@@ -206,15 +234,33 @@ async function applyCouponToOrder(req) {
     });
   }
 
+  // order.total already has the current coupon subtracted, and GST is
+  // levied on (subtotal − coupon) (utils/billing.computeBill). A coupon
+  // change therefore moves the stored total by the discount difference
+  // AND re-stamps the GST at the order's stamped rate on the new
+  // discounted base (orderBillMath.recomputeBillForCoupon).
+  const { recomputeBillForCoupon, lineItemsSubtotal } = require('./orderBillMath');
+  const applyCouponBill = (newDiscount) => {
+    const next = recomputeBillForCoupon({
+      bill: order,
+      subtotal: lineItemsSubtotal(order.items),
+      oldCoupon: Number(order.couponDiscount) || 0,
+      newCoupon: Number(newDiscount) || 0,
+    });
+    order.gst = next.gst;
+    order.total = next.total;
+  };
+
   // Empty / null code → clear the coupon on the order.
   const trimmed = typeof code === 'string' ? code.trim() : '';
   if (!trimmed) {
+    applyCouponBill(0);
     order.couponCode = '';
     order.couponDiscount = 0;
     await order.save();
     emitOrderEvent(
       'order:updated',
-      { orderId: order.orderId, couponCode: '', couponDiscount: 0 },
+      { orderId: order.orderId, couponCode: '', couponDiscount: 0, gst: order.gst, total: order.total },
       order
     );
     return reply(200, { success: true, order, discount: 0, message: 'Coupon removed' });
@@ -224,11 +270,18 @@ async function applyCouponToOrder(req) {
   // re-run validation here (not just trust a client-provided discount)
   // so a waiter can't punch in a hand-edited amount.
   const Coupon = require('../models/coupon');
-  const coupon = await Coupon.findOne({
+  // Branch scope: a coupon pinned to a branch only applies to that
+  // branch's orders; tenant-level (branch null) coupons apply anywhere.
+  // Codes are unique per tenant+branch, so prefer the order's branch row.
+  const couponCandidates = await Coupon.find({
     code: trimmed.toUpperCase(),
     isActive: true,
     ...tenantFilter(req),
+    branch: { $in: order.branch ? [null, order.branch] : [null] },
   });
+  const coupon = couponCandidates.find((c) => c.branch && String(c.branch) === String(order.branch))
+    || couponCandidates[0]
+    || null;
   if (!coupon) {
     throw httpError(404, { success: false, message: 'Invalid or inactive coupon code' });
   }
@@ -240,6 +293,10 @@ async function applyCouponToOrder(req) {
   if (coupon.endDate && now > coupon.endDate) {
     throw httpError(400, { success: false, message: 'Coupon has expired' });
   }
+  // Usage limit — same rule as checkout / order create.
+  if (coupon.usageLimit && Number(coupon.usageCount || 0) >= Number(coupon.usageLimit)) {
+    throw httpError(400, { success: false, message: 'Coupon usage limit has been reached' });
+  }
 
   const subtotal = (order.items || []).reduce((acc, i) => acc + (Number(i.price) || 0) * (Number(i.quantity) || 0), 0);
   if (coupon.minOrderValue && subtotal < coupon.minOrderValue) {
@@ -249,11 +306,26 @@ async function applyCouponToOrder(req) {
     });
   }
 
-  // ADM-064 — order.items[].prepStation was snapshotted at order
-  // create time, so the helper can classify directly without a
-  // MenuItem lookup.
-  const { computeCouponDiscount } = require('../utils/couponScope');
-  const { discount, eligibleSubtotal: eligible } = computeCouponDiscount(coupon, order.items || []);
+  // ADM-064 / Decision 6 — order.items[].categoryKind (Food / Drink of
+  // the menu category) and prepStation were snapshotted at order create /
+  // append time, so the helper classifies straight from the snapshot.
+  // Legacy lines without a categoryKind snapshot (orders placed before
+  // Decision 6) get the menu category's current kind for a scoped coupon;
+  // anything still unresolved falls back to the prep-station rule.
+  const { computeCouponDiscount, withCategoryKinds } = require('../utils/couponScope');
+  let couponItems = (order.items || []).map((i) => (typeof i?.toObject === 'function' ? i.toObject() : i));
+  if (coupon.scope && coupon.scope !== 'all') {
+    const missing = [...new Set(couponItems
+      .filter((i) => !i?.categoryKind && i?.menuItem && mongoose.isValidObjectId(String(i.menuItem)))
+      .map((i) => String(i.menuItem)))];
+    if (missing.length) {
+      const MenuItem = require('../models/menuItem');
+      const menus = await MenuItem.find({ _id: { $in: missing.slice(0, 500) }, ...tenantFilter(req) })
+        .select('category').populate('category', 'kind').lean();
+      couponItems = withCategoryKinds(couponItems, new Map(menus.map((m) => [String(m._id), m])));
+    }
+  }
+  const { discount, eligibleSubtotal: eligible } = computeCouponDiscount(coupon, couponItems);
   if (coupon.scope && coupon.scope !== 'all' && eligible <= 0) {
     throw httpError(400, {
       success: false,
@@ -264,13 +336,14 @@ async function applyCouponToOrder(req) {
   }
   const finalDiscount = Math.min(discount, subtotal);
 
+  applyCouponBill(finalDiscount);
   order.couponCode = coupon.code;
   order.couponDiscount = finalDiscount;
   await order.save();
 
   emitOrderEvent(
     'order:updated',
-    { orderId: order.orderId, couponCode: coupon.code, couponDiscount: finalDiscount },
+    { orderId: order.orderId, couponCode: coupon.code, couponDiscount: finalDiscount, gst: order.gst, total: order.total },
     order
   );
 

@@ -3,7 +3,7 @@ const logger = require('../utils/logger');
 const { recordAudit } = require('../utils/audit');
 const { triggerMarketingRebuild } = require('../utils/deployHook');
 const { compressAndUpload } = require('../utils/cloudinaryUploader');
-const { sanitizeBlogContent } = require('../utils/sanitizeBlogContent');
+const { sanitizeBlogContent, hasUnsafeScheme } = require('../utils/sanitizeBlogContent');
 
 // BlogPost is intrinsically platform-global (no tenant). // AUDIT-EXEMPT: global marketing content, not tenant-scoped
 
@@ -22,15 +22,34 @@ function slugify(input = '') {
 // Guarantee a unique slug by suffixing -2, -3, ... if needed. `excludeId` lets
 // an update keep its own slug without colliding with itself.
 async function uniqueSlug(base, excludeId = null) {
-    let slug = base || 'post';
+    // A title with no latin characters slugifies to '' — use 'post' as the
+    // base for the suffixed candidates too ('post-2', never '-2').
+    const root = base || 'post';
+    let slug = root;
     let n = 1;
     // eslint-disable-next-line no-constant-condition
     while (true) {
         const clash = await BlogPost.findOne({ slug, ...(excludeId ? { _id: { $ne: excludeId } } : {}) }).select('_id').lean();
         if (!clash) return slug;
         n += 1;
-        slug = `${base}-${n}`;
+        slug = `${root}-${n}`;
     }
+}
+
+// Text fields must be strings when present (coverUrl / author / keyword
+// may also be null = clear). Anything else is a 400, not a TypeError 500.
+// A cover URL with a non-http(s) scheme (javascript:, data:, …) is refused.
+function validatePostBody(body = {}) {
+    for (const key of ['title', 'description', 'content', 'slug', 'status']) {
+        if (body[key] !== undefined && typeof body[key] !== 'string') return `${key} must be text`;
+    }
+    for (const key of ['coverUrl', 'author', 'keyword']) {
+        if (body[key] !== undefined && body[key] !== null && typeof body[key] !== 'string') return `${key} must be text`;
+    }
+    if (typeof body.coverUrl === 'string' && body.coverUrl.trim() && hasUnsafeScheme(body.coverUrl.trim())) {
+        return 'Cover URL must be an http(s) link or an uploaded image path';
+    }
+    return null;
 }
 
 // Shape a post for the Super Admin list/detail (includes drafts + bookkeeping).
@@ -118,6 +137,8 @@ exports.getBlogPost = async (req, res) => {
 // POST /api/v1/superadmin/blog
 exports.createBlogPost = async (req, res) => {
     try {
+        const invalid = validatePostBody(req.body || {});
+        if (invalid) return res.status(400).json({ success: false, message: invalid });
         const { title, description, content, tags, coverUrl, author, keyword, status, slug } = req.body;
         if (!title || !title.trim()) return res.status(400).json({ success: false, message: 'Title is required' });
         if (!description || !description.trim()) return res.status(400).json({ success: false, message: 'Meta description is required' });
@@ -171,6 +192,9 @@ exports.updateBlogPost = async (req, res) => {
     try {
         const post = await BlogPost.findById(req.params.id);
         if (!post) return res.status(404).json({ success: false, message: 'Blog post not found' });
+
+        const invalid = validatePostBody(req.body || {});
+        if (invalid) return res.status(400).json({ success: false, message: invalid });
 
         const wasPublished = post.status === 'published';
         const { title, description, content, tags, coverUrl, author, keyword, status, slug } = req.body;

@@ -37,21 +37,26 @@ const hallSchema = new mongoose.Schema({
   },
   
   // Capacity
-  minCapacity: Number,
+  // Negative prices / capacities are refused (a negative price is
+  // clamped to a free hall by the pricing engine; a negative max
+  // rejects every booking).
+  minCapacity: { type: Number, min: [0, 'Minimum capacity cannot be negative'] },
   maxCapacity: {
     type: Number,
-    required: [true, 'Maximum capacity is required']
+    required: [true, 'Maximum capacity is required'],
+    min: [1, 'Maximum capacity must be at least 1']
   },
-  optimalCapacity: Number,
+  optimalCapacity: { type: Number, min: [0, 'Optimal capacity cannot be negative'] },
   
   // Pricing
   basePrice: {
     type: Number,
-    required: [true, 'Base price is required']
+    required: [true, 'Base price is required'],
+    min: [0, 'Base price cannot be negative']
   },
-  hourlyRate: Number,
-  cleaningCharges: Number,
-  securityDeposit: Number,
+  hourlyRate: { type: Number, min: [0, 'Hourly rate cannot be negative'] },
+  cleaningCharges: { type: Number, min: [0, 'Cleaning charges cannot be negative'] },
+  securityDeposit: { type: Number, min: [0, 'Security deposit cannot be negative'] },
   
   // Location
   floorLevel: String,

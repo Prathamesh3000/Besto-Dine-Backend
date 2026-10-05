@@ -16,12 +16,25 @@ const { sendServerError } = require('../utils/httpErrors');
 // Without this, MongoDB's $hour/$dayOfMonth/$dateToString run in UTC and a
 // cafe serving an 11 AM IST customer sees that order in "hour 5" (5:30 AM
 // UTC) — which our 9–23 hour window silently drops from the hourly chart.
-// Override per-deploy with ANALYTICS_TIMEZONE if the tenant is not in India.
-const REPORT_TZ = process.env.ANALYTICS_TIMEZONE || 'Asia/Kolkata';
+// Each tenant is reported in its own Restaurant.timezone (captured at
+// onboarding, editable in Settings); ANALYTICS_TIMEZONE / Asia/Kolkata is
+// the fallback when the tenant has none or it is not a valid IANA zone.
+const DEFAULT_REPORT_TZ = process.env.ANALYTICS_TIMEZONE || 'Asia/Kolkata';
+
+function reportTz(req) {
+  const tz = typeof req?.restaurant?.timezone === 'string' ? req.restaurant.timezone.trim() : '';
+  if (!tz) return DEFAULT_REPORT_TZ;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return tz;
+  } catch {
+    return DEFAULT_REPORT_TZ;
+  }
+}
 
 // Start of "today" in REPORT_TZ, returned as a UTC Date for Mongo queries.
 // Avoids pulling in moment/luxon just for this single call site.
-function startOfLocalDay(tz = REPORT_TZ, now = new Date()) {
+function startOfLocalDay(tz = DEFAULT_REPORT_TZ, now = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
@@ -37,6 +50,7 @@ function startOfLocalDay(tz = REPORT_TZ, now = new Date()) {
 
 exports.getStats = async (req, res) => {
   try {
+    const REPORT_TZ = reportTz(req);
     const { earningsPeriod = 'daily', bookingTime = 'today' } = req.query;
     const tf = tenantFilter(req);
     // Phase 6 step 6 — branch filter applied to every Order/Table aggregation.
@@ -54,7 +68,9 @@ exports.getStats = async (req, res) => {
     const pinned = pinnedBranchId(req);
     const queryBranch = req.query.branch;
     const rawActiveBranch = pinned
-      || (queryBranch && queryBranch !== 'all' && queryBranch !== 'tenant-only' && queryBranch !== 'none' ? queryBranch : null);
+      // Only a well-formed 24-hex id; a typo / keyword ('all', 'abc', …)
+      // means "no active branch" instead of a BSONError → 500.
+      || (typeof queryBranch === 'string' && /^[a-f\d]{24}$/i.test(queryBranch) ? queryBranch : null);
     const activeBranch = rawActiveBranch
       ? (rawActiveBranch instanceof mongoose.Types.ObjectId
           ? rawActiveBranch
@@ -128,7 +144,7 @@ exports.getStats = async (req, res) => {
         { $group: {
           _id: null,
           count: { $sum: 1 },
-          earnings: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$total', 0] } }
+          earnings: { $sum: { $cond: [{ $and: [{ $eq: ['$paymentStatus', 'Paid'] }, { $ne: ['$status', 'cancelled'] }] }, '$total', 0] } }
         }}
       ]),
 
@@ -252,7 +268,7 @@ exports.getStats = async (req, res) => {
       })(),
 
       // 11. Earnings aggregation — done in DB, not JS loops (per-tenant + branch)
-      buildEarningsAggregation(earningsPeriod, today, tfb),
+      buildEarningsAggregation(earningsPeriod, today, tfb, REPORT_TZ),
 
       // 12. Customer requests — scoped to today AND to the selected
       // branch. createRequest stamps `branch` from the request's table
@@ -421,7 +437,7 @@ exports.getStats = async (req, res) => {
 // Local-midnight (REPORT_TZ) of a given Y-M-D, expressed as a UTC Date for
 // Mongo. Mirrors startOfLocalDay() but for an arbitrary calendar date rather
 // than "the day containing now". DST-safe (offset is computed at the target).
-function localMidnightUTC(y, m, d, tz = REPORT_TZ) {
+function localMidnightUTC(y, m, d, tz = DEFAULT_REPORT_TZ) {
   const guess = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -448,9 +464,9 @@ function parseYmd(s) {
 //   single day  → hourly (9am–11pm, same window as the live dashboard)
 //   ≤ 92 days   → one point per calendar day
 //   longer      → one point per calendar month
-async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}) {
+async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}, REPORT_TZ = DEFAULT_REPORT_TZ) {
   const spanDays = Math.round((toExclUTC.getTime() - fromUTC.getTime()) / 86400000);
-  const matchPaid = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, paymentStatus: 'Paid', ...tf };
+  const matchPaid = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf };
 
   if (spanDays <= 1) {
     // Hourly — reuse the same 9–23 window the dashboard uses.
@@ -521,6 +537,7 @@ async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}) {
 // @access  Private/Admin (viewPayments-gated on the frontend nav)
 exports.getReports = async (req, res) => {
   try {
+    const REPORT_TZ = reportTz(req);
     const tf = tenantFilter(req);
     const bf = analyticsBranchFilter(req);
     const tfb = { ...tf, ...bf };
@@ -540,12 +557,12 @@ exports.getReports = async (req, res) => {
     const toParsed = parseYmd(req.query.to);
 
     const fromUTC = fromParsed
-      ? localMidnightUTC(fromParsed.y, fromParsed.m, fromParsed.d)
-      : localMidnightUTC(ty, tm, 1);
+      ? localMidnightUTC(fromParsed.y, fromParsed.m, fromParsed.d, REPORT_TZ)
+      : localMidnightUTC(ty, tm, 1, REPORT_TZ);
     // `to` is inclusive of the whole day, so the exclusive upper bound is the
     // start of the day AFTER `to`.
     const toBase = toParsed ? toParsed : { y: ty, m: tm, d: td };
-    const toExclUTC = new Date(localMidnightUTC(toBase.y, toBase.m, toBase.d).getTime() + 86400000);
+    const toExclUTC = new Date(localMidnightUTC(toBase.y, toBase.m, toBase.d, REPORT_TZ).getTime() + 86400000);
 
     if (toExclUTC.getTime() <= fromUTC.getTime()) {
       return res.status(400).json({ success: false, message: 'Invalid date range: "from" must be on or before "to".' });
@@ -558,7 +575,8 @@ exports.getReports = async (req, res) => {
     const rangeMatch = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, ...tfb };
     const spanMs = toExclUTC.getTime() - fromUTC.getTime();
     const rangeDays = Math.max(1, Math.round(spanMs / 86400000));
-    const PAID = { $eq: ['$paymentStatus', 'Paid'] };
+    // Earned = Paid and not cancelled (cancelled-but-unrefunded orders keep 'Paid').
+    const PAID = { $and: [{ $eq: ['$paymentStatus', 'Paid'] }, { $ne: ['$status', 'cancelled'] }] };
 
     // Previous equal-length window, immediately before `from` — powers the
     // period-over-period trend (is the business up or down vs last time?).
@@ -567,7 +585,7 @@ exports.getReports = async (req, res) => {
 
     const [earnings, itemFacetArr, orderFacetArr, prevAgg] = await Promise.all([
       // 1. Earnings time-series (auto-bucketed by span) — the headline trend.
-      buildRangeEarnings(fromUTC, toExclUTC, tfb),
+      buildRangeEarnings(fromUTC, toExclUTC, tfb, REPORT_TZ),
 
       // 2. Item-level analytics in one pass (unwound line items, non-cancelled).
       Order.aggregate([
@@ -623,11 +641,11 @@ exports.getReports = async (req, res) => {
             }},
           ],
           byWeekday: [
-            { $match: { paymentStatus: 'Paid' } },
+            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
             { $group: { _id: { $dayOfWeek: { date: '$createdAt', timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byHour: [
-            { $match: { paymentStatus: 'Paid' } },
+            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
             { $group: { _id: { $hour: { date: '$createdAt', timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byChannel: [
@@ -637,11 +655,11 @@ exports.getReports = async (req, res) => {
             { $group: { _id: '$source', orders: { $sum: 1 }, earnings: { $sum: { $cond: [PAID, '$total', 0] } } } },
           ],
           byPayment: [
-            { $match: { paymentStatus: 'Paid' } },
+            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
             { $group: { _id: '$paymentMethod', orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byDay: [
-            { $match: { paymentStatus: 'Paid' } },
+            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
             { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } }, earnings: { $sum: '$total' }, orders: { $sum: 1 } } },
             { $sort: { earnings: -1 } },
           ],
@@ -798,6 +816,7 @@ exports.getReports = async (req, res) => {
 // @access  Private/Admin
 exports.getForecast = async (req, res) => {
   try {
+    const REPORT_TZ = reportTz(req);
     const tf = tenantFilter(req);
     const bf = analyticsBranchFilter(req);
     const tfb = { ...tf, ...bf };
@@ -812,7 +831,7 @@ exports.getForecast = async (req, res) => {
 
     // Daily PAID earnings over the lookback window.
     const result = await Order.aggregate([
-      { $match: { createdAt: { $gte: histStart, $lt: histEndExcl }, paymentStatus: 'Paid', ...tfb } },
+      { $match: { createdAt: { $gte: histStart, $lt: histEndExcl }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tfb } },
       { $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } },
         total: { $sum: '$total' },
@@ -1003,12 +1022,12 @@ function summarize(data, currentIndex = null) {
   };
 }
 
-async function buildEarningsAggregation(period, today, tf = {}) {
+async function buildEarningsAggregation(period, today, tf = {}, REPORT_TZ = DEFAULT_REPORT_TZ) {
   if (period === 'weekly') {
     const weekStart = new Date(today);
     weekStart.setDate(weekStart.getDate() - 6);
     const result = await Order.aggregate([
-      { $match: { createdAt: { $gte: weekStart }, paymentStatus: 'Paid', ...tf } },
+      { $match: { createdAt: { $gte: weekStart }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf } },
       { $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } },
         total: { $sum: '$total' }
@@ -1048,7 +1067,7 @@ async function buildEarningsAggregation(period, today, tf = {}) {
     // Approximate month-start by pulling back (todayDay - 1) days from today.
     const monthStart = new Date(today.getTime() - (todayDay - 1) * 86400000);
     const result = await Order.aggregate([
-      { $match: { createdAt: { $gte: monthStart }, paymentStatus: 'Paid', ...tf } },
+      { $match: { createdAt: { $gte: monthStart }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf } },
       { $group: {
         _id: { $dayOfMonth: { date: '$createdAt', timezone: REPORT_TZ } },
         total: { $sum: '$total' }
@@ -1066,7 +1085,7 @@ async function buildEarningsAggregation(period, today, tf = {}) {
 
   // daily — hourly breakdown in REPORT_TZ
   const result = await Order.aggregate([
-    { $match: { createdAt: { $gte: today }, paymentStatus: 'Paid', ...tf } },
+    { $match: { createdAt: { $gte: today }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf } },
     { $group: {
       _id: { $hour: { date: '$createdAt', timezone: REPORT_TZ } },
       total: { $sum: '$total' }

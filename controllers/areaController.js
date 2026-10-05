@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Area = require('../models/area');
+const Branch = require('../models/branch');
 
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const listCache = require('../utils/listCache');
@@ -48,11 +49,29 @@ function areaBranchFilter(req) {
 
 // Create a new area
 const createArea = asyncHandler(async (req, res) => {
-    const { name, note } = req.body;
+    const { name, note, description } = req.body || {};
+    if (typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ success: false, message: 'Area name is required' });
+    }
+    if (note !== undefined && note !== null && typeof note !== 'string') {
+        return res.status(400).json({ success: false, message: 'Note must be text' });
+    }
+    if (description !== undefined && description !== null && typeof description !== 'string') {
+        return res.status(400).json({ success: false, message: 'Description must be text' });
+    }
+    if (typeof description === 'string' && description.trim().length > 300) {
+        return res.status(400).json({ success: false, message: 'Description cannot exceed 300 characters' });
+    }
 
     // Sub Admin owns the area at their branch; tenant owner creates
     // branch-less (null) areas unless body.branch is explicitly set.
     const ownerBranch = pinnedBranchId(req) || req.body.branch || null;
+    if (!pinnedBranchId(req) && ownerBranch) {
+        if (!mongoose.isValidObjectId(ownerBranch)
+            || !(await Branch.exists({ _id: ownerBranch, ...tenantFilter(req), isActive: true }))) {
+            return res.status(400).json({ success: false, message: 'Branch not found or not part of your restaurant' });
+        }
+    }
 
     // Uniqueness check is per tenant + branch: Branch A and Branch B
     // can both have an area called "Rooftop".
@@ -68,6 +87,7 @@ const createArea = asyncHandler(async (req, res) => {
     const area = new Area({
         name: name.trim(),
         note: note ? note.trim() : '',
+        description: description ? description.trim() : '',
         restaurant: tenantId(req),
         branch: ownerBranch,
     });
@@ -109,7 +129,19 @@ const getAreas = asyncHandler(async (req, res) => {
 // Update an area (for name, note or isActive toggle)
 const updateArea = asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const { name, note, isActive } = req.body;
+    const { name, note, isActive, description } = req.body || {};
+    if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
+        return res.status(400).json({ success: false, message: 'Area name is required' });
+    }
+    if (note !== undefined && typeof note !== 'string') {
+        return res.status(400).json({ success: false, message: 'Note must be text' });
+    }
+    if (description !== undefined && description !== null && typeof description !== 'string') {
+        return res.status(400).json({ success: false, message: 'Description must be text' });
+    }
+    if (typeof description === 'string' && description.trim().length > 300) {
+        return res.status(400).json({ success: false, message: 'Description cannot exceed 300 characters' });
+    }
 
     const area = await Area.findOne({ _id: id, ...tenantFilter(req), ...strictBranchFilter(req) });
     if (!area) {
@@ -118,6 +150,7 @@ const updateArea = asyncHandler(async (req, res) => {
 
     if (name !== undefined) area.name = name.trim();
     if (note !== undefined) area.note = note.trim();
+    if (description !== undefined) area.description = (description || '').trim();
     if (isActive !== undefined) area.isActive = isActive;
 
     await area.save();

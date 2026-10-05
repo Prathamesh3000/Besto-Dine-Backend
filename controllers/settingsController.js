@@ -754,8 +754,21 @@ function validateDelivery(delivery) {
 // @desc    Update settings (full replacement) for the caller's scope
 // @route   PUT /api/settings
 // @access  Admin / Sub Admin
+// Parking vehicle types are keyed by a slug id (what bookings store as
+// `vehicleType`). Derive it from the label when the admin UI omits it.
+function normalizeParkingSettings(reservation) {
+  const parking = reservation && reservation.parking;
+  if (!parking || typeof parking !== 'object' || !Array.isArray(parking.vehicles)) return;
+  parking.vehicles = parking.vehicles.map((v) => ({
+    id: String(v.id || v.label || '').trim().toLowerCase().replace(/\s+/g, '-'),
+    label: String(v.label || v.id || '').trim(),
+    pricePerHour: Number(v.pricePerHour) || 0,
+  }));
+}
+
 exports.updateSettings = async (req, res) => {
   try {
+    if (req.body.reservation) normalizeParkingSettings(req.body.reservation);
     // Input validation
     if (req.body.general) {
       if (req.body.general.email && !validateEmail(req.body.general.email)) {
@@ -871,6 +884,7 @@ exports.updateSettingsSection = async (req, res) => {
         return res.status(400).json({ message: extrasErr });
       }
     }
+    if (section === 'reservation') normalizeParkingSettings(req.body);
     if (section === 'delivery') {
       const deliveryErr = validateDelivery(req.body);
       if (deliveryErr) {

@@ -21,15 +21,18 @@ const { getSettings } = require('../utils/settingsCache');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { resolveMergeLeader, freeTableOrUnmergeGroup } = require('../utils/tableMerge');
-const { callerPartyKeys, checkTableCapacity, tableUnavailableError } = require('../utils/tableOccupancy');
+const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
+const { claimSeat } = require('../utils/tableSeats');
 const { httpError, reply } = require('./orderErrors');
 const {
   isValidObjectId,
   bumpMenuItemOrderCounts,
   emitStaffTable,
   signKioskTrackingToken,
+  menuItemUnavailableReason,
 } = require('./orderHelpers');
 const pricing = require('./orderPricingService');
+const { claimPayment, releaseClaim } = require('../utils/paymentClaim');
 const { buildCreateOrderNotificationTasks } = require('./orderNotifications');
 
 // Channels we accept on createOrder. Kept narrow so a tampered client
@@ -38,6 +41,44 @@ const { buildCreateOrderNotificationTasks } = require('./orderNotifications');
 const VALID_ORDER_SOURCES = new Set(['web-customer', 'qr-scan', 'kiosk', 'staff', 'pos', 'admin']);
 const STAFF_ORDERER_ROLES = new Set(['waiter', 'captain']);
 const DINE_IN_ALLOWED = new Set(['waiter', 'captain', 'admin', 'manager', 'customer']);
+
+// ── Phase: staff manual discount at creation ────────────────────────
+// A staff-placed order (e.g. the admin "Add takeaway order" modal) may
+// carry `manualDiscount` — the same field PATCH /orders/:id/status sets
+// from the table drawer — so it is stamped at creation instead of by a
+// follow-up PATCH. Same gate as that PATCH: admin / superadmin, or a
+// manager / captain / waiter holding the updateOrderStatus permission.
+// Customers, guests and kiosks can never send one (403). 0 / absent is
+// a no-op for everybody. order.total is NOT reduced — like the drawer
+// discount it is recorded on the order and the amount due becomes
+// total − manualDiscount − amountPaid.
+const MANUAL_DISCOUNT_ROLES = new Set(['admin', 'superadmin', 'manager', 'captain', 'waiter']);
+function canGiveManualDiscount(user) {
+  if (!user || !MANUAL_DISCOUNT_ROLES.has(user.role)) return false;
+  if (user.role === 'admin' || user.role === 'superadmin') return true;
+  return !!(user.permissions && user.permissions.updateOrderStatus === true);
+}
+function resolveManualDiscount(req, authoritativeTotal) {
+  const raw = req.body ? req.body.manualDiscount : undefined;
+  if (raw === undefined || raw === null || raw === '') return 0;
+  const value = typeof raw === 'number' ? raw : (typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN);
+  if (!Number.isFinite(value) || value < 0) {
+    throw httpError(400, { success: false, code: 'INVALID_MANUAL_DISCOUNT', message: 'Discount must be a non-negative amount.' });
+  }
+  const discount = Math.round(value * 100) / 100;
+  if (discount === 0) return 0;
+  if (!canGiveManualDiscount(req.user)) {
+    throw httpError(403, { success: false, code: 'MANUAL_DISCOUNT_STAFF_ONLY', message: 'Only staff can apply a discount to an order.' });
+  }
+  if (authoritativeTotal !== undefined && discount > Math.round((Number(authoritativeTotal) || 0) * 100) / 100) {
+    throw httpError(400, {
+      success: false,
+      code: 'MANUAL_DISCOUNT_EXCEEDS_TOTAL',
+      message: `Discount of ₹${discount.toFixed(2)} is more than the order total of ₹${Number(authoritativeTotal).toFixed(2)}.`,
+    });
+  }
+  return discount;
+}
 
 // ── Phase: idempotency short-circuit ────────────────────────────────
 // Returns { clientIdempotencyKey, replay } — `replay` is the original
@@ -402,10 +443,44 @@ async function loadCartMenu(req, items) {
   const menuDocs = menuItemIds.length
     ? await MenuItem.find(
       { _id: { $in: menuItemIds }, ...tenantFilter(req) }
-    ).populate('category', 'name').lean()
+    ).populate('category', 'name kind').lean()
     : [];
   const menuById = new Map(menuDocs.map(m => [String(m._id), m]));
+
+  // Archived / draft items (inactivated in Menu Management) and items
+  // outside their availability schedule (availableDays / startTime–
+  // endTime) are hidden from the customer menu — refuse them here too,
+  // so a stale cart / repeat / direct POST can't order them.
+  const now = new Date();
+  for (const m of menuDocs) {
+    const reason = menuItemUnavailableReason(m, now);
+    if (reason) {
+      throw httpError(400, {
+        success: false,
+        code: 'ITEM_UNAVAILABLE',
+        message: `${m.name} is ${reason}.`,
+      });
+    }
+  }
   return menuById;
+}
+
+// ── Phase: the branch whose prices apply ────────────────────────────
+// Dine-in is priced at the TABLE's branch (the physical location —
+// same rule resolvePlacement uses to stamp order.branch), not the
+// client-controlled X-Branch-Id header, so branch-specific prices can't
+// be dodged by omitting / swapping the header. Other orders keep the
+// header branch (a branch-pinned caller: their own branch).
+async function resolvePricingBranch(req, type, resolvedTableId) {
+  if (type === 'dine-in' && resolvedTableId) {
+    try {
+      const t = await Table.findOne({ _id: resolvedTableId, ...tenantFilter(req) }).select('branch').lean();
+      if (t?.branch) return t.branch;
+    } catch (err) {
+      logger.warn('Pricing branch lookup failed; using the request branch:', err.message);
+    }
+  }
+  return pinnedBranchId(req) || req.branch?._id || null;
 }
 
 // ── Phase: branch assignment + table availability / capacity ────────
@@ -451,17 +526,18 @@ async function resolvePlacement(req, { type, resolvedTableId, scanSessionId, bra
     const unavailable = tableUnavailableError(t);
     if (unavailable) throw httpError(unavailable.status, unavailable.body);
 
-    // ── Table capacity enforcement ──────────────────────────────
-    // A table seats `capacity` diners (summed across a merge group).
-    // Count the distinct ordering PARTIES currently seated — one per
-    // logged-in customer / guest scan session, plus one for staff
-    // walk-in orders — and refuse a NEW party once the table is full.
-    // A party that already has a live order can keep ordering (the
-    // old check counted orders, so one diner's 5th round tripped it
-    // while five separate phones on a 2-seater did not). Staff are
-    // never blocked: they seat walk-ins at their own discretion.
-    const capacityCheck = await checkTableCapacity(t, tenantFilter(req), callerPartyKeys(req, scanSessionId));
-    if (!capacityCheck.ok) throw httpError(capacityCheck.status, capacityCheck.body);
+    // ── Table capacity enforcement (seat reservation, QA #13) ───
+    // A table seats `capacity` diner parties (summed across a merge
+    // group). The party's seat was normally reserved when it scanned
+    // the QR; claimSeat refreshes it here, or atomically claims a new
+    // one if it was released while the diner browsed (idle pruning).
+    // A full table → 409 TABLE_CAPACITY_REACHED. Concurrent first
+    // orders can't overshoot: the seat push is a single conditional
+    // update. A party that already has a live order keeps ordering.
+    // Staff are never blocked: they seat walk-ins at their discretion.
+    // `t` is already the merge leader (resolveLeaderTable).
+    const seat = await claimSeat({ table: t, tenantFilterObj: tenantFilter(req), keys: callerPartyKeys(req, scanSessionId) });
+    if (!seat.ok) throw httpError(seat.status, seat.body);
 
     if (t.branch) inheritedBranchId = t.branch;
     if (!validWaiterId && t.assignedWaiter) validWaiterId = t.assignedWaiter;
@@ -605,7 +681,7 @@ function buildOrderDocs(req, ctx) {
     authoritativeTip, authoritativeCouponCode, authoritativeCouponDiscount,
     authoritativePointsRedeemed, authoritativeWalletPaid, taxBreakdown, wantsDelivery,
     cleanDeliveryAddress, authoritativeDeliverySlab, authoritativeDeliveryFee,
-    authoritativeDeliveryDistance, authoritativeDeliveryCoords,
+    authoritativeDeliveryDistance, authoritativeDeliveryCoords, authoritativeManualDiscount = 0,
   } = ctx;
   // Kitchen-bypass + mixed-cart split.
   //
@@ -691,8 +767,14 @@ function buildOrderDocs(req, ctx) {
       // kitchen doc so the bill aggregation still matches the cart.
     };
 
+    // The discounts (coupon / points) live on the kitchen doc. When they
+    // exceed the kitchen share, the kitchen doc would go negative (and the
+    // Order validator would abort the whole create) — so the counter doc
+    // absorbs the remainder: both docs stay ≥ 0 and still sum to the bill.
+    const counterShare = Math.min(counterTotal, Math.max(0, Math.round(authoritativeTotal * 100) / 100));
+    counterDocData.total = counterShare;
     primaryItems = kitchenItems;
-    primaryTotal = Math.round((authoritativeTotal - counterTotal) * 100) / 100;
+    primaryTotal = Math.round((authoritativeTotal - counterShare) * 100) / 100;
     hasKitchenWork = true;
     initialStatus = 'new';
   }
@@ -746,6 +828,19 @@ function buildOrderDocs(req, ctx) {
     status: initialStatus,
     preparationCompletedAt: !hasKitchenWork ? new Date() : undefined,
   };
+  // Staff manual discount (resolveManualDiscount: ≤ the checkout total).
+  // It lives on the primary doc; on a mixed-cart split any part above the
+  // primary doc's total spills onto the counter doc so neither doc's
+  // amount due (total − manualDiscount − amountPaid) goes negative.
+  const md = Math.max(0, Number(authoritativeManualDiscount) || 0);
+  if (md > 0) {
+    const onPrimary = Math.min(md, Math.max(0, primaryTotal));
+    primaryDocData.manualDiscount = Math.round(onPrimary * 100) / 100;
+    const rest = Math.round((md - onPrimary) * 100) / 100;
+    if (rest > 0 && counterDocData) {
+      counterDocData.manualDiscount = Math.min(rest, Math.max(0, Number(counterDocData.total) || 0));
+    }
+  }
   return { primaryDocData, counterDocData, hasKitchenWork };
 }
 
@@ -755,7 +850,7 @@ function buildOrderDocs(req, ctx) {
 async function persistOrderDocs(req, ctx) {
   const {
     primaryDocData, counterDocData, validUserId, clientIdempotencyKey, authoritativeSubtotal,
-    authoritativePointsRedeemed, authoritativeCouponCode, authoritativeCouponDiscount,
+    authoritativePointsRedeemed, authoritativeCouponCode, authoritativeCouponDiscount, couponId,
   } = ctx;
   let counterSideOrder = null;
   // ── Atomic write (bug #14) ───────────────────────────────────────
@@ -815,7 +910,9 @@ async function persistOrderDocs(req, ctx) {
         const Coupon = require('../models/coupon');
         const coupon = await Coupon.findOneAndUpdate(
           {
-            code: authoritativeCouponCode,
+            // The exact doc resolveCartCoupon validated (codes are only
+            // unique per tenant + branch); code fallback for safety.
+            ...(couponId ? { _id: couponId } : { code: authoritativeCouponCode }),
             isActive: true,
             ...tenantFilter(req),
             $or: [
@@ -833,6 +930,20 @@ async function persistOrderDocs(req, ctx) {
             message: 'This coupon has reached its usage limit or is no longer active. Please remove it and try again.',
           };
           throw e;
+        }
+        // Per-customer limit, re-checked inside the transaction: two
+        // concurrent orders both write the coupon doc above, so one of
+        // them retries and sees the other's redemption row here.
+        if (validUserId && Number(coupon.usagePerUser) > 0) {
+          const used = await CouponRedemption.countDocuments({ coupon: coupon._id, user: validUserId }).session(session);
+          if (used >= coupon.usagePerUser) {
+            const e = new Error('Coupon per-user limit reached.');
+            e[TXN_CONFLICT] = {
+              code: 'COUPON_USER_LIMIT',
+              message: `You can only use this coupon ${coupon.usagePerUser} time${coupon.usagePerUser > 1 ? 's' : ''}.`,
+            };
+            throw e;
+          }
         }
         await CouponRedemption.create([{
           coupon: coupon._id,
@@ -880,6 +991,74 @@ async function persistOrderDocs(req, ctx) {
     session.endSession();
   }
   return { savedOrder, counterSideOrder };
+}
+
+// ── Phase: "pay first, then order" checkout (decision 4c) ───────────
+// Deferred takeaway / kiosk pay BEFORE the order exists and send the
+// checkout result as `razorpayPayment: { razorpay_order_id,
+// razorpay_payment_id, razorpay_signature }`. Verified here (signature +
+// gateway notes / tenant / payer / amount via utils/paymentChecks) so a
+// forged or foreign payment refuses the whole order — no order is
+// written. Returns null when the request carries no checkout.
+async function verifyPrepaidCheckout(req, { orderId, validUserId, authoritativeTotal, authoritativeWalletPaid }) {
+  const checkout = req.body ? req.body.razorpayPayment : undefined;
+  if (checkout === undefined || checkout === null) return null;
+  if (typeof checkout !== 'object' || Array.isArray(checkout)) {
+    throw httpError(400, { success: false, code: 'PAYMENT_DETAILS_INVALID', message: 'Payment details are invalid.' });
+  }
+  const { verifyCheckoutForNewOrder } = require('../controllers/razorpayController');
+  const _id = new mongoose.Types.ObjectId();
+  const result = await verifyCheckoutForNewOrder(req, {
+    checkout,
+    order: {
+      _id,
+      orderId,
+      restaurant: tenantId(req),
+      user: validUserId || null,
+      total: authoritativeTotal,
+      amountPaid: authoritativeWalletPaid || 0,
+    },
+  });
+  if (!result.ok) {
+    throw httpError(result.status, { success: false, code: result.code, message: result.message });
+  }
+  // A payment already recorded on another order can't buy this one.
+  const usedElsewhere = await Order.exists({
+    $or: [
+      { razorpayPaymentId: result.paymentId },
+      { razorpayOrderId: result.razorpayOrderId },
+      { razorpayOrderIds: result.razorpayOrderId },
+    ],
+  });
+  if (usedElsewhere) {
+    throw httpError(409, { success: false, code: 'PAYMENT_ALREADY_USED', message: 'This payment has already been used for another order.' });
+  }
+  return { ...result, _id };
+}
+
+// Claim the verified payment for the order-to-be (single-use ledger,
+// purpose 'order_payment', ref = the order _id) and stamp the ids on the
+// doc. verify-payment for the same order is then a claim replay. An
+// unconfirmed checkout (gateway down) is stamped but not claimed.
+async function claimPrepaidCheckout(req, prepaid, primaryDocData) {
+  if (!prepaid) return null;
+  primaryDocData._id = prepaid._id;
+  primaryDocData.razorpayOrderId = prepaid.razorpayOrderId;
+  primaryDocData.razorpayOrderIds = [prepaid.razorpayOrderId];
+  primaryDocData.razorpayPaymentId = prepaid.paymentId;
+  if (!prepaid.confirmed) return null;
+  const claim = await claimPayment(prepaid.paymentId, {
+    purpose: 'order_payment',
+    ref: String(prepaid._id),
+    razorpayOrderId: prepaid.razorpayOrderId,
+    restaurant: tenantId(req) || null,
+    user: primaryDocData.user || null,
+    amount: prepaid.amount,
+  });
+  if (!claim.claimed) {
+    throw httpError(409, { success: false, code: 'PAYMENT_ALREADY_USED', message: 'This payment has already been used.' });
+  }
+  return { paymentId: prepaid.paymentId, ref: String(prepaid._id) };
 }
 
 // ── Phase: mark the dine-in table occupied ──────────────────────────
@@ -940,6 +1119,9 @@ async function createOrder(req) {
   if (replay) return replay;
 
   const { resolvedSource, resolvedPickupLocation, wantsDelivery, cleanDeliveryAddress } = validateOrderShape(req);
+  // Shape / role gate for a staff discount up front (the ≤ total check
+  // runs once the authoritative bill is known, below).
+  resolveManualDiscount(req);
   const attribution = resolveAttribution(req);
   const { validUserId, validTableId } = attribution;
   const { cleanCustomerName, cleanPhone } = normaliseContactFields(req);
@@ -966,7 +1148,8 @@ async function createOrder(req) {
   // services/orderPricingService.js). The client total is only checked
   // against the server bill (TOTAL_TAMPERED / TOTAL_MISMATCH); the stored
   // total is the server bill (kiosk: the amount it already charged).
-  const authoritativeSubtotal = pricing.priceCartItems(items, menuById, req.branch?._id || null);
+  const pricingBranchId = await resolvePricingBranch(req, type, resolvedTableId);
+  const authoritativeSubtotal = pricing.priceCartItems(items, menuById, pricingBranchId);
 
   // Fetch tenant settings once — needed for the loyalty-points rupee
   // conversion below and reused for the notification gate further down.
@@ -976,13 +1159,15 @@ async function createOrder(req) {
   const {
     authoritativeDeliveryFee, authoritativeDeliverySlab, authoritativeDeliveryDistance, authoritativeDeliveryCoords,
   } = await pricing.resolveDeliveryFee(req, { wantsDelivery, deliveryReq, branchId, cleanDeliveryAddress, settings, authoritativeSubtotal });
-  const { authoritativeCouponCode, authoritativeCouponDiscount } = await pricing.resolveCartCoupon(req, { items, menuById, authoritativeSubtotal });
+  const { authoritativeCouponCode, authoritativeCouponDiscount, couponId } = await pricing.resolveCartCoupon(req, {
+    items, menuById, authoritativeSubtotal, branchId: pricingBranchId,
+  });
   const { authoritativePointsRedeemed, authoritativePointsValue } = await pricing.resolvePointsRedemption(req, {
     validUserId, settings, authoritativeSubtotal, authoritativeCouponDiscount,
   });
   // ── Tip (clamped, not discount-protected) ───────────────────────
   const authoritativeTip = Math.max(0, Number(req.body.tipAmount) || 0);
-  const authoritativeWalletPaid = await pricing.resolveWalletPayment(req, { validUserId });
+  const requestedWalletPaid = await pricing.resolveWalletPayment(req, { validUserId });
   const { serverMinTotal, authoritativeTotal: clientBoundTotal, clientTotal } = pricing.checkClientTotal({
     total, authoritativeSubtotal, authoritativeCouponDiscount, authoritativePointsValue, authoritativeTip, authoritativeDeliveryFee,
   });
@@ -990,6 +1175,25 @@ async function createOrder(req) {
     type, deliveryReq, resolvedSource, authoritativeSubtotal, authoritativeTotal: clientBoundTotal,
     authoritativeCouponDiscount, authoritativePointsValue, authoritativeTip, authoritativeDeliveryFee, serverMinTotal,
     clientTotal,
+  });
+
+  // The wallet rupee portion of a split payment can never exceed the
+  // bill (models/order.js: amountPaid = capturedRzp + walletAmountPaid).
+  // Within the ₹1 client rounding window it is clamped to the total;
+  // anything larger is refused.
+  if (requestedWalletPaid > authoritativeTotal + 1) {
+    throw httpError(400, {
+      success: false,
+      code: 'WALLET_EXCEEDS_TOTAL',
+      message: `Wallet payment of ₹${requestedWalletPaid.toFixed(2)} is more than the order total of ₹${Number(authoritativeTotal).toFixed(2)}.`,
+    });
+  }
+  const authoritativeWalletPaid = Math.min(requestedWalletPaid, authoritativeTotal);
+  const authoritativeManualDiscount = resolveManualDiscount(req, authoritativeTotal);
+
+  // Decision 4c — verify a "pay first" checkout before anything is written.
+  const prepaid = await verifyPrepaidCheckout(req, {
+    orderId, validUserId, authoritativeTotal, authoritativeWalletPaid,
   });
 
   const enrichedItems = pricing.enrichCartItems(items, menuById);
@@ -1007,14 +1211,33 @@ async function createOrder(req) {
     authoritativeTip, authoritativeCouponCode, authoritativeCouponDiscount,
     authoritativePointsRedeemed, authoritativeWalletPaid, taxBreakdown, wantsDelivery,
     cleanDeliveryAddress, authoritativeDeliverySlab, authoritativeDeliveryFee,
-    authoritativeDeliveryDistance, authoritativeDeliveryCoords,
+    authoritativeDeliveryDistance, authoritativeDeliveryCoords, authoritativeManualDiscount,
   });
 
-  const persisted = await persistOrderDocs(req, {
-    primaryDocData, counterDocData, validUserId, clientIdempotencyKey, authoritativeSubtotal,
-    authoritativePointsRedeemed, authoritativeCouponCode, authoritativeCouponDiscount,
-  });
-  if (persisted.replay) return persisted.replay;
+  const prepaidClaim = await claimPrepaidCheckout(req, prepaid, primaryDocData);
+  // Link a mixed-cart split: the counter doc points at the primary doc so
+  // an online payment of the whole checkout settles both
+  // (razorpayController.settleSplitSiblings). The primary _id is fixed
+  // here (a pay-first checkout already pinned it in claimPrepaidCheckout).
+  if (counterDocData) {
+    if (!primaryDocData._id) primaryDocData._id = new mongoose.Types.ObjectId();
+    counterDocData.splitParent = primaryDocData._id;
+  }
+  let persisted;
+  try {
+    persisted = await persistOrderDocs(req, {
+      primaryDocData, counterDocData, validUserId, clientIdempotencyKey, authoritativeSubtotal,
+      authoritativePointsRedeemed, authoritativeCouponCode, authoritativeCouponDiscount, couponId,
+    });
+  } catch (err) {
+    // Nothing was written — free the payment for a retry / orphan refund.
+    if (prepaidClaim) await releaseClaim(prepaidClaim.paymentId, { purpose: 'order_payment', ref: prepaidClaim.ref });
+    throw err;
+  }
+  if (persisted.replay) {
+    if (prepaidClaim) await releaseClaim(prepaidClaim.paymentId, { purpose: 'order_payment', ref: prepaidClaim.ref });
+    return persisted.replay;
+  }
   const { savedOrder, counterSideOrder } = persisted;
 
   bumpMenuItemOrderCounts(savedOrder.items, savedOrder.restaurant);
@@ -1089,5 +1312,6 @@ module.exports = {
   normaliseContactFields,
   verifyDineInScan,
   buildOrderDocs,
+  resolveManualDiscount,
   VALID_ORDER_SOURCES,
 };

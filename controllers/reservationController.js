@@ -81,6 +81,9 @@ const createReservation = async (req, res) => {
             table: selectedTable,
             notes,
             restaurant: tenantId(req),
+            // Branch of the reserved table, so branch-pinned staff (whose
+            // list is filtered by strictBranchFilter) see it.
+            branch: table.branch || null,
         });
 
         const savedReservation = await newReservation.save();
@@ -160,7 +163,7 @@ const expireStaleReservations = async (req) => {
     if (tableIds.length) {
         await Table.updateMany(
             { _id: { $in: tableIds }, status: 'reserved', ...tf },
-            { $set: { status: 'free' } }
+            { $set: { status: 'free', seats: [] } }
         );
     }
 
@@ -203,6 +206,26 @@ const getReservations = async (req, res) => {
 };
 
 
+// Release the table (and its merge group) a reservation was holding —
+// only tables still 'reserved' are touched; an occupied / free table is
+// left alone. Seat reservations are reset with it (QA #13).
+const releaseReservedTable = async (reservation, tf) => {
+    const table = await Table.findOne({ _id: reservation.table, ...tf });
+    if (table && table.status === 'reserved') {
+        table.status = 'free';
+        await table.save();
+        await Table.updateOne({ _id: table._id, ...tf }, { $set: { seats: [] } });
+
+        // Also free merged tables that were set to 'reserved' when the reservation was created
+        if (table.mergedWith?.length > 0) {
+            await Table.updateMany(
+                { _id: { $in: table.mergedWith }, status: 'reserved', ...tf },
+                { $set: { status: 'free', seats: [] } }
+            );
+        }
+    }
+};
+
 // Cancel a reservation
 const cancelReservation = async (req, res) => {
     try {
@@ -218,19 +241,7 @@ const cancelReservation = async (req, res) => {
         await reservation.save();
 
         // Free the table and any merged tables in the group (scoped)
-        const table = await Table.findOne({ _id: reservation.table, ...tf });
-        if (table && table.status === 'reserved') {
-            table.status = 'free';
-            await table.save();
-
-            // Also free merged tables that were set to 'reserved' when the reservation was created
-            if (table.mergedWith?.length > 0) {
-                await Table.updateMany(
-                    { _id: { $in: table.mergedWith }, status: 'reserved', ...tf },
-                    { $set: { status: 'free' } }
-                );
-            }
-        }
+        await releaseReservedTable(reservation, tf);
 
         res.status(200).json({ success: true, message: 'Reservation cancelled successfully', reservation });
     } catch (error) {
@@ -244,13 +255,22 @@ const updateReservationStatus = async (req, res) => {
         const { id } = req.params;
         const { status } = req.body;
 
-        const reservation = await Reservation.findOne({ _id: id, ...tenantFilter(req) });
+        const tf = tenantFilter(req);
+        const reservation = await Reservation.findOne({ _id: id, ...tf });
         if (!reservation) {
             return res.status(404).json({ success: false, message: 'Reservation not found' });
         }
 
         reservation.status = status;
         await reservation.save();
+
+        // A reservation that is over (Cancelled / Completed) no longer holds
+        // its table — same release as cancelReservation. The stale sweep
+        // only frees tables of Pending / Approved reservations, so without
+        // this the table stayed 'reserved' forever.
+        if (['Cancelled', 'Completed'].includes(status)) {
+            await releaseReservedTable(reservation, tf);
+        }
 
         res.status(200).json({ success: true, message: 'Status updated', reservation });
     } catch (error) {
@@ -268,7 +288,8 @@ const applyLateDeduction = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Deduction amount must be positive' });
         }
 
-        const reservation = await Reservation.findOne({ _id: id, ...tenantFilter(req) });
+        const tf = tenantFilter(req);
+        const reservation = await Reservation.findOne({ _id: id, ...tf });
         if (!reservation) {
             return res.status(404).json({ success: false, message: 'Reservation not found' });
         }
@@ -284,23 +305,34 @@ const applyLateDeduction = async (req, res) => {
         const advance = reservation.payment?.advancePaid || 0;
         const actualDeduction = Math.min(deductionAmount, advance);
 
-        reservation.lateArrival = {
-            isLate: true,
-            deductionAmount: actualDeduction,
-            deductedAt: new Date()
+        const set = {
+            lateArrival: {
+                isLate: true,
+                deductionAmount: actualDeduction,
+                deductedAt: new Date()
+            },
         };
-
         if (reservation.payment) {
-            reservation.payment.advancePaid = Math.max(0, advance - actualDeduction);
-            reservation.payment.balance = (reservation.payment.total || 0) - reservation.payment.advancePaid;
+            const advanceAfter = Math.max(0, advance - actualDeduction);
+            set['payment.advancePaid'] = advanceAfter;
+            set['payment.balance'] = (reservation.payment.total || 0) - advanceAfter;
         }
 
-        await reservation.save();
+        // Conditional write: only a reservation with no deduction yet is
+        // updated, so two concurrent calls cannot both take a bite.
+        const updated = await Reservation.findOneAndUpdate(
+            { _id: reservation._id, 'lateArrival.deductedAt': null, ...tf },
+            { $set: set },
+            { returnDocument: 'after' }
+        );
+        if (!updated) {
+            return res.status(400).json({ success: false, message: 'Deduction already applied to this reservation' });
+        }
 
         res.status(200).json({
             success: true,
             message: `₹${actualDeduction.toFixed(2)} deducted from advance payment`,
-            reservation
+            reservation: updated
         });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Failed to apply deduction', ...devError(error) });

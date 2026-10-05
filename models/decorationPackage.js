@@ -73,10 +73,10 @@ const decorationPackageSchema = new mongoose.Schema({
     numberOfCaretakers: Number,
 
     // Pricing
-    basePrice: { type: Number, required: true },
-    dismantlingCharges: { type: Number, default: 0 },
-    setupCharges: { type: Number, default: 0 },
-    transportCharges: { type: Number, default: 0 },
+    basePrice: { type: Number, required: true, min: [0, 'Base price cannot be negative'] },
+    dismantlingCharges: { type: Number, default: 0, min: [0, 'Dismantling charges cannot be negative'] },
+    setupCharges: { type: Number, default: 0, min: [0, 'Setup charges cannot be negative'] },
+    transportCharges: { type: Number, default: 0, min: [0, 'Transport charges cannot be negative'] },
     isCustomizable: { type: Boolean, default: false },
 
     // Add-ons & Restrictions

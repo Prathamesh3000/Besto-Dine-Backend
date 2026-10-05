@@ -12,8 +12,8 @@ const { protect, adminOnly, checkPermission } = require('../middlewares/authMidd
 const { validate, body, objectIdParam, optionalObjectId } = require('../middlewares/validate');
 
 // ── Request validation (BUGS_REPORT #33) ────────────────────────────────
-// AddCategoryModal sends { name, displayOrder, image:url|null, showOnKiosk }
-// on create, { name, image, showOnKiosk } or { status } on update. Name
+// AddCategoryModal sends { name, displayOrder, image:url|null, showOnKiosk, kind }
+// on create, { name, image, showOnKiosk, kind } or { status } on update. Name
 // required-ness stays with the schema (controller returns its 400).
 const categoryIdParam = objectIdParam('id', 'Invalid category id');
 const categoryBodyRules = [
@@ -25,6 +25,8 @@ const categoryBodyRules = [
         .isLength({ max: 4096 }).withMessage('Image URL is too long'),
     body('status').optional().isIn(['active', 'inactive']).withMessage('Invalid status'),
     body('showOnKiosk').optional({ values: 'null' }).isBoolean().withMessage('showOnKiosk must be true or false'),
+    // Decision 6 — Food / Drink per category; values match Coupon.scope.
+    body('kind').optional().isIn(['food', 'beverages']).withMessage('Category type must be food or beverages'),
     optionalObjectId('body', 'branch', 'Invalid branch id'),
 ];
 

@@ -70,7 +70,8 @@ exports.updateDecorationPackage = async (req, res) => {
         const decorPackage = await DecorationPackage.findOneAndUpdate(
             { _id: req.params.id, ...tenantFilter(req), ...strictBranchFilter(req) },
             updateData,
-            { returnDocument: 'after' }
+            // runValidators: the schema refuses negative prices.
+            { returnDocument: 'after', runValidators: true }
         );
         if (!decorPackage) {
             return res.status(404).json({ success: false, message: 'Package not found' });

@@ -387,21 +387,38 @@ exports.addStaff = async (req, res) => {
       return res.status(403).json(ROLE_ADMIN_ONLY_BODY);
     }
 
+    // Permissions are Admin-only — same rule as updateStaff. A Manager
+    // may submit the role defaults unchanged (the modal always echoes an
+    // object) but cannot hire someone with keys beyond them.
+    const permsSupplied = req.body.permissions;
+    if (req.user?.role !== 'admin' && permsSupplied !== undefined && permsSupplied !== null
+        && permissionsChanged(resolvePermissions(role, undefined), resolvePermissions(role, permsSupplied))) {
+      return res.status(403).json({
+        success: false,
+        code: 'PERMISSIONS_ADMIN_ONLY',
+        message: 'Only an Admin can change staff permissions.',
+      });
+    }
+
     // ── Phase A2: enforce plan's maxStaff limit ──────────────────────
-    const activeStaffCount = await User.countDocuments({
+    // Fast pre-check for a friendly early 403; the authoritative check is
+    // re-run inside the insert transaction below (race-safe).
+    const maxStaff = req.restaurant?.getLimit?.('maxStaff') || 5;
+    const limitBody = (current) => ({
+      success: false,
+      code: 'STAFF_LIMIT_REACHED',
+      message: `Your plan allows ${maxStaff} staff members. You currently have ${current} active. Upgrade your plan to add more.`,
+      current,
+      limit: maxStaff,
+    });
+    const countActiveStaff = (session) => User.countDocuments({
       ...tenantFilter(req),
       role: { $in: ['admin', 'manager', 'waiter', 'captain', 'chef'] },
       status: 'active',
-    });
-    const maxStaff = req.restaurant?.getLimit?.('maxStaff') || 5;
+    }).session(session || null);
+    const activeStaffCount = await countActiveStaff();
     if (activeStaffCount >= maxStaff) {
-      return res.status(403).json({
-        success: false,
-        code: 'STAFF_LIMIT_REACHED',
-        message: `Your plan allows ${maxStaff} staff members. You currently have ${activeStaffCount} active. Upgrade your plan to add more.`,
-        current: activeStaffCount,
-        limit: maxStaff,
-      });
+      return res.status(403).json(limitBody(activeStaffCount));
     }
 
     // Phase 6 step 4 — branch assignment.
@@ -496,7 +513,7 @@ exports.addStaff = async (req, res) => {
       finalStaffId = await getNextStaffIdForBranch(tf, assignedBranchId);
     }
 
-    const staffMember = new User({
+    const staffFields = {
       name: name.trim(),
       email: email.trim(),     // schema handles lowercase
       password: tempPassword,           // hashed by pre-save hook
@@ -514,12 +531,41 @@ exports.addStaff = async (req, res) => {
       // Apply role defaults when the caller omits permissions (seed
       // scripts, direct API clients). The modal always sends an
       // explicit object so its "Reset to None" affordance still works.
-      permissions: resolvePermissions(role, req.body.permissions),
+      // Non-admins were held to the role defaults above.
+      permissions: req.user?.role === 'admin' ? resolvePermissions(role, req.body.permissions) : resolvePermissions(role, undefined),
       status: 'active',
       mustChangePassword: true          // force password change on first login
-    });
+    };
 
-    await staffMember.save();
+    // Race-safe maxStaff: re-count and insert inside one transaction that
+    // also writes a per-tenant lock row. Concurrent hires (even into
+    // different branches, where the staffId index doesn't collide) hit a
+    // WriteConflict on the lock row; the driver retries the loser, whose
+    // fresh count now sees the winner and is refused.
+    let staffMember;
+    let limitHit = null;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        limitHit = null;
+        const current = await countActiveStaff(session);
+        if (current >= maxStaff) { limitHit = current; return; }
+        await mongoose.connection.collection('staff_limit_locks').updateOne(
+          { _id: tenantId(req) },
+          { $inc: { seq: 1 } },
+          { upsert: true, session },
+        );
+        // Fresh document per attempt so a retried transaction never
+        // re-hashes an already hashed password.
+        staffMember = new User(staffFields);
+        await staffMember.save({ session });
+      });
+    } finally {
+      await session.endSession();
+    }
+    if (limitHit !== null) {
+      return res.status(403).json(limitBody(limitHit));
+    }
 
     // Return the plain-text temp password so the admin can share it with
     // the staff member.  This is the ONLY time it is ever available — the
@@ -600,6 +646,26 @@ exports.updateStaffStatus = async (req, res) => {
     // the cross-branch case.
     const target = await User.findOne({ _id: id, ...tenantFilter(req) });
     if (!target) return res.status(404).json({ success: false, message: 'Staff member not found' });
+
+    // Same safety rails as deleteStaff: nobody deactivates their own
+    // account (it revokes every session) and the tenant owner — the only
+    // account that manages billing / branches — can't be deactivated here.
+    if (status === 'inactive') {
+      if (req.user && String(target._id) === String(req.user._id || req.user.id)) {
+        return res.status(400).json({
+          success: false,
+          code: 'CANNOT_DEACTIVATE_SELF',
+          message: 'You cannot deactivate your own account.',
+        });
+      }
+      if (target.isTenantOwner === true) {
+        return res.status(403).json({
+          success: false,
+          code: 'CANNOT_DEACTIVATE_OWNER',
+          message: 'The restaurant owner account cannot be deactivated.',
+        });
+      }
+    }
 
     const gate = staffBranchGate(req, target);
     if (gate) return res.status(gate.status).json(gate.body);
@@ -961,6 +1027,11 @@ exports.getStaffPerformance = async (req, res) => {
     const tf = tenantFilter(req);
     const staff = await User.findOne({ _id: id, ...tf }).select('-password');
     if (!staff) return res.status(404).json({ success: false, message: 'Staff member not found' });
+
+    // Branch isolation — a pinned caller only sees their own branch's
+    // staff metrics (same gate as update / status / delete / reset).
+    const gate = staffBranchGate(req, staff);
+    if (gate) return res.status(gate.status).json(gate.body);
 
     const role = staff.role;
     const now = new Date();
@@ -1359,8 +1430,10 @@ exports.importStaffCsv = async (req, res) => {
         if (!canManageStaffRole(req.user?.role, roleRaw)) {
           throw new Error('Only an Admin can import Manager accounts');
         }
-        if (mobileRaw && !/^\d{10}$/.test(mobileRaw)) {
-          throw new Error('mobile must be exactly 10 digits');
+        // Same rule as the User schema / addStaff (10 digits, starts 6-9)
+        // so a row can't pass here and then be dropped by insertMany.
+        if (mobileRaw && !/^[6-9]\d{9}$/.test(mobileRaw)) {
+          throw new Error('mobile must be a valid 10-digit number starting with 6-9');
         }
 
         // Branch assignment is now batch-wide (targetBranchId resolved
@@ -1402,6 +1475,24 @@ exports.importStaffCsv = async (req, res) => {
       } catch (err) {
         errors.push({ row: rowNum, message: err.message });
       }
+    }
+
+    // ── Global identity conflicts (customer / superadmin emails) ───────
+    // Same rule as addStaff / validateStaffEmail: those identities are
+    // platform-wide, a staff row must not share their email.
+    if (prospects.length > 0) {
+      // AUDIT-EXEMPT: platform-wide email uniqueness vs global customer/superadmin identities (User is not tenant-scoped)
+      const globalTaken = new Set((await User.find({
+        email: { $in: prospects.map(p => p.email.toLowerCase()) },
+        role: { $in: ['customer', 'superadmin'] },
+      }).select('email').lean()).map(u => String(u.email).toLowerCase()));
+      for (let i = prospects.length - 1; i >= 0; i--) {
+        if (globalTaken.has(prospects[i].email.toLowerCase())) {
+          errors.push({ row: prospects[i].rowNum, message: 'This email is already registered to a customer or platform account.' });
+          prospects.splice(i, 1);
+        }
+      }
+      errors.sort((a, b) => a.row - b.row);
     }
 
     // ── Plan limit gate ──────────────────────────────────────────────
@@ -1466,6 +1557,8 @@ exports.importStaffCsv = async (req, res) => {
       const hashed = await bcrypt.hash(tempPassword, 12);
       tempPasswords.push({ email: p.email, name: p.name, tempPassword });
       return {
+        // Pre-assigned so we can tell afterwards exactly which rows landed.
+        _id: new mongoose.Types.ObjectId(),
         name: p.name,
         email: p.email.toLowerCase(),      // schema lowercases via setter, but be explicit
         password: hashed,
@@ -1532,13 +1625,20 @@ exports.importStaffCsv = async (req, res) => {
     }
 
     // Only return tempPasswords for staff that ACTUALLY got created.
-    const insertedEmails = new Set();
-    // Best-effort: if mongoose returned the inserted docs we know exactly
-    // which ones landed; otherwise assume any prospect not in `writeErrors`
-    // was inserted (insertedCount matches).
+    // insertMany(ordered:false) silently drops docs that fail schema
+    // validation (they are not in writeErrors), so ask the DB which of
+    // our pre-assigned ids landed instead of inferring from writeErrors.
+    const landed = new Set((await User.find({ _id: { $in: docs.map(d => d._id) } }).select('_id').lean())
+      .map(u => String(u._id)));
+    created = landed.size;
     const failedIndices = new Set(writeErrors.map(we => we.index ?? we.err?.index).filter(n => typeof n === 'number'));
+    const insertedEmails = new Set();
     docs.forEach((d, i) => {
-      if (!failedIndices.has(i)) insertedEmails.add(d.email);
+      if (landed.has(String(d._id))) {
+        insertedEmails.add(d.email);
+      } else if (!failedIndices.has(i)) {
+        errors.push({ row: prospects[i]?.rowNum ?? '—', message: 'row failed validation and was not created' });
+      }
     });
     const visibleTempPasswords = tempPasswords.filter(tp => insertedEmails.has(tp.email.toLowerCase()));
 

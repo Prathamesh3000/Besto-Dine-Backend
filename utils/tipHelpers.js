@@ -26,7 +26,9 @@ const logger = require('./logger');
 
 /**
  * Create a Tip record for an order that was just paid.
- * Idempotent — re-running is a no-op thanks to the find-first guard.
+ * Idempotent — re-running is a no-op thanks to the find-first guard plus
+ * the unique { order, restaurant } index on Tip (concurrent inserts lose
+ * with E11000 and fall back to the winner's row).
  *
  * @param {Object} order              Mongoose Order document (already saved)
  * @param {String|ObjectId} restaurantId  Tenant id to stamp on the Tip
@@ -41,41 +43,47 @@ async function createTipForPaidOrder(order, restaurantId) {
     try {
         // Tenant-scoped lookup so a hypothetical cross-tenant order id
         // collision can't return someone else's tip.
-        const existing = await Tip.findOne({ order: order._id, restaurant: restaurantId });
-        if (existing) {
-            let dirty = false;
-            // If a previous flow revoked this tip but the order was
-            // re-paid (rare — manual admin action), revive it.
-            if (existing.status === 'refunded') {
-                existing.status = 'pending';
-                existing.amount = order.tipAmount;   // re-sync in case amount changed
-                existing.settlement = undefined;
-                dirty = true;
+        let existing = await Tip.findOne({ order: order._id, restaurant: restaurantId });
+        if (!existing) {
+            try {
+                const tip = await new Tip({
+                    restaurant: restaurantId,
+                    waiter: order.waiter,
+                    order: order._id,
+                    amount: order.tipAmount,
+                    status: 'pending',
+                }).save();
+                logger.info(`Tip created ₹${order.tipAmount} for waiter ${order.waiter} on order ${order.orderId}`);
+                return tip;
+            } catch (err) {
+                // Unique { order, restaurant } index: a concurrent caller
+                // inserted first — fall through and treat theirs as existing.
+                if (err?.code !== 11000) throw err;
+                existing = await Tip.findOne({ order: order._id, restaurant: restaurantId });
+                if (!existing) throw err;
             }
-            // Re-attribute when order.waiter has changed since this Tip
-            // was first created — e.g. a captain picked up the order
-            // after it was already paid, so pickupOrder re-stamped the
-            // waiter field. Only pending tips are touched; settled tips
-            // have been paid out and reversing them needs a manual
-            // admin decision.
-            if (existing.status === 'pending' && String(existing.waiter) !== String(order.waiter)) {
-                existing.waiter = order.waiter;
-                dirty = true;
-            }
-            if (dirty) await existing.save();
-            return existing;
         }
-
-        const tip = await new Tip({
-            restaurant: restaurantId,
-            waiter: order.waiter,
-            order: order._id,
-            amount: order.tipAmount,
-            status: 'pending',
-        }).save();
-
-        logger.info(`Tip created ₹${order.tipAmount} for waiter ${order.waiter} on order ${order.orderId}`);
-        return tip;
+        let dirty = false;
+        // If a previous flow revoked this tip but the order was
+        // re-paid (rare — manual admin action), revive it.
+        if (existing.status === 'refunded') {
+            existing.status = 'pending';
+            existing.amount = order.tipAmount;   // re-sync in case amount changed
+            existing.settlement = undefined;
+            dirty = true;
+        }
+        // Re-attribute when order.waiter has changed since this Tip
+        // was first created — e.g. a captain picked up the order
+        // after it was already paid, so pickupOrder re-stamped the
+        // waiter field. Only pending tips are touched; settled tips
+        // have been paid out and reversing them needs a manual
+        // admin decision.
+        if (existing.status === 'pending' && String(existing.waiter) !== String(order.waiter)) {
+            existing.waiter = order.waiter;
+            dirty = true;
+        }
+        if (dirty) await existing.save();
+        return existing;
     } catch (err) {
         // Tip creation must never block the payment itself.
         logger.warn(`createTipForPaidOrder failed for ${order.orderId}: ${err.message}`);

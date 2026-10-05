@@ -15,10 +15,11 @@ const { getSettings } = require('../utils/settingsCache');
 const { getIO, emitToWaiter } = require('../utils/socket');
 const { verifyUserToken, loadUserForToken } = require('../middlewares/authMiddleware');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
-const { freeTableOrUnmergeGroup } = require('../utils/tableMerge');
+const { releaseTableAfterOrderClosed } = require('../utils/tableOccupancy');
 const { createTipForPaidOrder } = require('../utils/tipHelpers');
 const {
   VALID_TRANSITIONS,
+  canTransition,
   CANCEL_REQUIRES_REASON,
   CANCEL_PRIVILEGED_ROLES,
   CANCEL_PRIVILEGED_STATES,
@@ -129,25 +130,39 @@ function applyPaymentFields(oldOrder, body, updateData) {
     updateData.paidAt = new Date();
   }
 
-  // Reconcile order.total with amountPaid at settlement time.
+  // Marking Paid NEVER rewrites order.total.
   //
-  // order.total is persisted once at creation; tip additions, coupon
-  // changes, tax-rate edits, and additional-charge config changes
-  // happen afterwards and are folded into the waiter's Pay-Bill
-  // amount on the client. Without this reconcile, amountPaid ends
-  // up strictly greater than order.total and the Order Details
-  // modal shows an inconsistent "Total ₹X / Amount Paid ₹Y" pair
-  // where Y ≠ X. Only applied when the caller is actually settling
-  // the bill (paymentStatus === 'Paid' with a positive numeric
-  // amountPaid) — never touched for pending payments, partial
-  // payments, or refunds.
-  if (
-    paymentStatus === 'Paid' &&
-    typeof amountPaid === 'number' &&
-    Number.isFinite(amountPaid) &&
-    amountPaid > 0
-  ) {
-    updateData.total = Math.round(amountPaid * 100) / 100;
+  // It used to (`total = amountPaid`), which let any settle screen
+  // silently re-price the bill — a typo'd or discounted cash amount
+  // became the order's total, and the stamped GST / charges no longer
+  // added up to it. The bill is now fixed by the order; settlement only
+  // records what was collected:
+  //   • amountPaid below what is due (total − manualDiscount − already
+  //     paid, ₹1 rounding tolerance) → 400 AMOUNT_TOO_LOW. A deliberate
+  //     reduction must go through the Discount option (manualDiscount),
+  //     which is recorded on the order.
+  //   • amountPaid at or above due → recorded as paid; any overpayment
+  //     or tip is carried by amountPaid / tipAmount as before.
+  if (paymentStatus === 'Paid' && amountPaid !== undefined && amountPaid !== null && amountPaid !== '') {
+    const paid = Number(amountPaid);
+    const effectiveManualDiscount = updateData.manualDiscount !== undefined
+      ? updateData.manualDiscount
+      : Math.max(0, Number(oldOrder.manualDiscount) || 0);
+    const alreadyPaid = Math.max(0, Number(oldOrder.amountPaid) || 0);
+    const due = Math.round(Math.max(0,
+      (Number(oldOrder.total) || 0) - effectiveManualDiscount - alreadyPaid) * 100) / 100;
+    if (!Number.isFinite(paid) || paid < 0) {
+      throw httpError(400, { success: false, code: 'INVALID_AMOUNT', message: 'Amount paid must be a non-negative number.' });
+    }
+    if (paid < due - 1) {
+      throw httpError(400, {
+        success: false,
+        code: 'AMOUNT_TOO_LOW',
+        message: `Amount paid ₹${paid.toFixed(2)} is less than the amount due ₹${due.toFixed(2)}. `
+          + 'Marking an order Paid cannot reduce the bill — use the Discount option to give a discount, then settle.',
+        amountDue: due,
+      });
+    }
   }
 
   // Bill-paid auto-close for dine-in.
@@ -162,14 +177,21 @@ function applyPaymentFields(oldOrder, body, updateData) {
   // 'served' so the terminal-state table release runs in the same
   // update. Idempotent: if the order is already 'served' or
   // 'cancelled', we leave the status alone (payment still updates).
+  //
+  // Only when the state machine allows → served: a 'new' order (paid
+  // up-front) must still go through the kitchen — it stays on the KDS
+  // and the table is released once it is actually served.
   if (
     paymentStatus === 'Paid' &&
     oldOrder.type === 'dine-in' &&
     !updateData.status &&
     oldOrder.status !== 'served' &&
-    oldOrder.status !== 'cancelled'
+    canTransition(oldOrder.status, 'served')
   ) {
     updateData.status = 'served';
+    // The auto-promotion never passes through applyKitchenStamps' body
+    // status, so stamp servedAt here (first entry only).
+    if (!oldOrder.servedAt) updateData.servedAt = new Date();
   }
 }
 
@@ -230,9 +252,21 @@ async function commitStatusUpdate(oldOrder, updateData, tf) {
   // concurrent status change from the kitchen doesn't fail the payment.
   const atomicFilter = { _id: oldOrder._id, ...tf };
   if (updateData.status) atomicFilter.status = oldOrder.status;
+  // The not-Paid → Paid transition is pinned too, so of two concurrent
+  // mark-paid taps only one commits it (and runs the ledger / tip /
+  // notification side effects); the other gets a 409.
+  const claimsPaid = updateData.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
+  if (claimsPaid) atomicFilter.paymentStatus = { $ne: 'Paid' };
 
   const order = await Order.findOneAndUpdate(atomicFilter, updateData, { returnDocument: 'after' });
   if (!order) {
+    if (claimsPaid && !updateData.status) {
+      throw httpError(409, {
+        success: false,
+        code: 'ALREADY_PAID',
+        message: 'This order was already marked paid. Please refresh.',
+      });
+    }
     throw httpError(409, {
       success: false,
       code: 'INVALID_TRANSITION',
@@ -290,7 +324,13 @@ async function settleSiblingDineInRounds(paymentStatus, oldOrder, order, tf) {
         sib.paymentMethod = order.paymentMethod || 'cash';
         sib.amountPaid = 0; // covered by the settled round's amount
         if (!sib.paidAt) sib.paidAt = new Date();
-        if (sib.status !== 'served' && sib.status !== 'cancelled') sib.status = 'served';
+        // Same rule as the settled round: a round still 'new' stays in
+        // the kitchen; only rounds the state machine lets reach 'served'
+        // are closed.
+        if (sib.status !== 'served' && canTransition(sib.status, 'served')) {
+          sib.status = 'served';
+          if (!sib.servedAt) sib.servedAt = new Date();
+        }
         await sib.save();
       }
     } catch (err) {
@@ -379,13 +419,14 @@ async function releaseTableIfDone(order, tf) {
   const reachedTerminal = nowCancelled || nowServedPaid;
   if (order.table && reachedTerminal) {
     try {
-      // freeTableOrUnmergeGroup returns all table IDs it just freed:
+      // releaseTableAfterOrderClosed returns all table IDs it just freed:
       //   • single table → [order.table]
       //   • merged group → every sibling (leader + mergedWith)
+      //   • another open order still on the table → [] (table stays
+      //     occupied; activeOrder repointed to the remaining order)
       // Emitting a table:updated for each keeps the dashboard and
       // waiter grid in sync without a full refetch.
-      const { freedIds } = await freeTableOrUnmergeGroup(order.table, tf);
-      const ids = freedIds.length ? freedIds : [order.table];
+      const { freedIds: ids } = await releaseTableAfterOrderClosed(order, tf);
       for (const id of ids) {
         emitStaffTable('table:updated', { tableId: id, status: 'free' }, order.branch);
       }
@@ -462,15 +503,20 @@ async function updateOrderStatus(req) {
   await releaseTableIfDone(order, tf);
   await notifyStatusTransition({ status, oldOrder, order });
 
-  // Side Effect: Record transaction if status changes to 'Paid' and wasn't before
-  if (order.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid' && order.user) {
-    const settings = await recordPaidOrderLedger(req, order, tf);
+  const justPaid = order.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
 
-    // Side Effect: Record Tip if tipAmount > 0 and status is Paid.
-    // Delegated to the shared helper so every payment entry point
-    // (this PATCH, razorpay verifyPayment, razorpay webhook) produces
-    // the same Tip record.
+  // Side Effect: Record Tip if tipAmount > 0 and status is Paid.
+  // Delegated to the shared helper so every payment entry point
+  // (this PATCH, razorpay verifyPayment, razorpay webhook) produces
+  // the same Tip record. Runs for walk-in orders (no customer) too —
+  // the waiter earned the tip either way.
+  if (justPaid) {
     await createTipForPaidOrder(order, tenantId(req));
+  }
+
+  // Side Effect: Record transaction if status changes to 'Paid' and wasn't before
+  if (justPaid && order.user) {
+    const settings = await recordPaidOrderLedger(req, order, tf, oldOrder);
 
     // Socket.io — notify dashboards + the owning customer of status change.
     // Scoped emit (staff rooms + order owner + per-order guest room) replaces
@@ -570,7 +616,7 @@ async function pickupOrder(req) {
   // then show the table free with no way to collect payment).
   const settled = order.paymentStatus === 'Paid';
   if (order.table && settled) {
-    try { await freeTableOrUnmergeGroup(order.table, tf); }
+    try { await releaseTableAfterOrderClosed(order, tf); }
     catch (err) { logger.warn('Failed to free table on pickup:', err.message); }
   }
 

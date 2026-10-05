@@ -196,14 +196,18 @@ const menuItemSchema = new mongoose.Schema({
 
 // Calculate final price before saving — both the top-level default
 // price and every branch-specific override in branchPrices[].
+// A basePrice of 0 is a legitimate free item and must recompute too
+// (finalPrice 0), so the guard is "is a number", not truthiness. Results
+// are rounded to paise so 12.5% off ₹99 doesn't store 86.625.
+const offerPrice = (base, pct) => Math.round((base - (base * ((Number(pct) || 0) / 100))) * 100) / 100;
 menuItemSchema.pre('save', function () {
-    if (this.basePrice && this.offerPercentage >= 0) {
-        this.finalPrice = this.basePrice - (this.basePrice * (this.offerPercentage / 100));
+    if (typeof this.basePrice === 'number' && !(this.offerPercentage < 0)) {
+        this.finalPrice = offerPrice(this.basePrice, this.offerPercentage);
     }
     if (this.branchPrices?.length) {
         for (const bp of this.branchPrices) {
-            if (bp.basePrice && bp.offerPercentage >= 0) {
-                bp.finalPrice = bp.basePrice - (bp.basePrice * (bp.offerPercentage / 100));
+            if (typeof bp.basePrice === 'number' && !(bp.offerPercentage < 0)) {
+                bp.finalPrice = offerPrice(bp.basePrice, bp.offerPercentage);
             }
         }
     }

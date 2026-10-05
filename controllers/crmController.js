@@ -65,7 +65,12 @@ exports.getAllCustomers = asyncHandler(async (req, res) => {
             { $addFields: {
                 wallet: { $arrayElemAt: ['$wallet', 0] },
                 orderCount: { $size: '$orders' },
-                totalSpent: { $sum: '$orders.total' },
+                // Lifetime value counts real (non-cancelled) orders only.
+                totalSpent: { $sum: { $map: {
+                    input: '$orders',
+                    as: 'o',
+                    in: { $cond: [{ $eq: ['$$o.status', 'cancelled'] }, 0, { $ifNull: ['$$o.total', 0] }] },
+                } } },
                 lastOrderDate: { $max: '$orders.createdAt' },
             }},
             // Visibility: a Sub Admin only sees customers who have
@@ -184,7 +189,10 @@ exports.getCustomerDetail = asyncHandler(async (req, res) => {
     // #30 — a customer with no footprint in this tenant (or, for a
     // branch-pinned admin, this branch) must not be viewable by id:
     // the profile carries global PII (name / email / mobile).
-    if (!wallet && orders.length === 0 && advanceBookings.length === 0) {
+    // The wallet is tenant-level, so it is footprint only for a tenant-wide
+    // caller — never for a branch-pinned admin.
+    const walletFootprint = !!wallet && !pinnedBranchId(req);
+    if (!walletFootprint && orders.length === 0 && advanceBookings.length === 0) {
         return res.status(404).json({ success: false, message: 'Customer not found' });
     }
 
@@ -274,7 +282,9 @@ exports.getCustomerDetail = asyncHandler(async (req, res) => {
         .slice(0, 10)
         .map(([name, count]) => ({ name, count }));
 
-    const totalSpent = orders.reduce((sum, o) => sum + (o.total || 0), 0);
+    // Lifetime value / average exclude cancelled orders.
+    const spendOrders = orders.filter(o => o.status !== 'cancelled');
+    const totalSpent = spendOrders.reduce((sum, o) => sum + (o.total || 0), 0);
     const completedBookings = advanceBookings.filter(b => b.status === 'Completed').length;
 
     const preferences = {
@@ -282,7 +292,7 @@ exports.getCustomerDetail = asyncHandler(async (req, res) => {
         allergy: customer.allergy || '',
         preferredPayment: getMostFrequent(orders.map(o => o.paymentMethod).filter(Boolean)),
         preferredOrderType: getMostFrequent(orders.map(o => o.type)),
-        avgOrderValue: orders.length > 0 ? Math.round(totalSpent / orders.length) : 0
+        avgOrderValue: spendOrders.length > 0 ? Math.round(totalSpent / spendOrders.length) : 0
     };
 
     // Suggestions — from order notes

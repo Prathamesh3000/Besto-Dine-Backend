@@ -9,7 +9,7 @@ const mongoose = require('mongoose');
 const Order = require('../models/order');
 const logger = require('../utils/logger');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
-const { tenantFilter, tenantId } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { httpError, reply } = require('./orderErrors');
 const { staffBranchFilter, applySessionScope } = require('./orderAccess');
 const {
@@ -352,9 +352,18 @@ async function getRefunds(req) {
 
   const methodFilter = method ? { paymentMethod: method } : {};
 
+  // Unparseable dates are ignored (same as buildPastOrdersDateFilter) —
+  // an Invalid Date would CastError the whole query into a 500.
   const dateFilter = {};
-  if (from) dateFilter.$gte = new Date(from);
-  if (to) dateFilter.$lte = new Date(to);
+  const asDate = (v) => {
+    if (!v || typeof v !== 'string') return null;
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  };
+  const fromDate = asDate(from);
+  const toDate = asDate(to);
+  if (fromDate) dateFilter.$gte = fromDate;
+  if (toDate) dateFilter.$lte = toDate;
   const updatedAtFilter = Object.keys(dateFilter).length ? { updatedAt: dateFilter } : {};
 
   const finalQuery = {
@@ -609,11 +618,20 @@ async function getOrderById(req) {
   const STAFF_ROLES_SET = new Set(['admin', 'manager', 'captain', 'waiter', 'chef', 'superadmin']);
   const caller = req.user || null;
   let authorized = false;
+  let branchBlocked = false;
 
   if (caller && STAFF_ROLES_SET.has(caller.role)) {
     // Staff of the tenant — tenant match is already enforced by the
-    // query above; role gives them view rights on any order.
-    authorized = true;
+    // query above; role gives them view rights on any order, except
+    // that branch-pinned staff only see their own branch's orders
+    // (same rule as the list queries and PATCH /:id/status).
+    const pinned = pinnedBranchId(req);
+    const orderBranch = order.branch?._id || order.branch;
+    if (pinned && orderBranch && String(orderBranch) !== String(pinned)) {
+      branchBlocked = true;
+    } else {
+      authorized = true;
+    }
   } else if (caller && caller.role === 'customer' && order.user
     && String(order.user) === String(caller.id)) {
     // Logged-in customer reading their own order.
@@ -624,7 +642,7 @@ async function getOrderById(req) {
   // customer who placed their order as a guest and only logged in
   // afterwards (order.user is null but they still hold the session's
   // scanToken). Strict match on sessionId; tenant also cross-checked.
-  if (!authorized && order.scanSessionId) {
+  if (!authorized && !branchBlocked && order.scanSessionId) {
     const scanToken = req.headers['x-scan-token'];
     if (scanToken) {
       try {

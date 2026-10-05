@@ -421,6 +421,19 @@ userSchema.pre('save', async function () {
     }
 });
 
+// ─── Serialisation ───────────────────────────────────────────────────────────
+// `select: false` only applies to queries: a freshly created / saved
+// document still carries the bcrypt hash in memory, and res.json() would
+// ship it to the client. Strip credentials whenever a User document is
+// serialised to JSON. (googleId / authProviders are identifiers, not
+// secrets, and are left as they were.)
+userSchema.set('toJSON', {
+    transform(_doc, ret) {
+        delete ret.password;
+        return ret;
+    },
+});
+
 // ─── Instance methods ─────────────────────────────────────────────────────────
 
 // Compare a plain-text candidate password against the stored bcrypt hash.

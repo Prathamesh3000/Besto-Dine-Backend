@@ -85,17 +85,62 @@ if (process.env.NODE_ENV !== 'production') {
 // without long-lived bearer tokens.
 //
 // Refresh lifetime is sliding (every rotation restarts it):
-//   superadmin 12h · staff 7d · customer 30d  (hours; env-overridable)
+//   superadmin 12h · staff 7d  (hours; env-overridable)
+//   customer   CUSTOMER_IDLE_TIMEOUT_MINUTES (default 60) — an INACTIVITY
+//              timeout: each refresh extends the session by 60 min, and a
+//              customer idle for longer must sign in again (QA N14).
 const STAFF_SESSION_ROLES = new Set(['admin', 'manager', 'waiter', 'captain', 'chef']);
 
+const envNumber = (envKey, dflt) => {
+    const n = Number(process.env[envKey]);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+};
+
+/** Customer inactivity timeout (ms). CUSTOMER_IDLE_TIMEOUT_MINUTES, default 60. */
+function customerIdleMs() {
+    return envNumber('CUSTOMER_IDLE_TIMEOUT_MINUTES', 60) * 60 * 1000;
+}
+
+const isCustomerRole = (role) => role !== 'superadmin' && !STAFF_SESSION_ROLES.has(role);
+
 function refreshTtlMs(role) {
+    const hours = (envKey, dflt) => envNumber(envKey, dflt) * 60 * 60 * 1000;
+    if (role === 'superadmin') return hours('REFRESH_TTL_HOURS_SUPERADMIN', 12);
+    if (STAFF_SESSION_ROLES.has(role)) return hours('REFRESH_TTL_HOURS_STAFF', 7 * 24);
+    return customerIdleMs();
+}
+
+/**
+ * Absolute session lifetime — the hard ceiling a session cannot exceed
+ * no matter how active the user is.
+ *
+ * refreshTtlMs() above is PER TOKEN and resets on every rotation. That
+ * alone is a sliding window with no ceiling: any client that refreshes
+ * before the token lapses stays signed in indefinitely. The customer
+ * app polls notifications every 15s and refreshes its access token
+ * every ~30 minutes, so a browser tab left open overnight renews itself
+ * forever — which is why a tester who signed in yesterday was still
+ * signed in today.
+ *
+ * Defaults are chosen per role by how much damage an unattended session
+ * can do:
+ *   superadmin  8h  — platform-wide access; shortest leash
+ *   staff      12h  — about one shift on a shared floor tablet
+ *   customer   24h  — plus a 60-minute INACTIVITY timeout (see
+ *                     customerIdleMs / refresh below)
+ */
+function refreshAbsoluteMs(role) {
     const hours = (envKey, dflt) => {
         const n = Number(process.env[envKey]);
         return (Number.isFinite(n) && n > 0 ? n : dflt) * 60 * 60 * 1000;
     };
-    if (role === 'superadmin') return hours('REFRESH_TTL_HOURS_SUPERADMIN', 12);
-    if (STAFF_SESSION_ROLES.has(role)) return hours('REFRESH_TTL_HOURS_STAFF', 7 * 24);
-    return hours('REFRESH_TTL_HOURS_CUSTOMER', 30 * 24);
+    if (role === 'superadmin') return hours('SESSION_MAX_HOURS_SUPERADMIN', 8);
+    if (STAFF_SESSION_ROLES.has(role)) return hours('SESSION_MAX_HOURS_STAFF', 12);
+    // Customer absolute cap: SESSION_MAX_HOURS_CUSTOMER, else
+    // REFRESH_TTL_HOURS_CUSTOMER (its meaning since the idle timeout took
+    // over the per-token window), else 24h. Combined with the 60-minute
+    // inactivity timeout, an active customer re-signs in at least daily.
+    return hours('SESSION_MAX_HOURS_CUSTOMER', envNumber('REFRESH_TTL_HOURS_CUSTOMER', 24));
 }
 
 const sha256 = (raw) => crypto.createHash('sha256').update(String(raw)).digest('hex');
@@ -105,24 +150,38 @@ const sha256 = (raw) => crypto.createHash('sha256').update(String(raw)).digest('
 // inside this window that is treated as benign rather than as theft.
 const REFRESH_REUSE_GRACE_MS = 30 * 1000;
 
-async function createRefreshSession(user, req, family) {
+async function createRefreshSession(user, req, family, familyExpiresAt) {
     const raw = crypto.randomBytes(32).toString('base64url');
+    // A rotation INHERITS the original ceiling; only a fresh login (no
+    // familyExpiresAt passed) starts a new one. Recomputing it here
+    // would reintroduce the unbounded-session bug this exists to fix.
+    const ceiling = familyExpiresAt || new Date(Date.now() + refreshAbsoluteMs(user.role));
     await RefreshSession.create({
         user: user._id,
         tokenHash: sha256(raw),
         family: family || crypto.randomUUID(),
         tv: Number(user.tokenVersion) || 0,
-        expiresAt: new Date(Date.now() + refreshTtlMs(user.role)),
+        familyExpiresAt: ceiling,
+        lastUsedAt: new Date(),
+        // Per-token expiry; never later than the family ceiling.
+        // For customers this IS the inactivity window (60 min default).
+        expiresAt: new Date(Math.min(Date.now() + refreshTtlMs(user.role), ceiling.getTime())),
         userAgent: String(req.headers?.['user-agent'] || '').slice(0, 200),
         ip: String(req.ip || ''),
     });
     return raw;
 }
 
+// Exported for __tests__/sessionLifetime.test.js — the session ceiling
+// is a security control, so its values are pinned by tests.
+exports.refreshAbsoluteMs = refreshAbsoluteMs;
+exports.refreshTtlMs = refreshTtlMs;
+exports.customerIdleMs = customerIdleMs;
+
 /** Mint an access token + refresh token for `user`. */
-async function issueSession(req, res, user, family) {
+async function issueSession(req, res, user, family, familyExpiresAt) {
     const token = signAccessToken(user);
-    const refreshToken = await createRefreshSession(user, req, family);
+    const refreshToken = await createRefreshSession(user, req, family, familyExpiresAt);
     setAuthCookie(res, token);  // CRIT-08 — no-op unless USE_COOKIE_AUTH=true
     return { token, refreshToken };
 }
@@ -1075,7 +1134,13 @@ exports.refresh = async (req, res) => {
 
         if (!session) {
             const prior = await RefreshSession.findOne({ tokenHash }).lean();
-            if (!prior || prior.expiresAt <= now) return invalid();
+            if (!prior) return invalid();
+            if (prior.expiresAt <= now) {
+                // A customer token that lapsed = the inactivity timeout
+                // (N14) — tell the client so it can say "session expired".
+                const owner = await User.findById(prior.user).select('role').lean();
+                return invalid(owner && isCustomerRole(owner.role) ? 'SESSION_IDLE_TIMEOUT' : 'REFRESH_INVALID');
+            }
             const inGrace = prior.rotatedAt && (now - new Date(prior.rotatedAt)) < REFRESH_REUSE_GRACE_MS;
             if (!inGrace) {
                 // A rotated/revoked token came back: assume it was stolen
@@ -1094,10 +1159,77 @@ exports.refresh = async (req, res) => {
         if (!user || user.status !== 'active') return invalid();
         if ((Number(user.tokenVersion) || 0) !== (Number(session.tv) || 0)) return invalid('SESSION_REVOKED');
 
+        // ── Customer inactivity timeout (QA N14) ──────────────────
+        // Two signals, either ends the session:
+        //   1. server: time since this token was issued (lastUsedAt —
+        //      every refresh issues a new row, so this is "time since
+        //      the session was last used"). `expiresAt` already enforces
+        //      it; this catches rows from before the change (30-day
+        //      expiresAt) and clock-edge cases.
+        //   2. client: `idleMs` — time since the customer last touched
+        //      the app. The customer app polls in the background, and a
+        //      poll that renews the token is not the customer "using"
+        //      the session; the browser reports real interaction.
+        if (isCustomerRole(user.role)) {
+            const idleLimit = customerIdleMs();
+            const lastUsed = new Date(session.lastUsedAt || session.createdAt || now).getTime();
+            const reportedIdle = Number(req.body?.idleMs);
+            const idleServer = now.getTime() - lastUsed;
+            const idleClient = Number.isFinite(reportedIdle) && reportedIdle > 0 ? reportedIdle : 0;
+            if (idleServer >= idleLimit || idleClient >= idleLimit) {
+                // Expire (not just revoke) the family so a replay reads as
+                // a lapsed session, not as token theft.
+                await RefreshSession.updateMany(
+                    { family: session.family, revokedAt: null },
+                    { $set: { revokedAt: now } },
+                );
+                await RefreshSession.updateMany(
+                    { family: session.family },
+                    { $set: { expiresAt: now } },
+                );
+                logger.info('auth.refresh.idle-timeout', {
+                    userId: String(user._id),
+                    idleMs: Math.max(idleServer, idleClient),
+                });
+                return invalid('SESSION_IDLE_TIMEOUT');
+            }
+        }
+
+        // ── Absolute session ceiling ──────────────────────────────
+        // The check that actually ends a session. `expiresAt` resets on
+        // every rotation, so without this a client that keeps
+        // refreshing is never signed out — a tab left open overnight
+        // renews itself indefinitely.
+        //
+        // Rows written before this field existed carry no ceiling.
+        // Backfill one from the row's own creation time using the
+        // USER's role (the session row has no role of its own), so
+        // existing logins age out on the correct schedule instead of
+        // living forever.
+        const ceiling = session.familyExpiresAt
+            || new Date(new Date(session.createdAt || now).getTime() + refreshAbsoluteMs(user.role));
+
+        if (ceiling <= now) {
+            // Kill the whole family: the ceiling applies to the login,
+            // not to any one token within it.
+            await RefreshSession.updateMany(
+                { family: session.family, revokedAt: null },
+                { $set: { revokedAt: now } },
+            );
+            logger.info('auth.refresh.session-expired', {
+                userId: String(user._id),
+                role: user.role,
+                family: session.family,
+            });
+            return invalid('SESSION_EXPIRED');
+        }
+
         const tenantLock = await assertTenantNotLocked(user);
         if (tenantLock) return res.status(tenantLock.status).json(tenantLock.body);
 
-        const tokens = await issueSession(req, res, user, session.family);
+        // Pass the ceiling through so the new token inherits it rather
+        // than starting a fresh one.
+        const tokens = await issueSession(req, res, user, session.family, ceiling);
         return res.status(200).json({ success: true, ...tokens });
     } catch (err) {
         logger.error('Refresh error:', { error: err.message });
@@ -1169,7 +1301,15 @@ exports.updateProfile = async (req, res) => {
             name, mobile, allergy, avatar,
             dob, anniversary, gender, dietaryPreference, address,
             preferredLanguage,
-        } = req.body;
+        } = req.body || {};
+
+        // Text fields must be strings (null clears) — a number / object /
+        // array is a client error, not a TypeError (500) on .trim().
+        for (const [key, value] of Object.entries({ name, mobile, allergy, avatar })) {
+            if (value !== undefined && value !== null && typeof value !== 'string') {
+                return res.status(400).json({ success: false, message: `${key} must be text` });
+            }
+        }
 
         const user = await User.findById(req.user._id);
         if (!user) {
@@ -1178,7 +1318,7 @@ exports.updateProfile = async (req, res) => {
 
         // ── Validate inputs ─────────────────────────────────────────────
         if (name !== undefined) {
-            const trimmed = name.trim();
+            const trimmed = (name || '').trim();
             if (!trimmed) {
                 return res.status(400).json({ success: false, message: 'Name cannot be empty' });
             }
@@ -1189,7 +1329,7 @@ exports.updateProfile = async (req, res) => {
         }
 
         if (mobile !== undefined) {
-            const cleaned = mobile.trim();
+            const cleaned = (mobile || '').trim();
             // Allow empty (clears the field) or valid Indian mobile format
             if (cleaned && !MOBILE_REGEX.test(cleaned)) {
                 return res.status(400).json({ success: false, message: 'Please provide a valid 10-digit mobile number' });
@@ -1198,7 +1338,7 @@ exports.updateProfile = async (req, res) => {
         }
 
         if (allergy !== undefined) {
-            const trimmed = allergy.trim();
+            const trimmed = (allergy || '').trim();
             if (trimmed.length > 1000) {
                 return res.status(400).json({ success: false, message: 'Allergy text cannot exceed 1000 characters' });
             }

@@ -7,6 +7,7 @@ const {
     getTables,
     getBookableTables,
     getTableByToken,
+    getTableAvailability,
     updateTable,
     deleteTable,
     regenerateQrToken,
@@ -84,6 +85,8 @@ const csvUpload = multer({
 
 // Public route (customer QR scan)
 router.get('/scan/:qrToken', getTableByToken);
+// QA #14 — can this table still take orders? (customer app, no auth)
+router.get('/:id/availability', validate([tableIdParam]), getTableAvailability);
 
 // Customer-facing bookable table list. MUST stay above the staff
 // `GET /` so the narrow projection is what the booking flow reaches.

@@ -38,7 +38,24 @@ const SCAN_TOKEN_TTL = process.env.SCAN_TOKEN_TTL || '4h';
 
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { resolveMergeLeader, freeTableOrUnmergeGroup } = require('../utils/tableMerge');
-const { callerPartyKeys, checkTableCapacity } = require('../utils/tableOccupancy');
+const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
+
+// QA #14 — tell diners bound to these tables (they auto-join the
+// `table:<id>` room from their scan token) that the table can no longer
+// take orders, so the customer app locks ordering straight away instead
+// of failing at Place Order.
+function emitTableUnavailable(tableIds, reason) {
+    try {
+        const io = getIO();
+        if (!io) return;
+        for (const id of tableIds) {
+            if (id) io.to(`table:${id}`).emit(EVENTS.TABLE_UNAVAILABLE, { tableId: String(id), reason });
+        }
+    } catch (err) {
+        logger.warn('Socket emit failed:', err.message);
+    }
+}
+const { claimSeat, releaseSeats } = require('../utils/tableSeats');
 const { devError } = require('../utils/AppError');
 const { pickAllowed, TABLE_UPDATE_FIELDS } = require('../utils/bodyAllowlist');
 
@@ -76,6 +93,18 @@ async function resolveBranch(req, rawBranchId) {
     return { ok: true, branchId: rawBranchId };
 }
 
+// Branch-pinned staff may only act on their own branch's tables
+// (tenant-level tables with branch=null stay reachable). Returns true
+// when `table` belongs to another branch.
+function isOtherBranchTable(req, table) {
+    const callerPin = pinnedBranchId(req);
+    if (!callerPin || !table?.branch) return false;
+    return String(table.branch._id || table.branch) !== String(callerPin._id || callerPin);
+}
+const branchMismatch = (res) => res.status(403).json({
+    success: false, code: 'BRANCH_MISMATCH', message: 'This table belongs to another branch.',
+});
+
 // Create a new table
 const createTable = async (req, res) => {
     try {
@@ -89,8 +118,25 @@ const createTable = async (req, res) => {
             return res.status(400).json({ success: false, message: branchCheck.message });
         }
 
-        // Check for existing table in the same area (scoped to tenant)
-        const existingTable = await Table.findOne({ name: name.trim(), area, ...tenantFilter(req) });
+        // ── Enforce the plan's maxTables limit (0 / missing = uncapped,
+        // same reading as the superadmin plan-change usage check).
+        const maxTables = req.restaurant?.getLimit?.('maxTables') ?? 0;
+        if (maxTables > 0) {
+            const tableCount = await Table.countDocuments({ ...tenantFilter(req), isDeleted: { $ne: true } });
+            if (tableCount >= maxTables) {
+                return res.status(403).json({
+                    success: false,
+                    code: 'TABLE_LIMIT_REACHED',
+                    message: `Your plan allows ${maxTables} table(s). You currently have ${tableCount}. Upgrade your plan to add more.`,
+                    current: tableCount,
+                    limit: maxTables,
+                });
+            }
+        }
+
+        // Check for existing table in the same area (scoped to tenant).
+        // Soft-deleted tables don't count — their name may be reused.
+        const existingTable = await Table.findOne({ name: name.trim(), area, isDeleted: { $ne: true }, ...tenantFilter(req) });
         if (existingTable) {
             return res.status(400).json({ success: false, message: 'Table with this name already exists in the selected area.' });
         }
@@ -181,6 +227,11 @@ const getTables = async (req, res) => {
         if (status) query.status = status;
 
         const tables = await Table.find(query)
+            // See adminBootstrapController: qrToken is select:false and
+            // the admin QR modal cannot build a working code without it.
+            // +seats → serialised as `seatsTaken` (count only) by the
+            // schema's toJSON transform; identities never leave.
+            .select('+qrToken +seats')
             .populate('area', 'name isActive')
             .populate('branch', 'name slug')
             .populate('currentDiner.user', 'name mobile email')
@@ -340,16 +391,20 @@ const getTableByToken = async (req, res) => {
             } catch { /* expired / invalid — issue a fresh session */ }
         }
 
-        // Table capacity — refuse a NEW party once the table already
-        // seats `capacity` distinct ordering parties. createOrder
-        // enforces the same rule; checking here too means the diner is
-        // told up front instead of after building a cart.
-        const capacityCheck = await checkTableCapacity(
-            effectiveTable,
-            { restaurant: effectiveTable.restaurant?._id || effectiveTable.restaurant },
-            callerPartyKeys(req, priorSessionId),
-        );
-        if (!capacityCheck.ok) return res.status(capacityCheck.status).json(capacityCheck.body);
+        // Decide the party's scan session FIRST — a re-scan keeps its
+        // prior session, a new phone gets the id we are about to sign —
+        // then reserve a seat for it (QA #13). claimSeat is atomic: a
+        // full table answers 409 here, before the diner builds a cart,
+        // and N phones scanning a K-seat table at once yield exactly K
+        // seats. Staff scanning the sticker (callerPartyKeys → null)
+        // never take a seat. Seats live on the merge leader.
+        const sessionId = priorSessionId || crypto.randomUUID();
+        const seat = await claimSeat({
+            table: effectiveTable,
+            tenantFilterObj: { restaurant: effectiveTable.restaurant?._id || effectiveTable.restaurant },
+            keys: callerPartyKeys(req, sessionId),
+        });
+        if (!seat.ok) return res.status(seat.status).json(seat.body);
 
         // Auto-occupy the table on QR scan so the admin dashboard updates in real time.
         // Skip if it's already occupied/merged/reserved (don't clobber existing state).
@@ -433,7 +488,6 @@ const getTableByToken = async (req, res) => {
         // sticker's for audit, but all order writes must target the
         // leader so they hit the group's single active order.
         try {
-            const sessionId = priorSessionId || crypto.randomUUID();
             tableObj.scanToken = signTypedToken(
                 TOKEN_TYPES.SCAN,
                 {
@@ -579,6 +633,16 @@ const updateTable = async (req, res) => {
 
         await table.save();
 
+        // A table reset to free, or taken out of service, releases every
+        // seat reservation (QA #13). Merged groups keep seats on the
+        // leader, so clear the siblings too.
+        if (updates.status === 'free' || updates.status === 'disabled' || updates.isActive === false) {
+            await releaseSeats([table._id, ...(table.mergedWith || [])], tenantFilter(req));
+        }
+        if (updates.status === 'disabled' || updates.isActive === false) {
+            emitTableUnavailable([table._id, ...(table.mergedWith || [])], 'disabled');
+        }
+
         const populatedTable = await Table.findById(table._id)
             .populate('area', 'name isActive')
             .populate('branch', 'name slug');
@@ -617,10 +681,11 @@ const deleteTable = async (req, res) => {
         }
 
         const current = await Table.findOne({ _id: id, isDeleted: { $ne: true }, ...tf })
-            .select('status mergedWith name').lean();
+            .select('status mergedWith name branch').lean();
         if (!current) {
             return res.status(404).json({ success: false, message: 'Table not found' });
         }
+        if (isOtherBranchTable(req, current)) return branchMismatch(res);
         if (Array.isArray(current.mergedWith) && current.mergedWith.length > 0) {
             return res.status(400).json({ success: false, message: 'Cannot delete table that is part of a merge group. Unmerge first.' });
         }
@@ -668,7 +733,7 @@ const deleteTable = async (req, res) => {
         // table between the checks above and this write.
         const table = await Table.findOneAndUpdate(
             { _id: id, isDeleted: { $ne: true }, status: { $ne: 'occupied' }, 'mergedWith.0': { $exists: false }, ...tf },
-            { $set: { isDeleted: true, deletedAt: new Date(), status: 'disabled' } },
+            { $set: { isDeleted: true, deletedAt: new Date(), status: 'disabled', seats: [] } },
             { returnDocument: 'after' },
         );
 
@@ -680,6 +745,7 @@ const deleteTable = async (req, res) => {
             });
         }
 
+        emitTableUnavailable([table._id], 'deleted');
         res.status(200).json({ success: true, message: 'Table deleted successfully' });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Error deleting table', ...devError(error) });
@@ -723,6 +789,7 @@ const mergeTables = async (req, res) => {
         if (tables.length !== tableIds.length) {
             return res.status(404).json({ success: false, message: 'One or more tables not found.' });
         }
+        if (tables.some((t) => isOtherBranchTable(req, t))) return branchMismatch(res);
 
         // Check if same area
         const areaId = tables[0].area.toString();
@@ -766,6 +833,34 @@ const mergeTables = async (req, res) => {
             }
         }));
         await Table.bulkWrite(mergeOps);
+
+        // Seat reservations (QA #13) live on the merge leader and count
+        // against the group's summed capacity. Move any seats already
+        // taken at a member (e.g. diners who scanned the occupied table
+        // before the merge) onto the leader so the whole group is one pool.
+        try {
+            const tf = tenantFilter(req);
+            const leader = await resolveMergeLeader(tableIds[0], tf);
+            if (leader) {
+                const members = await Table.find({ _id: { $in: tableIds }, ...tf }).select('+seats').lean();
+                const moved = [];
+                for (const m of members) {
+                    if (String(m._id) !== String(leader._id) && Array.isArray(m.seats) && m.seats.length) moved.push(...m.seats);
+                }
+                if (moved.length) {
+                    await Table.updateMany(
+                        { _id: { $in: tableIds.filter((tid) => String(tid) !== String(leader._id)) }, ...tf },
+                        { $set: { seats: [] } },
+                    );
+                    await Table.updateOne(
+                        { _id: leader._id, ...tf },
+                        { $push: { seats: { $each: moved.map(({ _id, ...seat }) => seat) } } },
+                    );
+                }
+            }
+        } catch (err) {
+            logger.warn('mergeTables: seat consolidation failed: ' + err.message);
+        }
 
         // Per-tenant settings (was the legacy no-arg single-tenant lookup).
         const settings = await getSettings(req);
@@ -819,6 +914,7 @@ const unmergeTables = async (req, res) => {
         if (!table || table.status !== 'merged') {
             return res.status(400).json({ success: false, message: 'Table is not merged' });
         }
+        if (isOtherBranchTable(req, table)) return branchMismatch(res);
 
         const allMergedIds = [table._id, ...(table.mergedWith || [])];
 
@@ -843,7 +939,10 @@ const unmergeTables = async (req, res) => {
         // Reset all tables in this group (scoped to tenant)
         await Table.updateMany(
             { _id: { $in: allMergedIds }, ...tenantFilter(req) },
-            { $set: { status: 'free', mergedWith: [] } }
+            // Seats live on the group leader; splitting the group
+            // releases them (QA #13) — diners re-claim on their next
+            // scan / order.
+            { $set: { status: 'free', mergedWith: [], seats: [] } }
         );
 
         // Per-tenant settings (was the legacy no-arg single-tenant lookup).
@@ -1010,6 +1109,7 @@ const freeTable = async (req, res) => {
         if (!table) {
             return res.status(404).json({ success: false, message: 'Table not found' });
         }
+        if (isOtherBranchTable(req, table)) return branchMismatch(res);
 
         // Every order still occupying the table — independent-orders model.
         const openOrders = await Order.find({
@@ -1065,7 +1165,8 @@ const freeTable = async (req, res) => {
             }
         }
 
-        const { freedIds } = await freeTableOrUnmergeGroup(table._id, tf);
+        // Staff reset → every seat on the table / group is released.
+        const { freedIds } = await freeTableOrUnmergeGroup(table._id, tf, { clearSeats: true });
 
         try {
             const io = getIO();
@@ -1123,8 +1224,10 @@ const claimTable = async (req, res) => {
             return res.status(409).json({ success: false, code: 'TABLE_DISABLED', message: 'This table is out of service. Please ask a staff member for help.' });
         }
 
-        // Capacity — a customer who isn't already seated here can't
-        // join a table that is full.
+        // Seat — the customer joins (or, if their scan session already
+        // holds a seat, refreshes and adds their user id to) a seat on
+        // the merge leader. A customer who isn't seated can't join a
+        // table that is full (QA #13).
         let claimSessionId = null;
         if (req.headers['x-scan-token']) {
             try {
@@ -1132,8 +1235,9 @@ const claimTable = async (req, res) => {
                 if (String(decoded.tableId) === String(table._id)) claimSessionId = decoded.sessionId || null;
             } catch { /* optional */ }
         }
-        const capacityCheck = await checkTableCapacity(table, tenantFilter(req), callerPartyKeys(req, claimSessionId));
-        if (!capacityCheck.ok) return res.status(capacityCheck.status).json(capacityCheck.body);
+        const seatTable = (await resolveMergeLeader(table._id, tenantFilter(req))) || table;
+        const seat = await claimSeat({ table: seatTable, tenantFilterObj: tenantFilter(req), keys: callerPartyKeys(req, claimSessionId) });
+        if (!seat.ok) return res.status(seat.status).json(seat.body);
 
         // Don't clobber a diner snapshot that already belongs to a
         // different user (e.g. someone else claimed it first, or staff
@@ -1315,7 +1419,7 @@ const importTablesCsv = async (req, res) => {
         const getExistingNamesForArea = async (areaId) => {
             const cacheKey = String(areaId);
             if (existingNamesByArea.has(cacheKey)) return existingNamesByArea.get(cacheKey);
-            const docs = await Table.find({ area: areaId, restaurant: restaurantId }).select('name').lean();
+            const docs = await Table.find({ area: areaId, restaurant: restaurantId, isDeleted: { $ne: true } }).select('name').lean();
             const set = new Set(docs.map(d => String(d.name).trim().toLowerCase()));
             existingNamesByArea.set(cacheKey, set);
             return set;
@@ -1397,6 +1501,19 @@ const importTablesCsv = async (req, res) => {
             }
         }
 
+        // Plan maxTables limit (0 / missing = uncapped) — rows past the
+        // remaining allowance are reported as errors, not inserted.
+        const maxTables = req.restaurant?.getLimit?.('maxTables') ?? 0;
+        if (maxTables > 0 && toInsert.length) {
+            const tableCount = await Table.countDocuments({ restaurant: restaurantId, isDeleted: { $ne: true } });
+            const room = Math.max(0, maxTables - tableCount);
+            if (toInsert.length > room) {
+                for (const doc of toInsert.splice(room)) {
+                    errors.push({ row: null, message: `"${doc.name}" not added — your plan allows ${maxTables} table(s).` });
+                }
+            }
+        }
+
         let created = 0;
         if (toInsert.length) {
             // ordered:false lets MongoDB skip a row that loses an index race
@@ -1452,7 +1569,25 @@ const importTablesCsv = async (req, res) => {
     }
 };
 
+// QA #14 — lightweight check the customer app runs when it comes back
+// online / into view, in case it missed the TABLE_UNAVAILABLE push.
+// Reveals only whether the table can take orders.
+const getTableAvailability = async (req, res) => {
+    try {
+        const table = await Table.findOne({ _id: req.params.id, ...tenantFilter(req) })
+            .select('isDeleted isActive status').lean();
+        const unavailable = tableUnavailableError(table);
+        if (unavailable) {
+            return res.status(200).json({ success: true, available: false, code: unavailable.body.code });
+        }
+        return res.status(200).json({ success: true, available: true });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Error checking table', ...devError(error) });
+    }
+};
+
 module.exports = {
+    getTableAvailability,
     createTable,
     getTables,
     getBookableTables,

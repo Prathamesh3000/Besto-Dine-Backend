@@ -99,10 +99,24 @@ exports.getHalls = async (req, res) => {
 };
 
 // Create a hall (Admin)
+// Capacity sanity beyond the schema's per-field `min`: a minimum above
+// the maximum makes every guest count unbookable. Returns an error
+// message or null. Only checks the pair when both are known.
+function capacityError(minCapacity, maxCapacity) {
+  const min = minCapacity === undefined || minCapacity === null || minCapacity === '' ? null : Number(minCapacity);
+  const max = maxCapacity === undefined || maxCapacity === null || maxCapacity === '' ? null : Number(maxCapacity);
+  if (min !== null && max !== null && Number.isFinite(min) && Number.isFinite(max) && min > max) {
+    return 'Minimum capacity cannot be greater than maximum capacity';
+  }
+  return null;
+}
+
 exports.createHall = async (req, res) => {
   try {
     const body = { ...req.body };
     delete body.restaurant;
+    const capErr = capacityError(body.minCapacity, body.maxCapacity);
+    if (capErr) return res.status(400).json({ success: false, message: capErr });
     const branchCheck = await resolveBranchForWrite(req, body.branch);
     if (!branchCheck.ok) {
       return res.status(400).json({ success: false, message: branchCheck.message });
@@ -125,6 +139,8 @@ exports.updateHall = async (req, res) => {
     if (body.status !== undefined) {
       body.isActive = body.status;
     }
+    const capErr = capacityError(body.minCapacity, body.maxCapacity);
+    if (capErr) return res.status(400).json({ success: false, message: capErr });
     // If the admin is moving this hall to a different branch, validate.
     // Sub Admins are auto-pinned to their branch (resolveBranchForWrite
     // ignores the body value for them).
@@ -144,7 +160,8 @@ exports.updateHall = async (req, res) => {
     const updated = await Hall.findOneAndUpdate(
       { _id: id, ...tenantFilter(req), ...scopeFilter },
       body,
-      { returnDocument: 'after' }
+      // runValidators: the schema refuses negative prices / capacities.
+      { returnDocument: 'after', runValidators: true }
     );
     if (!updated) return res.status(404).json({ success: false, message: 'Hall not found' });
     res.status(200).json({ success: true, hall: updated });

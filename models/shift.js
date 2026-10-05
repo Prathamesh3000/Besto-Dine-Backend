@@ -38,6 +38,13 @@ const shiftSchema = new mongoose.Schema({
     },
 }, { timestamps: true });
 
+// At most one active shift per staff member per tenant — makes clock-in
+// race-safe (concurrent inserts lose with E11000).
+shiftSchema.index(
+    { restaurant: 1, staff: 1 },
+    { unique: true, partialFilterExpression: { status: 'active' } },
+);
+
 // BUGS_REPORT #30 — auto-scope queries to the request tenant (utils/tenantScopePlugin.js).
 shiftSchema.plugin(require('../utils/tenantScopePlugin'));
 

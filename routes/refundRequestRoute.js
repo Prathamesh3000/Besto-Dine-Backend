@@ -12,7 +12,7 @@
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/refundRequestController');
-const { protect, adminOnly, restrictTo } = require('../middlewares/authMiddleware');
+const { protect, adminOnly, restrictTo, checkPermission } = require('../middlewares/authMiddleware');
 const { validate, body, objectIdParam } = require('../middlewares/validate');
 
 // BUGS_REPORT #33 — shape checks only; balance / status / duplicate rules
@@ -48,7 +48,8 @@ router.get('/mine', protect, restrictTo('customer'), ctrl.listMyRefundRequests);
 
 // ── Admin endpoints ───────────────────────────────────────────────────────
 router.get('/', protect, adminOnly, ctrl.listRefundRequests);
-router.post('/:id/approve', protect, adminOnly, decisionValidation, ctrl.approveRefundRequest);
-router.post('/:id/reject',  protect, adminOnly, decisionValidation, ctrl.rejectRefundRequest);
+// Deciding a refund needs the same 'refund' permission as POST /razorpay/refund.
+router.post('/:id/approve', protect, adminOnly, checkPermission('refund'), decisionValidation, ctrl.approveRefundRequest);
+router.post('/:id/reject',  protect, adminOnly, checkPermission('refund'), decisionValidation, ctrl.rejectRefundRequest);
 
 module.exports = router;

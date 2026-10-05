@@ -130,6 +130,9 @@ exports.getCurrentSubscription = async (req, res) => {
                     currentPeriodEnd: sub.currentPeriodEnd || null,
                     lastChargedAt: sub.lastChargedAt || null,
                     razorpayStatus: sub.razorpayStatus || '',
+                    // Decision 5 (2026-10): when a halted subscription will
+                    // be suspended if it is still unpaid (null = not scheduled).
+                    scheduledSuspendAt: sub.scheduledSuspendAt || null,
                     razorpaySubscriptionId: sub.razorpaySubscriptionId || '',
                     shortUrl: sub.shortUrl || '',
                     features: sub.features || {},
@@ -294,7 +297,10 @@ exports.upgradePlan = async (req, res) => {
         const currentPlanId = restaurant.subscription?.plan;
         if (currentPlanId) {
             const currentPlanDoc = await SubscriptionPlan.findById(currentPlanId).select('name price');
-            const currentPrice = currentPlanDoc?.price ?? 0;
+            // Judge against what the tenant actually pays (snapshot),
+            // not the possibly-edited catalogue price.
+            const snapPrice = restaurant.subscription?.price;
+            const currentPrice = typeof snapPrice === 'number' ? snapPrice : (currentPlanDoc?.price ?? 0);
             if (currentPrice > 0 && plan.price < currentPrice) {
                 return res.status(400).json({
                     success: false,
@@ -381,6 +387,7 @@ exports.upgradePlan = async (req, res) => {
         let shortUrl = '';
         let razorpayStatus = '';
         let fallbackOrderFlag = false;
+        let customerId = previousCustomerId;
         try {
             try {
                 await ensureRazorpayPlan(plan);
@@ -391,7 +398,7 @@ exports.upgradePlan = async (req, res) => {
             }
 
             const owner = restaurant.owner ? await User.findById(restaurant.owner) : req.user;
-            const customerId = await ensureRazorpayCustomer(restaurant, owner);
+            customerId = await ensureRazorpayCustomer(restaurant, owner);
 
             const sub = await createRazorpaySubscription({ plan, restaurant, customerId });
 
@@ -448,7 +455,9 @@ exports.upgradePlan = async (req, res) => {
         // Razorpay confirms payment. Until then the tenant sees their
         // existing plan + a "pending upgrade — finish payment" badge.
         restaurant.subscription = restaurant.subscription || {};
-        restaurant.subscription.razorpayCustomerId = previousCustomerId; // may have been set in ensureRazorpayCustomer
+        // Persist the (possibly freshly created) Razorpay customer id so
+        // the next upgrade reuses it instead of creating another customer.
+        restaurant.subscription.razorpayCustomerId = customerId || previousCustomerId;
         restaurant.subscription.pendingUpgrade = {
             plan: plan._id,
             planName: plan.name,
@@ -746,6 +755,16 @@ exports.verifyUpgradePayment = async (req, res) => {
             logTag: `tenantBilling.verifyUpgradePayment[${restaurant.slug}]`,
         });
 
+        // Payment doesn't pay for the pending plan (wrong order / short
+        // amount) — nothing applied, nothing invoiced.
+        if (result.skipped) {
+            return res.status(400).json({
+                success: false,
+                code: 'PAYMENT_PLAN_MISMATCH',
+                message: 'This payment does not cover the plan you are upgrading to. Please contact support.',
+            });
+        }
+
         return res.status(200).json({
             success: true,
             data: {
@@ -953,8 +972,9 @@ exports.syncFromRazorpay = async (req, res) => {
  *
  * Validation:
  *   - Reason is required (min 10 chars) so the reviewer has context.
- *   - planId must exist and be active.
+ *   - planId must exist, be active and public.
  *   - Cannot request the same plan they're on.
+ *   - Plan must be cheaper than the price the tenant currently pays.
  *   - At most ONE pending request per tenant (no stacking).
  *
  * On approval, the existing approvePlanChangeRequest superadmin
@@ -997,6 +1017,29 @@ exports.requestDowngrade = async (req, res) => {
                 success: false,
                 code: 'SAME_PLAN',
                 message: `You're already on the ${plan.name} plan.`,
+            });
+        }
+
+        // Downgrade means a cheaper plan from the public catalogue. A
+        // pricier (or private/bespoke) plan through this queue would be
+        // a free upgrade once approved — upgrades go through payment.
+        if (plan.isPublic === false) {
+            return res.status(400).json({ success: false, message: 'Selected plan is not available' });
+        }
+        // Snapshot price (what the tenant pays); catalogue only as a
+        // fallback for legacy tenants without one.
+        let currentPrice = restaurant.subscription?.price;
+        if (typeof currentPrice !== 'number') {
+            const currentPlanDoc = restaurant.subscription?.plan
+                ? await SubscriptionPlan.findById(restaurant.subscription.plan).select('price')
+                : null;
+            currentPrice = currentPlanDoc?.price ?? 0;
+        }
+        if (!(Number(plan.price) < currentPrice)) {
+            return res.status(400).json({
+                success: false,
+                code: 'NOT_A_DOWNGRADE',
+                message: `${plan.name} is not cheaper than your current plan. Use Upgrade to move to a higher plan.`,
             });
         }
 

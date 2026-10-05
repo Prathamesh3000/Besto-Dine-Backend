@@ -185,6 +185,22 @@ function formatOrderDetail(order) {
     couponDiscount: Number(order.couponDiscount) || 0,
     pointsRedeemed: Number(order.pointsRedeemed) || 0,
     walletAmountPaid: Number(order.walletAmountPaid) || 0,
+    // The tax breakdown stamped at creation (re-stamped on append) plus the
+    // staff discount and delivery fee, so the customer bill shows the lines
+    // that make up the stored total instead of re-deriving them from the
+    // tenant's CURRENT tax settings (Frontend utils/billing.billFromOrder).
+    gst: Number(order.gst) || 0,
+    gstPercentage: Number(order.gstPercentage) || 0,
+    serviceCharge: Number(order.serviceCharge) || 0,
+    serviceChargePercentage: Number(order.serviceChargePercentage) || 0,
+    additionalCharges: Array.isArray(order.additionalCharges)
+      ? order.additionalCharges.map(c => ({
+        name: c.name, type: c.type, value: Number(c.value) || 0, amount: Number(c.amount) || 0,
+      }))
+      : [],
+    additionalChargesTotal: Number(order.additionalChargesTotal) || 0,
+    manualDiscount: Number(order.manualDiscount) || 0,
+    deliveryFee: Number(order.delivery?.fee) || 0,
     pickupTime: order.pickupTime || null,
     pickupLocation: order.pickupLocation || null,
     branch: order.branch || null,

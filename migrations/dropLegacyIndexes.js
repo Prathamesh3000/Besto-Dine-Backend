@@ -13,6 +13,9 @@
  * Currently dropped:
  *   - wallets.user_1   → replaced by `{ user: 1, restaurant: 1 }`
  *                        so each customer can have one wallet per tenant.
+ *   - tables.name_1_area_1 → replaced by the partial `name_area_unique_live`
+ *                        so soft-deleted table names can be reused.
+ *   (full list in LEGACY_INDEXES below)
  *
  * Run from the Backend directory:
  *
@@ -44,6 +47,13 @@ const LEGACY_INDEXES = [
     // old definition was `staffId_1_restaurant_1` — drop it so each
     // branch can restart its own EMP-001 sequence.
     { collection: 'users',           index: 'staffId_1_restaurant_1', reason: 'replaced by partial compound { staffId, restaurant, branch } — EMP-001 restarts per branch (Phase 6+)' },
+
+    // Wave 5 — soft-deleted tables must not block their name (2026-10).
+    // models/table.js now declares the unique { name, area } index as
+    // `name_area_unique_live` with partialFilterExpression isDeleted:false.
+    // The old implicit index still counts deleted tables, so re-creating a
+    // deleted table's name fails until it is dropped.
+    { collection: 'tables',          index: 'name_1_area_1',    reason: 'replaced by partial unique name_area_unique_live (isDeleted:false) — deleted table names are reusable' },
 ];
 
 async function run() {

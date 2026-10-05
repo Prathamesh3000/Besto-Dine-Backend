@@ -12,6 +12,11 @@ const stockAdjustmentSchema = new mongoose.Schema({
     newStock: { type: Number, required: true },
     reason: { type: String, default: '' },
     adjustedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // Order whose auto-deduction ('usage') or cancel-restore ('return')
+    // wrote this row. restoreInventoryForOrder adds back exactly what
+    // these rows say was deducted (a partial deduction restores only
+    // the part actually taken). null for manual adjustments.
+    order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: undefined },
     date: { type: Date, default: Date.now }
 });
 
@@ -120,6 +125,7 @@ const inventorySchema = new mongoose.Schema({
 
 // ─── Auto-calculate status before save ───────────────────────────────────────
 inventorySchema.pre('save', function () {
+    if (this.isModified('currentStock')) this.currentStock = roundQty(this.currentStock);
     if (this.currentStock <= 0) {
         this.status = 'out-of-stock';
     } else if (this.currentStock <= this.minStock) {
@@ -139,6 +145,42 @@ inventorySchema.index({ restaurant: 1, itemId: 1 }, { unique: true });
 inventorySchema.index({ category: 1, status: 1 });
 inventorySchema.index({ name: 'text' });
 inventorySchema.index({ currentStock: 1, minStock: 1 });
+
+// ─── Stock quantity precision ────────────────────────────────────────────────
+// Every stock write rounds to 3 decimals (1 g / 1 mL on kg / L items) so
+// float drift (0.3 − 0.1 − 0.1 = 0.09999999999999998) never makes the
+// last 100 g look insufficient. `+ 0` turns a -0 into 0; non-finite
+// input is returned as-is so callers' NaN checks still fire.
+const QTY_FACTOR = 1000;
+const roundQty = (n) => {
+    const x = Number(n);
+    return Number.isFinite(x) ? Math.round(x * QTY_FACTOR) / QTY_FACTOR + 0 : x;
+};
+inventorySchema.statics.roundQty = roundQty;
+
+/**
+ * Atomic relative stock change: `$inc` by `delta` on the doc matching
+ * `filter` (callers add a guard such as `currentStock: { $gte: n }`), then
+ * re-round the stored value. Concurrent callers never overwrite each
+ * other (no absolute value read earlier is written back). The re-round is
+ * conditional on the value this call produced, so it never clobbers a
+ * later write. Returns null when nothing matched, else
+ * `{ doc, previousStock, newStock }` (doc = state after this $inc).
+ */
+inventorySchema.statics.incStock = async function incStock(filter, delta, options = {}) {
+    const doc = await this.findOneAndUpdate(filter, { $inc: { currentStock: delta } }, { ...options, returnDocument: 'after' });
+    if (!doc) return null;
+    const raw = doc.currentStock;
+    const newStock = roundQty(raw);
+    if (newStock !== raw) {
+        await this.updateOne(
+            { _id: doc._id, restaurant: doc.restaurant, currentStock: raw },
+            { $set: { currentStock: newStock } }
+        );
+        doc.currentStock = newStock;
+    }
+    return { doc, previousStock: roundQty(newStock - delta), newStock };
+};
 
 // ─── Virtual: stock value ────────────────────────────────────────────────────
 inventorySchema.virtual('stockValue').get(function () {

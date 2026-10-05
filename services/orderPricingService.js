@@ -15,9 +15,10 @@
 const Wallet = require('../models/wallet');
 const logger = require('../utils/logger');
 const { getSettings } = require('../utils/settingsCache');
-const { tenantFilter } = require('../utils/tenantScope');
+const { tenantFilter, pinnedBranchId } = require('../utils/tenantScope');
 const { resolveLoyaltySettings } = require('../utils/paymentDefaults');
 const { toTaxConfig } = require('../utils/billing');
+const { menuCategoryKind } = require('../utils/couponScope');
 const { httpError } = require('./orderErrors');
 const { lineItemsSubtotal, recomputeBillAfterAppend, billOrderType, billFieldsForNewOrder, round2 } = require('./orderBillMath');
 
@@ -51,6 +52,47 @@ function validateSelectedToppings(items, menuById) {
   }
 }
 
+// Canonical per-unit price of one cart / append line: the resolved
+// (branch / offer-aware) finalPrice, or — when the client picked a size —
+// that size's menu price with the item's offer applied, rounded to paise.
+// Never the client-sent price. Unknown size → 400 INVALID_SIZE.
+function canonicalUnitPrice(menu, resolved, item) {
+  let unitPrice = Number(resolved.finalPrice) || 0;
+
+  // Size variant: if the client picked a size, use that size's
+  // canonical price from the menu doc — never the client-sent one.
+  const firstSize = Array.isArray(item.selectedSizes) && item.selectedSizes.length
+    ? item.selectedSizes[0]
+    : null;
+  if (firstSize && firstSize.name) {
+    const wantedName = String(firstSize.name).trim().toLowerCase();
+    const canonicalSize = Array.isArray(menu.sizes)
+      ? menu.sizes.find(s => String(s.name).trim().toLowerCase() === wantedName)
+      : null;
+    if (!canonicalSize || !Number.isFinite(Number(canonicalSize.price))) {
+      throw httpError(400, {
+        success: false,
+        code: 'INVALID_SIZE',
+        message: `Unknown size "${firstSize.name}" for ${menu.name}`,
+      });
+    }
+    unitPrice = Number(canonicalSize.price);
+    // Sizes carry the BASE price; the menu item's `offerPercentage`
+    // applies on top, exactly like for the default unit price. Without
+    // this discount step, picking "Regular" on a discounted item
+    // would charge the pre-offer base price and the cart total
+    // (which sees finalPrice on the storefront) would trip
+    // TOTAL_TAMPERED below for every legitimate order. Round to the
+    // same 2-dp precision the storefront uses to keep the totals
+    // strictly comparable.
+    const offerPct = Number(resolved.offerPercentage) || 0;
+    if (offerPct > 0) {
+      unitPrice = Math.round((unitPrice - (unitPrice * offerPct / 100)) * 100) / 100;
+    }
+  }
+  return unitPrice;
+}
+
 // R-01: price every cart line from canonical menu data. Mutates each
 // item's price/quantity to the canonical values; returns the subtotal.
 function priceCartItems(items, menuById, pricingBranchId) {
@@ -67,39 +109,7 @@ function priceCartItems(items, menuById, pricingBranchId) {
       });
     }
     const resolved = resolvePrice(menu, pricingBranchId);
-    let unitPrice = Number(resolved.finalPrice) || 0;
-
-    // Size variant: if the client picked a size, use that size's
-    // canonical price from the menu doc — never the client-sent one.
-    const firstSize = Array.isArray(item.selectedSizes) && item.selectedSizes.length
-      ? item.selectedSizes[0]
-      : null;
-    if (firstSize && firstSize.name) {
-      const wantedName = String(firstSize.name).trim().toLowerCase();
-      const canonicalSize = Array.isArray(menu.sizes)
-        ? menu.sizes.find(s => String(s.name).trim().toLowerCase() === wantedName)
-        : null;
-      if (!canonicalSize || !Number.isFinite(Number(canonicalSize.price))) {
-        throw httpError(400, {
-          success: false,
-          code: 'INVALID_SIZE',
-          message: `Unknown size "${firstSize.name}" for ${menu.name}`,
-        });
-      }
-      unitPrice = Number(canonicalSize.price);
-      // Sizes carry the BASE price; the menu item's `offerPercentage`
-      // applies on top, exactly like for the default unit price. Without
-      // this discount step, picking "Regular" on a discounted item
-      // would charge the pre-offer base price and the cart total
-      // (which sees finalPrice on the storefront) would trip
-      // TOTAL_TAMPERED below for every legitimate order. Round to the
-      // same 2-dp precision the storefront uses to keep the totals
-      // strictly comparable.
-      const offerPct = Number(resolved.offerPercentage) || 0;
-      if (offerPct > 0) {
-        unitPrice = Math.round((unitPrice - (unitPrice * offerPct / 100)) * 100) / 100;
-      }
-    }
+    const unitPrice = canonicalUnitPrice(menu, resolved, item);
 
     // Toppings were already validated canonical above — sum them here
     // against the same canonical values to avoid re-trusting client input.
@@ -218,8 +228,35 @@ async function resolveDeliveryFee(req, { wantsDelivery, deliveryReq, branchId, c
   };
 }
 
+// Look a coupon up within the caller's tenant AND branch scope — the
+// same visibility rules as the checkout pre-check
+// (promotionController.applyCoupon / customerBranchFilter):
+//   • branch-pinned staff  → only their branch's coupons;
+//   • customers / guests ordering at a branch → tenant-level coupons,
+//     that branch's, or the main branch's (inherited);
+//   • unpinned staff, or no branch context → any coupon of the tenant.
+// `branchId` is the order's branch (the table's branch for dine-in).
+async function findCouponInScope(Coupon, req, code, branchId) {
+  const base = { code, isActive: true, ...tenantFilter(req) };
+  const pinned = pinnedBranchId(req);
+  if (pinned) return Coupon.findOne({ ...base, branch: pinned }).lean();
+  const isStaff = !!(req.user && req.user.role && req.user.role !== 'customer');
+  const orderBranch = branchId || req.branch?._id || null;
+  if (isStaff || !orderBranch) return Coupon.findOne(base).lean();
+
+  const coupon = await Coupon.findOne({ ...base, branch: { $in: [null, orderBranch] } }).lean();
+  if (coupon) return coupon;
+  // Only pay for the main-branch lookup when the code exists elsewhere.
+  const elsewhere = await Coupon.findOne({ ...base, branch: { $nin: [null, orderBranch] } }).lean();
+  if (!elsewhere) return null;
+  const { getMainBranchId } = require('../utils/mainBranch');
+  const main = await getMainBranchId(req);
+  if (!main || String(main) === String(orderBranch)) return null;
+  return Coupon.findOne({ ...base, branch: main }).lean();
+}
+
 // Server-side coupon validation for a new cart.
-async function resolveCartCoupon(req, { items, menuById, authoritativeSubtotal }) {
+async function resolveCartCoupon(req, { items, menuById, authoritativeSubtotal, branchId }) {
   // ── Server-side coupon validation ───────────────────────────────
   // Mirrors applyCouponToOrder's logic: look up Coupon, verify scope /
   // dates / minOrderValue, recompute discount server-side. A
@@ -236,13 +273,10 @@ async function resolveCartCoupon(req, { items, menuById, authoritativeSubtotal }
   const rawCouponCode = (!isGuestPlacer && typeof req.body.couponCode === 'string')
     ? req.body.couponCode.trim().toUpperCase()
     : '';
+  let couponId;
   if (rawCouponCode) {
     const Coupon = require('../models/coupon');
-    const coupon = await Coupon.findOne({
-      code: rawCouponCode,
-      isActive: true,
-      ...tenantFilter(req),
-    }).lean();
+    const coupon = await findCouponInScope(Coupon, req, rawCouponCode, branchId);
     if (!coupon) {
       throw httpError(400, {
         success: false,
@@ -265,6 +299,35 @@ async function resolveCartCoupon(req, { items, menuById, authoritativeSubtotal }
         message: 'Coupon has expired.',
       });
     }
+    // Time-of-day window (e.g. a 12:00–15:00 lunch deal) — same rule as
+    // the checkout pre-check (promotionController.applyCoupon), which a
+    // client can skip by posting straight to POST /orders.
+    if (coupon.startTime && coupon.endTime) {
+      const currentTime = nowTs.getHours().toString().padStart(2, '0') + ':' + nowTs.getMinutes().toString().padStart(2, '0');
+      if (currentTime < coupon.startTime || currentTime > coupon.endTime) {
+        throw httpError(400, {
+          success: false,
+          code: 'COUPON_TIME_WINDOW',
+          message: `This coupon is valid only between ${coupon.startTime} and ${coupon.endTime}.`,
+        });
+      }
+    }
+    // Per-customer limit (usagePerUser) — counted from the redemption
+    // ledger. Re-checked inside the order transaction
+    // (orderCreateService.persistOrderDocs) so two concurrent orders
+    // can't both slip under the limit.
+    const customerId = req.user && req.user.role === 'customer' ? (req.user._id || req.user.id) : null;
+    if (customerId && coupon._id && Number(coupon.usagePerUser) > 0) {
+      const CouponRedemption = require('../models/couponRedemption');
+      const used = await CouponRedemption.countDocuments({ coupon: coupon._id, user: customerId });
+      if (used >= coupon.usagePerUser) {
+        throw httpError(400, {
+          success: false,
+          code: 'COUPON_USER_LIMIT',
+          message: `You can only use this coupon ${coupon.usagePerUser} time${coupon.usagePerUser > 1 ? 's' : ''}.`,
+        });
+      }
+    }
     if (coupon.minOrderValue && authoritativeSubtotal < coupon.minOrderValue) {
       throw httpError(400, {
         success: false,
@@ -280,6 +343,9 @@ async function resolveCartCoupon(req, { items, menuById, authoritativeSubtotal }
     const scopedItems = items.map((it) => {
       const m = menuById.get(String(it.menuItem));
       return {
+        // Decision 6 — the category's Food / Drink kind wins over the
+        // prep-station fallback (a Coke routed to the counter is a beverage).
+        categoryKind: menuCategoryKind(m) || undefined,
         prepStation: (m?.prepStation || 'kitchen'),
         price: Number(it.price) || 0,
         quantity: Number(it.quantity) || 0,
@@ -298,8 +364,11 @@ async function resolveCartCoupon(req, { items, menuById, authoritativeSubtotal }
     // shipping_discount / bogo aren't priced at create time (handled elsewhere).
     authoritativeCouponDiscount = Math.min(Math.max(0, discount), authoritativeSubtotal);
     authoritativeCouponCode = coupon.code;
+    couponId = coupon._id;
   }
-  return { authoritativeCouponCode, authoritativeCouponDiscount };
+  // couponId pins the exact coupon doc for the in-transaction usage
+  // write (codes are only unique per tenant + branch).
+  return { authoritativeCouponCode, authoritativeCouponDiscount, couponId };
 }
 
 // Server-side loyalty-points validation.
@@ -310,7 +379,9 @@ async function resolvePointsRedemption(req, { validUserId, settings, authoritati
   // client's claimed value. Guests (no login) can't redeem points.
   let authoritativePointsRedeemed = 0;
   let authoritativePointsValue = 0;                 // rupees the points are worth
-  const requestedPoints = Number(req.body.pointsRedeemed) || 0;
+  // Whole points only — a fractional request (10.7) would leave a
+  // fractional points balance behind.
+  const requestedPoints = Math.floor(Number(req.body.pointsRedeemed) || 0);
   if (requestedPoints > 0) {
     if (!req.user || !validUserId) {
       throw httpError(400, {
@@ -323,19 +394,30 @@ async function resolvePointsRedemption(req, { validUserId, settings, authoritati
       user: validUserId,
       ...tenantFilter(req),
     }).lean();
-    const available = Math.max(0, Number(wallet?.loyaltyPoints) || 0);
+    const available = Math.max(0, Math.floor(Number(wallet?.loyaltyPoints) || 0));
     authoritativePointsRedeemed = Math.min(requestedPoints, available);
     const { pointsToRupee } = resolveLoyaltySettings(settings);
-    authoritativePointsValue = Math.round(
-      authoritativePointsRedeemed * (Number(pointsToRupee) || 0) * 100
-    ) / 100;
-    // Don't let points push the post-coupon bill below zero.
-    const maxRedeemableRupees = Math.max(0, authoritativeSubtotal - authoritativeCouponDiscount);
+    const rate = Number(pointsToRupee) || 0;
+    authoritativePointsValue = Math.round(authoritativePointsRedeemed * rate * 100) / 100;
+    // Don't let points push the post-coupon bill below zero, nor pay
+    // more than the tenant's Settings.wallet.maxRedeemPercent (default
+    // 50 %) of the subtotal.
+    const rawPct = Number(settings?.wallet?.maxRedeemPercent);
+    const maxRedeemPercent = settings?.wallet?.maxRedeemPercent != null && Number.isFinite(rawPct)
+      ? Math.min(100, Math.max(0, rawPct))
+      : 50;
+    const maxRedeemableRupees = Math.max(0, Math.min(
+      authoritativeSubtotal - authoritativeCouponDiscount,
+      Math.round(authoritativeSubtotal * maxRedeemPercent) / 100,
+    ));
     if (authoritativePointsValue > maxRedeemableRupees) {
-      authoritativePointsValue = maxRedeemableRupees;
-      authoritativePointsRedeemed = pointsToRupee > 0
-        ? Math.floor(authoritativePointsValue / pointsToRupee)
+      authoritativePointsRedeemed = rate > 0
+        ? Math.floor((maxRedeemableRupees / rate) + 1e-9)
         : 0;
+      authoritativePointsValue = Math.min(
+        maxRedeemableRupees,
+        Math.round(authoritativePointsRedeemed * rate * 100) / 100,
+      );
     }
   }
   return { authoritativePointsRedeemed, authoritativePointsValue };
@@ -460,6 +542,12 @@ async function computeTaxBreakdown(req, {
       subtotal: authoritativeSubtotal,
       taxConfig: toTaxConfig(taxSettings?.taxes),
       orderType: deliveryReq?.requested ? 'delivery' : type,
+      // The coupon must go IN (not be subtracted afterwards): GST is
+      // levied on the discounted value (subtotal − coupon).
+      couponDiscount: authoritativeCouponDiscount,
+      pointsRedeemed: authoritativePointsValue,
+      tipAmount: authoritativeTip,
+      deliveryFee: authoritativeDeliveryFee,
     });
   } catch (err) {
     // Never block an order on a settings read (createOrder has already
@@ -478,13 +566,10 @@ async function computeTaxBreakdown(req, {
     additionalChargesTotal: serverBill.additionalChargesTotal,
   };
 
-  // The full server bill: taxed subtotal, then discounts off, tip and
-  // delivery on (same order of operations as utils/billing.computeBill).
-  const exactTotal = Math.max(0, Math.round((
-    serverBill.total
-    - authoritativeCouponDiscount - authoritativePointsValue
-    + authoritativeTip + authoritativeDeliveryFee
-  ) * 100) / 100);
+  // The full server bill: GST on (subtotal − coupon), service and
+  // additional charges on the gross subtotal, then coupon and points
+  // off, tip and delivery on — all inside utils/billing.computeBill.
+  const exactTotal = serverBill.total;
 
   const isStaffCaller = !!(req.user && STAFF_CALLER_ROLES.has(req.user.role));
   if (isStaffCaller) {
@@ -594,6 +679,8 @@ function enrichCartItems(items, menuById) {
       selectedToppings,
       vegType: menu?.vegType || item.vegType || '',
       category: canonicalCategory,
+      // Decision 6 — Food / Drink kind snapshot for coupon scoping.
+      categoryKind: menuCategoryKind(menu) || undefined,
       prepStation: resolvedStation,
       prepTimeMinutes,
     };
@@ -617,62 +704,97 @@ function insufficientStockBody(stockCheck) {
 
 // Validate + canonically price the items a waiter appends to an order.
 // Returns the enriched line items and the bare item delta (no tax).
+//
+// Same rules as createOrder's priceCartItems: every line must resolve to
+// an orderable menu item of this tenant (unknown / foreign / missing id,
+// archived or out-of-window item → 400 — never a client-priced line), the
+// size price + offer is charged when a size is picked, toppings are
+// charged at their menu price, and a line holds at most 999.
 function buildAppendItems(items, menuById, branch) {
   const { resolvePrice } = require('../utils/priceResolver');
+  const { menuItemUnavailableReason, MAX_LINE_QUANTITY } = require('./orderHelpers');
+  const norm = (v) => String(v ?? '').trim().toLowerCase();
+  // One timestamp for the whole batch so the chef card groups it.
+  const now = new Date();
   let deltaTotal = 0;
   const enrichedItems = [];
   for (const item of items) {
     const menu = item.menuItem && menuById.get(String(item.menuItem));
+    if (!menu) {
+      throw httpError(400, { success: false, code: 'ITEM_NOT_FOUND', message: `Unknown menu item: ${item.name || item.menuItem || '(none)'}` });
+    }
+    const unavailable = menuItemUnavailableReason(menu, now);
+    if (unavailable) {
+      throw httpError(400, { success: false, code: 'ITEM_UNAVAILABLE', message: `${menu.name} is ${unavailable}.` });
+    }
     const qty = Math.max(1, Math.floor(Number(item.quantity) || 1));
-    const resolvedMenu = menu ? resolvePrice(menu, branch) : null;
-    const basePrice = resolvedMenu ? (Number(resolvedMenu.finalPrice) || 0) : (Number(item.price) || 0);
+    if (qty > MAX_LINE_QUANTITY) {
+      throw httpError(400, {
+        success: false,
+        code: 'QUANTITY_EXCEEDED',
+        message: `Quantity ${qty} for "${menu.name}" exceeds the per-item limit.`,
+      });
+    }
+    const unitPrice = canonicalUnitPrice(menu, resolvePrice(menu, branch), item);
 
-    if (Array.isArray(item.selectedToppings) && item.selectedToppings.length > 0) {
-      if (!menu) {
-        throw httpError(400, { success: false, message: `Unknown menu item: ${item.name || item.menuItem}` });
-      }
-      const canonical = new Map((menu.toppings || []).map(t => [String(t.name).trim().toLowerCase(), Number(t.price)]));
+    const canonical = new Map((menu.toppings || []).map(t => [norm(t.name), t]));
+    const selectedToppings = [];
+    if (Array.isArray(item.selectedToppings)) {
       for (const st of item.selectedToppings) {
-        const key = String(st?.name || '').trim().toLowerCase();
+        const key = norm(st?.name);
         const real = canonical.get(key);
-        if (!key || real === undefined) {
+        if (!key || !real) {
           throw httpError(400, { success: false, message: `Invalid topping "${st?.name || ''}" for ${menu.name}` });
         }
-        if (!Number.isFinite(Number(st.price)) || Math.abs(Number(st.price) - real) > 0.01) {
+        if (!Number.isFinite(Number(st.price)) || Math.abs(Number(st.price) - Number(real.price)) > 0.01) {
           throw httpError(400, { success: false, message: `Topping price mismatch for "${st.name}" on ${menu.name}` });
         }
+        selectedToppings.push({ ...(st?.id ? { id: String(st.id) } : {}), name: real.name, price: Number(real.price) });
+      }
+    }
+    const toppingSum = selectedToppings.reduce((sum, t) => sum + t.price, 0);
+    deltaTotal += (unitPrice + toppingSum) * qty;
+
+    // Record only the size that was priced (the first), as spelled on
+    // the menu doc — mirrors enrichCartItems.
+    let selectedSizes = [];
+    const firstSize = Array.isArray(item.selectedSizes) && item.selectedSizes.length ? item.selectedSizes[0] : null;
+    if (firstSize && firstSize.name) {
+      const canonicalSize = (menu.sizes || []).find((sz) => norm(sz.name) === norm(firstSize.name));
+      if (canonicalSize) {
+        selectedSizes = [{
+          ...(firstSize.id ? { id: String(firstSize.id) } : {}),
+          name: canonicalSize.name,
+          priceDetails: firstSize.priceDetails,
+        }];
       }
     }
 
-    const toppingSum = Array.isArray(item.selectedToppings)
-      ? item.selectedToppings.reduce((s, t) => s + (Number(t.price) || 0), 0)
-      : 0;
-    deltaTotal += (basePrice + toppingSum) * qty;
-
-    const menuPrep = Number(menu?.prepTimeMinutes);
+    const menuPrep = Number(menu.prepTimeMinutes);
     const prepTimeMinutes = Number.isFinite(menuPrep) && menuPrep >= 0
       ? Math.min(menuPrep, 240)
       : 15;
     enrichedItems.push({
       menuItem: item.menuItem,
-      // Canonical menu name / category / vegType when the item is on
-      // the menu (never the client's label).
-      name: menu?.name || item.name || '',
-      price: basePrice,
+      // Canonical menu name / category / vegType (never the client's label).
+      name: menu.name || '',
+      price: unitPrice,
       quantity: qty,
-      category: menu?.category?.name || item.category || '',
-      vegType: menu?.vegType || item.vegType || '',
-      selectedToppings: item.selectedToppings || [],
-      selectedSizes: item.selectedSizes || [],
+      category: menu.category?.name || item.category || '',
+      // Decision 6 — Food / Drink kind snapshot for coupon scoping.
+      categoryKind: menuCategoryKind(menu) || undefined,
+      vegType: menu.vegType || item.vegType || '',
+      selectedToppings,
+      selectedSizes,
       instructions: item.instructions || '',
       prepTimeMinutes,
       // Explicit timestamp so the chef card can split the newly-added
-      // items from the original order. The schema default would also
-      // set this, but pinning to a single `now` keeps all items from
-      // one append batch grouped under the exact same moment.
-      addedAt: new Date(),
+      // items from the original order. Every line of one append batch
+      // shares the same moment so the batch stays grouped.
+      addedAt: now,
     });
   }
+  deltaTotal = Math.round(deltaTotal * 100) / 100;
   return { enrichedItems, deltaTotal };
 }
 
@@ -710,9 +832,16 @@ async function applyAppendToBill(req, order, subtotalBefore, fallbackDelta) {
  * NEW order built from already-priced line items — used by the repeat
  * flows, which used to store the bare item subtotal as the total.
  * Falls back to the bare subtotal if tenant settings can't be read.
+ *
+ * `bareSiblingSubtotal` — mixed kitchen + counter repeat: the counter
+ * items went to their own doc at their bare subtotal (like createOrder's
+ * split), so this doc carries the tax lines of the WHOLE repeat and its
+ * total is the full bill minus that bare counter amount. The two docs
+ * then sum to exactly the bill of the combined cart.
  */
-async function applyNewOrderBill(req, order) {
-  const subtotal = lineItemsSubtotal(order.items);
+async function applyNewOrderBill(req, order, { bareSiblingSubtotal = 0 } = {}) {
+  const extra = Math.max(0, Number(bareSiblingSubtotal) || 0);
+  const subtotal = lineItemsSubtotal(order.items) + extra;
   try {
     const settings = await getSettings(req);
     const next = billFieldsForNewOrder({
@@ -720,7 +849,7 @@ async function applyNewOrderBill(req, order) {
       taxConfig: toTaxConfig(settings?.taxes),
       orderType: billOrderType(order),
     });
-    order.total = next.total;
+    order.total = round2(next.total - extra);
     order.gst = next.gst;
     order.gstPercentage = next.gstPercentage;
     order.serviceCharge = next.serviceCharge;
@@ -729,7 +858,7 @@ async function applyNewOrderBill(req, order) {
     order.additionalChargesTotal = next.additionalChargesTotal;
   } catch (err) {
     logger.warn('New-order bill compute failed; using bare subtotal:', err.message);
-    order.total = round2(subtotal);
+    order.total = round2(subtotal - extra);
   }
 }
 

@@ -120,8 +120,9 @@ function checkWalletRechargePayment({ payment, rzpOrder, razorpayOrderId, userId
  * Cafe-order verify: decide whether this Razorpay payment may settle
  * this cafe order.
  *
- *   - When the order carries a stamped razorpayOrderId, it MUST equal
- *     the checkout's order id.
+ *   - When the order carries stamped checkout ids (razorpayOrderId /
+ *     razorpayOrderIds), the checkout's order id MUST be one of them —
+ *     any checkout opened for this order may settle it (decision 4a).
  *   - Otherwise (deferred takeaway: Razorpay order created before the
  *     cafe order existed) the Razorpay order's server-set notes must be
  *     a cafe-order checkout for this tenant whose cafeOrderId is either
@@ -143,8 +144,11 @@ function checkOrderPaymentBinding({ order, payment, rzpOrder, razorpayOrderId, t
         return fail(403, 'TENANT_MISMATCH', 'This payment belongs to a different restaurant.');
     }
 
-    if (order.razorpayOrderId) {
-        if (order.razorpayOrderId !== razorpayOrderId) {
+    const linked = orderCheckoutIds(order);
+    if (linked.length) {
+        // Decision 4a: a payment through ANY checkout opened for this
+        // order settles it (not only the latest one).
+        if (!linked.includes(razorpayOrderId)) {
             return fail(400, 'RAZORPAY_ORDER_MISMATCH', 'Payment verification failed — Razorpay order ID mismatch.');
         }
     } else {
@@ -166,14 +170,44 @@ function checkOrderPaymentBinding({ order, payment, rzpOrder, razorpayOrderId, t
         }
     }
 
-    const total = Math.round((Number(order.total) || 0) * 100) / 100;
-    const priorPaid = Math.round((Number(order.amountPaid) || 0) * 100) / 100;
-    const due = (priorPaid > 0 && priorPaid < total) ? Math.round((total - priorPaid) * 100) / 100 : total;
-    if (base.amount < due - 1) {
-        return fail(400, 'AMOUNT_INSUFFICIENT',
-            `Payment verification failed — captured amount (₹${base.amount}) does not cover order total (₹${due}).`);
+    const cover = checkCaptureCoversDue({ order, amount: base.amount });
+    if (!cover.ok) return cover;
+    return { ok: true, amount: base.amount, priorPaid: cover.priorPaid, total: cover.total };
+}
+
+// Every Razorpay checkout (order id) linked to a cafe order: the latest
+// `razorpayOrderId` plus the history in `razorpayOrderIds` (decision 4a).
+function orderCheckoutIds(order) {
+    const ids = [];
+    if (order?.razorpayOrderId) ids.push(String(order.razorpayOrderId));
+    for (const id of order?.razorpayOrderIds || []) {
+        if (id && !ids.includes(String(id))) ids.push(String(id));
     }
-    return { ok: true, amount: base.amount, priorPaid, total };
+    return ids;
+}
+
+// What is still owed on an order: the full total, or — after a partial
+// (wallet) payment — total minus what was already paid.
+function orderAmountDue(order) {
+    const total = Math.round((Number(order?.total) || 0) * 100) / 100;
+    const priorPaid = Math.round((Number(order?.amountPaid) || 0) * 100) / 100;
+    const due = (priorPaid > 0 && priorPaid < total) ? Math.round((total - priorPaid) * 100) / 100 : total;
+    return { total, priorPaid, due };
+}
+
+/**
+ * Does a captured amount (₹) cover what is due on the order? ₹1
+ * tolerance for rounding. Shared by verify-payment, the webhook and
+ * reconciliation so an underpaid capture never settles an order.
+ */
+function checkCaptureCoversDue({ order, amount }) {
+    const { total, priorPaid, due } = orderAmountDue(order);
+    const captured = Math.round((Number(amount) || 0) * 100) / 100;
+    if (captured < due - 1) {
+        return fail(400, 'AMOUNT_INSUFFICIENT',
+            `Payment verification failed — captured amount (₹${captured}) does not cover order total (₹${due}).`);
+    }
+    return { ok: true, amount: captured, priorPaid, total, due };
 }
 
 /**
@@ -248,6 +282,9 @@ module.exports = {
     checkSettledPayment,
     checkWalletRechargePayment,
     checkOrderPaymentBinding,
+    orderCheckoutIds,
+    checkCaptureCoversDue,
+    orderAmountDue,
     checkOrphanRefundEligibility,
     resolveBookingPaymentOutcome,
 };

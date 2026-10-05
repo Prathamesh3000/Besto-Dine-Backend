@@ -97,7 +97,12 @@ exports.getCakes = async (req, res) => {
       'sizes.0': { $exists: true },
       ...tf,
       ...bf,
-    });
+    })
+      // QA N8/N9 — the cake step only needs these; the full MenuItem
+      // documents (descriptions, recipes, every image…) made the payload
+      // heavy for a picker that renders a name + one thumbnail.
+      .select('name vegType images image sizes')
+      .lean();
 
     res.status(200).json({ success: true, cakes });
   } catch (err) {
@@ -162,29 +167,15 @@ exports.getAddons = async (req, res) => {
   }
 };
 
+// Parking config for the customer's Parking step (QA N10/N11): vehicle
+// types with hourly rates, the max custom duration, and the hours billed
+// for "whole event" parking. Same resolver the booking pricing uses, so
+// what the customer sees is what the server charges.
 exports.getParkingRates = async (req, res) => {
   try {
-    const Settings = require('../models/settings');
-    const settings = await Settings.findOne(tenantFilter(req)).lean();
-    const parkingConfig = settings?.parking;
-
-    // Return from settings if configured, otherwise return defaults
-    if (parkingConfig && parkingConfig.vehicles && parkingConfig.vehicles.length > 0) {
-      return res.status(200).json({ success: true, parking: parkingConfig });
-    }
-
-    // Default parking rates
-    res.status(200).json({
-      success: true,
-      parking: {
-        vehicles: [
-          { id: 'bike', label: 'Bike', pricePerHour: 20 },
-          { id: 'car', label: 'Car', pricePerHour: 50 },
-          { id: 'bus', label: 'Bus', pricePerHour: 100 }
-        ],
-        maxDuration: 6
-      }
-    });
+    const { loadParkingConfig } = require('../utils/parkingConfig');
+    const parking = await loadParkingConfig(tenantFilter(req));
+    res.status(200).json({ success: true, parking });
   } catch (err) {
     sendServerError(res, err, 'bookingInfoController.getParkingRates');
   }
@@ -414,7 +405,8 @@ exports.updatePackage = async (req, res) => {
     const updated = await Package.findOneAndUpdate(
       { _id: id, ...tenantFilter(req), ...strictBranchFilter(req) },
       updateData,
-      { returnDocument: 'after' }
+      // runValidators: the schema refuses negative prices / headcounts.
+      { returnDocument: 'after', runValidators: true }
     );
     if (!updated) return res.status(404).json({ success: false, message: 'Package not found' });
     res.status(200).json({ success: true, package: updated });

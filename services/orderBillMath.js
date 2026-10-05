@@ -37,9 +37,10 @@ function lineItemsSubtotal(items) {
 //
 // For an ordinary order (stored breakdown == bill(own items)) this is
 // exactly the from-scratch recompute:
-//   total' = bill(all items).total − coupon − points + tip + delivery.
-// Coupon discount, redeemed points, tip and delivery fee are carried
-// through untouched. Applying the difference instead of overwriting also
+//   total' = bill(all items, coupon).total − points + tip + delivery.
+// GST is levied on (subtotal − coupon), so both bills use the order's
+// stored couponDiscount as the GST base reduction. Coupon discount,
+// redeemed points, tip and delivery fee are carried through untouched. Applying the difference instead of overwriting also
 // keeps two real cases correct that a blind overwrite would break:
 //   • mixed-cart split: the kitchen doc's breakdown was computed on the
 //     whole cart (it also carries the counter items' tax), and
@@ -63,10 +64,18 @@ function billOrderType(order) {
  * @param {number} p.subtotalAfter   item subtotal after the append
  * @param {object} p.taxConfig       toTaxConfig(settings.taxes)
  * @param {string} p.orderType       'dine-in' | 'takeaway' | 'delivery'
+ * @param {number} [p.couponDiscount] order's coupon (GST base is
+ *                                   subtotal − coupon); defaults to
+ *                                   bill.couponDiscount
  */
-function recomputeBillAfterAppend({ bill = {}, subtotalBefore = 0, subtotalAfter = 0, taxConfig = {}, orderType = 'dine-in' }) {
-  const before = computeBill({ subtotal: subtotalBefore, taxConfig, orderType });
-  const after = computeBill({ subtotal: subtotalAfter, taxConfig, orderType });
+function recomputeBillAfterAppend({ bill = {}, subtotalBefore = 0, subtotalAfter = 0, taxConfig = {}, orderType = 'dine-in', couponDiscount }) {
+  // GST is levied on (subtotal − coupon), so both sides of the
+  // difference use the order's stored coupon: the appended items are
+  // taxed in full, and a coupon that exceeded the old subtotal (GST base
+  // floored at 0) is still honoured once the subtotal grows past it.
+  const coupon = couponDiscount !== undefined ? num(couponDiscount) : num(bill.couponDiscount);
+  const before = computeBill({ subtotal: subtotalBefore, taxConfig, orderType, couponDiscount: coupon });
+  const after = computeBill({ subtotal: subtotalAfter, taxConfig, orderType, couponDiscount: coupon });
 
   const gst = round2(Math.max(0, num(bill.gst) + after.gst - before.gst));
   const serviceCharge = round2(Math.max(0, num(bill.serviceCharge) + after.serviceCharge - before.serviceCharge));
@@ -127,8 +136,37 @@ function billFieldsForNewOrder({ subtotal = 0, taxConfig = {}, orderType = 'dine
   };
 }
 
+/**
+ * Pure. New money fields for an order whose coupon changes from
+ * `oldCoupon` to `newCoupon` (either may be 0 — apply / swap / clear).
+ *
+ * GST is levied on (subtotal − coupon), so a coupon change moves BOTH
+ * the discount line and the GST line. The GST rate used is the one
+ * STAMPED on the order (bill.gstPercentage) — never the live setting —
+ * so a later admin rate change does not leak into an open bill. As with
+ * the append recompute the difference is applied to the stored figures
+ * (legacy orders with no stamped rate keep a zero GST delta):
+ *
+ *   gst'   = gst + gstOn(sub − new) − gstOn(sub − old)
+ *   total' = total + old − new + (gst' − gst)
+ *
+ * Service charge and additional charges are on the gross subtotal and
+ * do not move.
+ */
+function recomputeBillForCoupon({ bill = {}, subtotal = 0, oldCoupon = 0, newCoupon = 0 }) {
+  const pct = num(bill.gstPercentage);
+  const sub = round2(num(subtotal));
+  const gstOn = (coupon) => round2(Math.max(0, round2(sub - num(coupon))) * (pct / 100));
+  const storedGst = num(bill.gst);
+  const gst = round2(Math.max(0, storedGst + gstOn(newCoupon) - gstOn(oldCoupon)));
+  const total = round2(Math.max(0,
+    num(bill.total) + num(oldCoupon) - num(newCoupon) + (gst - storedGst)));
+  return { gst, total };
+}
+
 module.exports = {
   round2,
+  recomputeBillForCoupon,
   lineItemsSubtotal,
   billOrderType,
   recomputeBillAfterAppend,

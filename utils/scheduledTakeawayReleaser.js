@@ -30,19 +30,25 @@ const TICK_INTERVAL_MS = 60 * 1000;        // 60 s — granularity of "release"
 // whose timers are out of phase — a duplicate order:new is harmless, a
 // missed one is not.
 const RELEASE_GRACE_MS = TICK_INTERVAL_MS + 15 * 1000;
+// Max createdAt → release gap: parsePickupAt wraps a pickup at most one
+// day past createdAt.
+const CANDIDATE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 async function releaseTick() {
     try {
         const now = Date.now();
-        // Pull every still-pending takeaway in the rolling 6 h window.
-        // 6 h is wider than the longest realistic future-pickup gap;
-        // if a tenant offers next-day takeaway later we'd widen here.
-        const sixHoursAgo = new Date(now - 6 * 60 * 60 * 1000);
+        // Pull every still-pending takeaway that could release now. The
+        // release instant (pickup − lead), not createdAt, decides — and
+        // parsePickupAt never places a pickup more than 24 h after
+        // createdAt, so a 24 h createdAt window covers every order whose
+        // release can be due (a 09:00 order for a 10:30 PM pickup
+        // releases 13 h after creation). The window only bounds the scan.
+        const windowStart = new Date(now - CANDIDATE_WINDOW_MS);
         const candidates = await Order.find({
             type: 'takeaway',
             status: 'new',
             pickupTime: { $exists: true, $ne: null },
-            createdAt: { $gte: sixHoursAgo },
+            createdAt: { $gte: windowStart },
         }).select('_id orderId restaurant branch createdAt pickupTime').lean();
 
         const io = getIO();

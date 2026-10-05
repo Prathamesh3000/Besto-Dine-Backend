@@ -61,7 +61,14 @@ const notificationSchema = new mongoose.Schema({
     // without reading every Indoor one. The Requests screen already
     // had floor pills; the notification list had no area data at all,
     // so it couldn't offer the same.
-    area: String
+    area: String,
+    // Advance-booking notifications: human booking code (BKT-/BKH-…),
+    // the booking document id and refund figures, so the admin's
+    // "refund due" alert links back to the booking machine-readably.
+    bookingId: String,
+    bookingDocId: String,
+    refundAmount: Number,
+    refundPct: Number
   },
   priority: {
     type: String,
