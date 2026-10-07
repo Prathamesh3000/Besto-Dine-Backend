@@ -9,8 +9,10 @@ const { validate, objectIdParam } = require('../middlewares/validate');
 // Malformed :id → 400 here instead of a CastError 500 in the controller.
 const idRules = validate([objectIdParam('id', 'Invalid campaign id')]);
 
-// Marketing campaigns are part of the `couponPromotions` feature bundle.
-router.use(auth.protect, auth.adminOnly, attachTenant, featureGate('couponPromotions'));
+// Marketing campaigns are their own module (`campaigns`). Tenants whose
+// plan snapshot pre-dates that key fall back to `couponPromotions`, which
+// used to cover campaigns (utils/featureAccess LEGACY_FALLBACK).
+router.use(auth.protect, auth.adminOnly, attachTenant, featureGate('campaigns'));
 
 router.get('/',             campaignController.getCampaigns);
 router.get('/stats',        campaignController.getCampaignStats);

@@ -15,7 +15,7 @@ const { getSettings } = require('../utils/settingsCache');
 const { getIO, emitToWaiter } = require('../utils/socket');
 const { verifyUserToken, loadUserForToken } = require('../middlewares/authMiddleware');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
-const { releaseTableAfterOrderClosed } = require('../utils/tableOccupancy');
+const { releaseTableIfSettled } = require('../utils/tableOccupancy');
 const { createTipForPaidOrder } = require('../utils/tipHelpers');
 const {
   VALID_TRANSITIONS,
@@ -26,7 +26,7 @@ const {
   STATUS_TIMESTAMP_FIELD,
 } = require('../utils/orderLifecycle');
 const { httpError, reply } = require('./orderErrors');
-const { emitOrderEvent, emitStaffTable } = require('./orderHelpers');
+const { emitOrderEvent } = require('./orderHelpers');
 const { notifyStatusTransition, emitStatusUpdateEvents, notify } = require('./orderNotifications');
 const { recordPaidOrderLedger } = require('./orderPaymentService');
 
@@ -168,19 +168,15 @@ function applyPaymentFields(oldOrder, body, updateData) {
   // Bill-paid auto-close for dine-in.
   //
   // The waiter's PaymentOption flow sends only payment fields (no
-  // status) when settling a bill. Without this, the order stays at
-  // whatever status it was (ready / preparing / served) and the
-  // table-release branch below — which is gated on a transition to
-  // 'served' / 'cancelled' — never fires, so the table stays
-  // 'occupied' forever after the guest leaves. Treat "fully paid on
-  // a dine-in order" as the real end of the session: promote to
-  // 'served' so the terminal-state table release runs in the same
-  // update. Idempotent: if the order is already 'served' or
-  // 'cancelled', we leave the status alone (payment still updates).
+  // status) when settling a bill. Treat "fully paid on a dine-in
+  // order" as the end of the service: promote it to 'served' so it
+  // leaves the waiter's pickup queue. (The table itself is released by
+  // releaseTableIfDone on payment regardless of kitchen status.)
+  // Idempotent: if the order is already 'served' or 'cancelled', we
+  // leave the status alone (payment still updates).
   //
   // Only when the state machine allows → served: a 'new' order (paid
-  // up-front) must still go through the kitchen — it stays on the KDS
-  // and the table is released once it is actually served.
+  // up-front) must still go through the kitchen — it stays on the KDS.
   if (
     paymentStatus === 'Paid' &&
     oldOrder.type === 'dine-in' &&
@@ -400,38 +396,32 @@ function runInventoryHooks(req, status, oldOrder, order) {
   }
 }
 
-// Release the table once cancelled, or served AND paid.
-async function releaseTableIfDone(order, tf) {
-  // Free the table only when the customer is actually done — i.e. the
-  // order is now cancelled, OR it is both served AND paid. Marking an
-  // order "served" alone means the food is on the table; the customer
-  // is still eating and hasn't settled the bill, so freeing the table
-  // then wipes out the pending bill and loses payment. Previously this
-  // path freed the table on `served` alone, which is why "click Serve
-  // → table shows Free → no bill to collect" was happening.
-  //
-  // Inspect the post-save order (not the request params) so we also
-  // catch the pay-after-serve ordering: waiter marks served first,
-  // then admin collects payment — second call sees `served && Paid`
-  // here and releases the table correctly.
-  const nowCancelled = order.status === 'cancelled';
-  const nowServedPaid = order.status === 'served' && order.paymentStatus === 'Paid';
-  const reachedTerminal = nowCancelled || nowServedPaid;
-  if (order.table && reachedTerminal) {
-    try {
-      // releaseTableAfterOrderClosed returns all table IDs it just freed:
-      //   • single table → [order.table]
-      //   • merged group → every sibling (leader + mergedWith)
-      //   • another open order still on the table → [] (table stays
-      //     occupied; activeOrder repointed to the remaining order)
-      // Emitting a table:updated for each keeps the dashboard and
-      // waiter grid in sync without a full refetch.
-      const { freedIds: ids } = await releaseTableAfterOrderClosed(order, tf);
-      for (const id of ids) {
-        emitStaffTable('table:updated', { tableId: id, status: 'free' }, order.branch);
-      }
-    } catch (err) { logger.warn('Failed to free table on status change:', err.message); }
-  }
+// Release the table once every order on it is settled.
+//
+// Table-status rule (utils/tableOccupancy.releaseTableIfSettled): a
+// dine-in table turns Free the moment no order on it (or its merge
+// group) is unsettled — kitchen status no longer matters. So the table
+// is re-checked whenever this update
+//   • cancelled the order,
+//   • settled it (→ Paid / Refunded), or
+//   • served an order that was already paid (pay-first orders keep the
+//     table until the food is on it; also drops the seat reservations
+//     freeTableOrUnmergeGroup kept while that order was cooking).
+// A paid order still in the kitchen stays on the KDS as before. When
+// another party's order is still unpaid the table stays occupied and
+// activeOrder is repointed to that order. The helper emits
+// `table:updated` for every freed id.
+async function releaseTableIfDone(oldOrder, order, tf) {
+  if (!order.table) return;
+  const SETTLED = ['Paid', 'Refunded'];
+  const nowSettled = SETTLED.includes(order.paymentStatus);
+  const justCancelled = order.status === 'cancelled' && oldOrder.status !== 'cancelled';
+  const justSettled = nowSettled && !SETTLED.includes(oldOrder.paymentStatus);
+  const justServedPaid = nowSettled && order.status === 'served' && oldOrder.status !== 'served';
+  if (!justCancelled && !justSettled && !justServedPaid) return;
+  try {
+    await releaseTableIfSettled(order, tf, { branch: order.branch || null, restaurant: order.restaurant });
+  } catch (err) { logger.warn('Failed to free table on status change:', err.message); }
 }
 
 async function updateOrderStatus(req) {
@@ -500,7 +490,7 @@ async function updateOrderStatus(req) {
   await clearFloorAlertsOnClose(status, oldOrder, order, tf);
   await settleSiblingDineInRounds(paymentStatus, oldOrder, order, tf);
   runInventoryHooks(req, status, oldOrder, order);
-  await releaseTableIfDone(order, tf);
+  await releaseTableIfDone(oldOrder, order, tf);
   await notifyStatusTransition({ status, oldOrder, order });
 
   const justPaid = order.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
@@ -512,6 +502,11 @@ async function updateOrderStatus(req) {
   // the waiter earned the tip either way.
   if (justPaid) {
     await createTipForPaidOrder(order, tenantId(req));
+    // Optional auto bill on settlement (Settings → Printers → "Bill when
+    // paid", off by default). Cash at the counter also pops the drawer.
+    require('./printService').enqueueBillJob({
+      order, reason: 'paid', openDrawer: /cash/i.test(String(order.paymentMethod || '')),
+    }).catch(() => {});
   }
 
   // Side Effect: Record transaction if status changes to 'Paid' and wasn't before
@@ -610,13 +605,14 @@ async function pickupOrder(req) {
     logger.warn(`Notification cleanup failed for ${order.orderId}: ${err.message}`);
   }
 
-  // Free the table only when the bill has already been settled. Marking
-  // an order served ≠ customer left — they're still eating. Freeing the
-  // table here would drop the pending bill (the admin dashboard would
-  // then show the table free with no way to collect payment).
-  const settled = order.paymentStatus === 'Paid';
+  // Free the table when the bill has already been settled (pay-first
+  // order now served). Unpaid → the diners are still eating and owe the
+  // bill, so the table stays occupied. releaseTableIfSettled also keeps
+  // the table occupied while another party's order is unpaid, and emits
+  // `table:updated` for every freed table.
+  const settled = order.paymentStatus === 'Paid' || order.paymentStatus === 'Refunded';
   if (order.table && settled) {
-    try { await releaseTableAfterOrderClosed(order, tf); }
+    try { await releaseTableIfSettled(order, tf, { branch: order.branch || null, restaurant: order.restaurant }); }
     catch (err) { logger.warn('Failed to free table on pickup:', err.message); }
   }
 
@@ -629,8 +625,8 @@ async function pickupOrder(req) {
   } catch (err) { logger.warn('Tip creation on pickup failed (non-fatal):', err.message); }
 
   // Socket.io — notify dashboards + the owning customer of pickup.
-  // Only emit the table-freed event when we actually freed the table.
-  // Include servedAt in the payload so the customer tracking timeline
+  // (The table-freed event comes from releaseTableIfSettled, only when
+  // it actually freed the table.) Include servedAt in the payload so the customer tracking timeline
   // can update its "Served" step optimistically without a refetch.
   try {
     emitOrderEvent(
@@ -643,9 +639,6 @@ async function pickupOrder(req) {
       },
       order
     );
-    if (order.table && settled) {
-      emitStaffTable('table:updated', { tableId: order.table, status: 'free' }, order.branch);
-    }
   } catch { /* socket not critical */ }
 
   return reply(200, { success: true, order });

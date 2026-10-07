@@ -25,7 +25,10 @@ const csvUpload = multer({
         const okMime = ['text/csv', 'application/vnd.ms-excel', 'text/plain', 'application/csv']
             .includes(file.mimetype);
         if (okExt || okMime) return cb(null, true);
-        cb(new Error('Only .csv files are allowed'), false);
+        const err = new Error('Only .csv files are allowed');
+        err.status = 400;
+        err.expose = true;
+        cb(err, false);
     },
 });
 

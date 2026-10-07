@@ -309,7 +309,14 @@ async function notifyCounterPaymentRequested(req, { order, payableTotal, tableLa
   try {
     const tenant = tenantId(req);
     const orderBranch = order.branch || null;
-    const payload = { orderId: order.orderId, amount: payableTotal, table: tableLabel };
+    // tableId lets the admin's "Settle cash" CTA open that table's drawer
+    // in the admin Tables screen (the label alone can be ambiguous).
+    const payload = {
+      orderId: order.orderId,
+      amount: payableTotal,
+      table: tableLabel,
+      tableId: order.table ? order.table.toString() : null,
+    };
     await notify({
       restaurant: tenant,
       branch: orderBranch,

@@ -99,8 +99,26 @@ function autoRoomsFor(data = {}) {
         rooms.add(`table:${scan.tableId}`);
         if (scan.restaurantId) rooms.add(menuRoom(scan.restaurantId));
     }
+    // Print agents (typ:'agent' handshake) listen only on their branch's
+    // printer room — they have no role, so no staff rooms above.
+    if (data.agent && data.agent.restaurant && data.agent.branch) {
+        rooms.add(printerRoom(data.agent.restaurant, data.agent.branch));
+    }
     rooms.delete(null);
     return [...rooms];
+}
+
+/**
+ * `t:<rid>:printer:<branchId>` — the print agent(s) of one branch.
+ * Deliberately NOT in ROOM_ROLES / parseTenantRoom: staff `join`
+ * requests for it fall through canJoinWith and are refused, so only a
+ * socket authenticated with an agent token ever sits in it.
+ */
+function printerRoom(restaurantId, branchId) {
+    const t = toId(restaurantId);
+    const b = toId(branchId);
+    if (!t || !b) return null;
+    return `t:${t}:printer:${b}`;
 }
 
 /** Parse `t:<rid>:<role>[:<branchId>|:unbranched]` or `t:<rid>:menu`. */
@@ -229,6 +247,7 @@ module.exports = {
     toId,
     tenantRoom,
     menuRoom,
+    printerRoom,
     emitRoomsFor,
     listenRolesFor,
     autoRoomsFor,

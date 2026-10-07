@@ -5,6 +5,7 @@ const router = express.Router();
 const staffController = require('../controllers/staffController');
 const { protect, adminOnly, adminExclusive, checkPermission } = require('../middlewares/authMiddleware');
 const { validate, body, objectIdParam, optionalObjectId } = require('../middlewares/validate');
+const { featureGate } = require('../middlewares/featureGate');
 
 // ── Request validation (BUGS_REPORT #33) ────────────────────────────────
 // Type/shape checks only — staffController keeps its own business rules
@@ -63,7 +64,10 @@ const csvUpload = multer({
         const okMime = ['text/csv', 'application/vnd.ms-excel', 'text/plain', 'application/csv']
             .includes(file.mimetype);
         if (okExt || okMime) return cb(null, true);
-        cb(new Error('Only .csv files are allowed'), false);
+        const err = new Error('Only .csv files are allowed');
+        err.status = 400;
+        err.expose = true;
+        cb(err, false);
     },
 });
 
@@ -101,7 +105,7 @@ router.patch('/:id/status', ...staffGuard, validate([
 // PUT /api/staff/:id - Update staff details (admin + manager with permission)
 router.put('/:id', ...staffGuard, validate([staffIdParam, ...staffBodyRules({ allowNull: true })]), staffController.updateStaff);
 // GET /api/staff/:id/performance - Staff performance metrics (admin + manager)
-router.get('/:id/performance', protect, adminOnly, validate([staffIdParam]), staffController.getStaffPerformance);
+router.get('/:id/performance', protect, adminOnly, featureGate('staffPerformance'), validate([staffIdParam]), staffController.getStaffPerformance);
 // POST /api/staff/:id/reset-password - Issue a new temp password.
 // Branch Admins / branch-pinned Managers can reset passwords for staff
 // in their own branch only — controller enforces self-guard,

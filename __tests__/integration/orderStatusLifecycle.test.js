@@ -366,8 +366,11 @@ describe('mark-paid side effects', () => {
     test('settling one dine-in round settles the table\'s other unpaid rounds (amountPaid 0) and frees the table', async () => {
         const first = await dineIn();
         const sib = await dineIn({ table: first.table, scanToken: first.scanToken });
-        // Updated 2026-10: paid rounds still NEW stay in the kitchen (and
-        // keep the table), so both rounds are ready before settling.
+        // Updated 2026-10: paid rounds still NEW stay in the kitchen, so
+        // both rounds are made ready before settling to check the
+        // auto-serve of siblings. (Since the table-status rule the table
+        // frees on payment regardless of kitchen status — see
+        // tableStatus.test.js.)
         await forceStatus(first.order._id, 'ready');
         await forceStatus(sib.order._id, 'ready');
         const cancelled = await dineIn({ table: first.table, scanToken: first.scanToken });
@@ -473,7 +476,7 @@ describe('mark-paid side effects', () => {
         expect((await reload(order._id)).inventoryDeducted).toBe(false);
     });
 
-    // Regression (fixed 2026-10): releaseTableAfterOrderClosed keeps the table occupied while another open order remains on it.
+    // Regression (fixed 2026-10): releaseTableIfSettled (was releaseTableAfterOrderClosed) keeps the table occupied while another unpaid order remains on it.
     test('cancelling one of two open orders on a table keeps the table occupied', async () => {
         const first = await dineIn();
         const other = await dineIn({ table: first.table, scanToken: first.scanToken });

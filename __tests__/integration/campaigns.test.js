@@ -10,7 +10,8 @@
  *   PUT    /campaigns/:id        update
  *   DELETE /campaigns/:id        delete
  *
- * Every route: protect → adminOnly → attachTenant → couponPromotions gate.
+ * Every route: protect → adminOnly → attachTenant → campaigns gate (plan
+ * snapshots that pre-date the `campaigns` key fall back to couponPromotions).
  *
  * Tests whose name starts with "BUG:" pin behaviour the code gets wrong
  * today; they are expected to fail until the source is fixed.
@@ -30,7 +31,7 @@ const { defaultPermissionsForRole } = require(path.join(BACKEND, 'utils/staffDef
 const ctx = useIntegrationApp();
 let A;
 let B;
-let C;          // plan without couponPromotions
+let C;          // plan without campaigns
 let fc;
 let kt;
 let fcAdmin;
@@ -41,7 +42,7 @@ beforeAll(async () => {
     A = await seedTenant({ label: 'cm-a' });
     B = await seedTenant({ label: 'cm-b' });
     C = await seedTenant({ label: 'cm-c' });
-    await Restaurant.updateOne({ _id: C.restaurant._id }, { $set: { 'subscription.features.couponPromotions': false } });
+    await Restaurant.updateOne({ _id: C.restaurant._id }, { $set: { 'subscription.features.campaigns': false } });
     fc = await Branch.create({ restaurant: A.restaurant._id, name: 'FC Road', slug: 'fc-road', isActive: true });
     kt = await Branch.create({ restaurant: A.restaurant._id, name: 'Kothrud', slug: 'kothrud', isActive: true });
     fcAdmin = await createUser({
@@ -75,11 +76,26 @@ describe('access', () => {
         expect((await ctx.api.guest(A).get('/campaigns')).status).toBe(401);
     });
 
-    test('plan without couponPromotions → 403 FEATURE_LOCKED, nothing created', async () => {
+    test('plan without campaigns → 403 FEATURE_LOCKED, nothing created', async () => {
         const res = await api(C.users.admin).post('/campaigns').send(body());
         expect(res.status).toBe(403);
         expect(res.body.code).toBe('FEATURE_LOCKED');
+        expect(res.body.feature).toBe('campaigns');
         expect(await Campaign.countDocuments({ restaurant: C.restaurant._id })).toBe(0);
+    });
+
+    test('legacy snapshot without a campaigns key follows couponPromotions', async () => {
+        await Restaurant.updateOne({ _id: C.restaurant._id }, {
+            $unset: { 'subscription.features.campaigns': 1 },
+            $set: { 'subscription.features.couponPromotions': false },
+        });
+        expect((await api(C.users.admin).get('/campaigns')).status).toBe(403);
+
+        await Restaurant.updateOne({ _id: C.restaurant._id }, { $set: { 'subscription.features.couponPromotions': true } });
+        expect((await api(C.users.admin).get('/campaigns')).status).toBe(200);
+
+        // restore the "no campaigns" fixture for later tests
+        await Restaurant.updateOne({ _id: C.restaurant._id }, { $set: { 'subscription.features.campaigns': false } });
     });
 });
 

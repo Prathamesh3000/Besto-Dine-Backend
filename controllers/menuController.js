@@ -509,7 +509,18 @@ exports.importMenuItemsCsv = async (req, res) => {
         };
 
         const errors = [];
+        const skipped = [];
         let created = 0;
+
+        // Re-uploading a sheet (or the master template twice) must not
+        // duplicate dishes: a row whose name already exists in the same
+        // category at this branch is reported as skipped, like the Tables /
+        // Staff / Halls importers do. Key = categoryId::lower-cased name.
+        const existingKeys = new Set(
+            (await MenuItem.find({ restaurant: restaurantId, branch: branchId || null })
+                .select('name category').lean())
+                .map((d) => `${String(d.category)}::${String(d.name || '').trim().toLowerCase()}`),
+        );
 
         // Plan maxMenuItems (0 / missing = uncapped) — rows past the cap
         // are reported as row errors instead of being created.
@@ -623,6 +634,13 @@ exports.importMenuItemsCsv = async (req, res) => {
 
                 const categoryId = await resolveCategory(categoryName);
 
+                const dupKey = `${String(categoryId)}::${name.toLowerCase()}`;
+                if (existingKeys.has(dupKey)) {
+                    skipped.push({ row: rowNum, name, reason: `"${name}" already exists in ${categoryName}` });
+                    continue;
+                }
+                existingKeys.add(dupKey);
+
                 // Resolve images. Trust CSV-provided URLs only if they
                 // look real (not the deprecated source.unsplash.com or
                 // the random-photo picsum CDN — those return the same
@@ -678,6 +696,8 @@ exports.importMenuItemsCsv = async (req, res) => {
         return res.status(200).json({
             success: true,
             created,
+            skippedCount: skipped.length,
+            skipped,
             errorCount: errors.length,
             errors,
         });

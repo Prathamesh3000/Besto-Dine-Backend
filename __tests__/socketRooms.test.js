@@ -141,3 +141,25 @@ describe('canJoinWith', () => {
         expect(await canJoinWith(adminT1, null, deps)).toBe(false);
     });
 });
+
+describe('printer room (thermal print agents)', () => {
+    const { printerRoom } = require('../utils/socketRooms');
+    const deps = { getBranchTenant: async () => T1, findOrder: async () => null };
+
+    test('printerRoom is keyed by tenant + branch and needs both', () => {
+        expect(printerRoom(T1, B1)).toBe(`t:${T1}:printer:${B1}`);
+        expect(printerRoom(T1, null)).toBeNull();
+        expect(printerRoom(null, B1)).toBeNull();
+    });
+
+    test('an agent identity auto-joins only its printer room', () => {
+        const rooms = autoRoomsFor({ agent: { restaurant: T1, branch: B1, agentId: 'ag-1' } });
+        expect(rooms).toEqual([`t:${T1}:printer:${B1}`]);
+    });
+
+    test('staff cannot join a printer room by name, even their own tenant/branch', async () => {
+        expect(await canJoinWith({ userId: U1, role: 'admin', restaurant: T1 }, `t:${T1}:printer:${B1}`, deps)).toBe(false);
+        expect(await canJoinWith({ userId: U1, role: 'chef', restaurant: T1, branchId: B1 }, `t:${T1}:printer:${B1}`, deps)).toBe(false);
+        expect(parseTenantRoom(`t:${T1}:printer:${B1}`)).toBeNull();
+    });
+});

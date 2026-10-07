@@ -439,6 +439,9 @@ const assertTenantNotLocked = async (user) => {
  * the frontend simply behaves as a legacy single-tenant client (every
  * feature unlocked).
  */
+const { effectiveFeatures, activeAddonKeys } = require('../utils/featureAccess');
+const ALL_FEATURE_KEYS = [...require('../models/subscriptionPlan').FEATURE_KEYS, 'revenueAnalytics'];
+
 const buildAuthResponse = async (user) => {
     const payload = buildUserPayload(user);
 
@@ -446,7 +449,7 @@ const buildAuthResponse = async (user) => {
 
     try {
         const r = await Restaurant.findById(user.restaurant)
-            .select('name slug status subscription featureOverrides')
+            .select('name slug status subscription featureOverrides addons')
             .lean();
         if (!r) return payload;
 
@@ -459,7 +462,12 @@ const buildAuthResponse = async (user) => {
             planSlug: r.subscription?.planSlug || '',
             subscriptionStatus: r.subscription?.status || '',
             trialEndDate: r.subscription?.trialEndDate || null,
-            features: r.subscription?.features || {},
+            // Fully-resolved module map (plan snapshot + paid add-ons +
+            // legacy fallbacks) so the UI applies exactly the backend's
+            // rules. The raw plan snapshot stays available as planFeatures.
+            features: effectiveFeatures(r, ALL_FEATURE_KEYS),
+            planFeatures: r.subscription?.features || {},
+            addons: [...activeAddonKeys(r)],
             limits: r.subscription?.limits || {},
             featureOverrides: r.featureOverrides || {},
         };

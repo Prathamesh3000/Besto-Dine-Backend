@@ -10,6 +10,7 @@ const Promotion = require('../models/promotion');
 const Coupon = require('../models/coupon');
 const logger = require('../utils/logger');
 const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
+const { hasFeature } = require('../utils/featureAccess');
 const { buildAvailabilityFilter } = require('../utils/menuAvailability');
 
 /**
@@ -50,10 +51,20 @@ exports.getMenuBootstrap = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug,
             status: { $in: ['active', 'trial'] },
-        }).select('_id name slug city contactPhone logo branding subscription featureOverrides').lean();
+        }).select('_id name slug city contactPhone logo branding subscription featureOverrides addons').lean();
 
         if (!restaurant) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
+        }
+
+        // The kiosk menu is part of the paid self-order kiosk module.
+        if (kioskMode && !hasFeature(restaurant, 'kiosk')) {
+            return res.status(403).json({
+                success: false,
+                code: 'FEATURE_LOCKED',
+                feature: 'kiosk',
+                message: "This restaurant doesn't offer self-order kiosk.",
+            });
         }
 
         // ── Resolve the optional branch ───────────────────────────────

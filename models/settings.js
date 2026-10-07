@@ -194,7 +194,47 @@ const settingsSchema = new mongoose.Schema({
         message: 'Accent colour must be a hex code like #FE8301',
       },
     },
-  }
+  },
+
+  // Thermal printers (KOT / bill) for THIS branch. Not inherited: each
+  // location has its own printers and its own print agent (the small
+  // program on the counter PC that talks to them — see print-agent/).
+  // `agent` is managed by /print/agent-key and never sent by the UI;
+  // settingsController.normalizePrinters keeps it across section saves.
+  printers: {
+    enabled: { type: Boolean, default: false },
+    autoPrint: {
+      kotOnCreate: { type: Boolean, default: true },
+      kotOnAppend: { type: Boolean, default: true },
+      billOnPaid:  { type: Boolean, default: false },
+    },
+    agent: {
+      agentId:    { type: String, default: '' },
+      // Bumped on every key issue / revoke; a token whose `kv` claim no
+      // longer matches is refused at the socket handshake.
+      keyVersion: { type: Number, default: 0, min: 0 },
+      issuedAt:   { type: Date, default: null },
+      lastSeenAt: { type: Date, default: null },
+    },
+    list: {
+      type: [{
+        _id: false,
+        id:           { type: String, required: true, trim: true, maxlength: 64 },
+        name:         { type: String, required: [true, 'Printer name is required'], trim: true, maxlength: [40, 'Printer name cannot exceed 40 characters'] },
+        station:      { type: String, enum: { values: ['kitchen', 'bar', 'counter'], message: 'Station must be kitchen, bar or counter' }, default: 'kitchen' },
+        interface:    { type: String, enum: { values: ['lan', 'usb'], message: 'Interface must be lan or usb' }, default: 'lan' },
+        host:         { type: String, default: '', trim: true, maxlength: [253, 'Host is too long'] },
+        port:         { type: Number, default: 9100, min: [1, 'Port must be between 1 and 65535'], max: [65535, 'Port must be between 1 and 65535'] },
+        devicePath:   { type: String, default: '', trim: true, maxlength: [260, 'Device path is too long'] },
+        paperWidth:   { type: String, enum: { values: ['58', '80'], message: 'Paper width must be 58 or 80' }, default: '80' },
+        characterSet: { type: String, default: 'PC437_USA', trim: true, maxlength: 32 },
+        copies:       { type: Number, default: 1, min: [1, 'Copies must be between 1 and 3'], max: [3, 'Copies must be between 1 and 3'] },
+        enabled:      { type: Boolean, default: true },
+      }],
+      default: [],
+      validate: { validator: (v) => !v || v.length <= 10, message: 'At most 10 printers are allowed' },
+    },
+  },
 }, { timestamps: true });
 
 // One Settings doc per (restaurant, branch) — tenant-level uses branch=null.

@@ -32,6 +32,14 @@ const FEATURE_KEYS = [
     'dataExport',
     'webhooks',
     'kiosk',
+    // Added with the Silver / Gold / Premium line-up (PRICING_PACKAGING §4).
+    // campaigns used to ride on couponPromotions — tenants whose snapshot
+    // pre-dates the key fall back to that (utils/featureAccess).
+    'campaigns',
+    'aggregatorOrders',
+    'accountingExport',
+    'eInvoice',
+    'whiteLabelBranding',
 ];
 
 // Build the features sub-schema dynamically so adding a new feature key

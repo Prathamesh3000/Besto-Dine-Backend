@@ -166,7 +166,7 @@ exports.getRestaurantLanding = async (req, res) => {
 
         // AUDIT-EXEMPT: public tenant resolution by URL slug — this IS the tenant lookup.
         const restaurant = await Restaurant.findOne({ slug })
-            .select('name slug city logo status timezone contactPhone address branding.primaryColor subscription.features featureOverrides')
+            .select('name slug city logo status timezone contactPhone address branding.primaryColor subscription.features featureOverrides addons')
             .lean();
         if (!restaurant) {
             return notFound(res, 'RESTAURANT_NOT_FOUND', 'Restaurant not found');

@@ -8,17 +8,16 @@
  * frontend uses to hide buttons for locked modules (Wallet, Bookings,
  * Coupons) so users don't tap through to a 403.
  *
- * Resolution mirrors the backend `featureGate` middleware exactly so the
- * UI and the gate never disagree:
- *   featureOverrides[key] === false → OFF
- *   featureOverrides[key] === true  → ON
- *   subscription.features[key] truthy → ON
- *   otherwise → OFF
+ * Resolution is utils/featureAccess.hasFeature — the same function the
+ * backend `featureGate` middleware uses — so the UI and the gate never
+ * disagree (overrides → paid add-ons → plan snapshot).
  *
  * Used by publicController (restaurant list + by-slug) and tableController
  * (QR scan response) so every place the frontend learns about a tenant
  * gets the same features map.
  */
+
+const { hasFeature } = require('./featureAccess');
 
 const CUSTOMER_FACING_FEATURE_KEYS = [
     'dineIn',
@@ -34,17 +33,15 @@ const CUSTOMER_FACING_FEATURE_KEYS = [
     // toggle turned ON for the tenant — the public endpoint just
     // wasn't reporting the flag.
     'kiosk',
+    // Online payments — when the plan has no payment gateway the customer
+    // apps hide "Pay online" and offer pay-at-counter only.
+    'paymentGateway',
 ];
 
 function publicFeaturesOf(restaurant) {
-    const source = restaurant?.subscription?.features || {};
-    const overrides = restaurant?.featureOverrides || {};
     const out = {};
     for (const key of CUSTOMER_FACING_FEATURE_KEYS) {
-        if (overrides[key] === false) { out[key] = false; continue; }
-        if (overrides[key] === true)  { out[key] = true;  continue; }
-        const v = source[key];
-        out[key] = v === true || v === 'advanced' || v === 'standard' || v === 'basic';
+        out[key] = restaurant ? hasFeature(restaurant, key) : false;
     }
     return out;
 }

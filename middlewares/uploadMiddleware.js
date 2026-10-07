@@ -16,7 +16,11 @@ const fileFilter = (req, file, cb) => {
     if (extname && mimetype) {
         return cb(null, true);
     } else {
-        cb(new Error('Only image files (jpg, jpeg, png, webp) are allowed!'), false);
+        // Client error (400 with this message), not a server fault.
+        const err = new Error('Only image files (jpg, jpeg, png, webp) are allowed!');
+        err.status = 400;
+        err.expose = true;
+        cb(err, false);
     }
 };
 

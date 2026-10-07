@@ -14,10 +14,10 @@ const idGen = require('../utils/idGenerator');
 const logger = require('../utils/logger');
 const { getSettings } = require('../utils/settingsCache');
 const { tenantFilter, tenantId } = require('../utils/tenantScope');
-const { freeTableOrUnmergeGroup } = require('../utils/tableMerge');
+const { releaseTableIfSettled } = require('../utils/tableOccupancy');
 const { resolveLoyaltySettings } = require('../utils/paymentDefaults');
 const { httpError, reply } = require('./orderErrors');
-const { emitOrderEvent, emitStaffTable, runAfterResponse } = require('./orderHelpers');
+const { emitOrderEvent, runAfterResponse } = require('./orderHelpers');
 const { orderAccessForCaller } = require('./orderAccess');
 const { notifyCounterPaymentRequested, notifyPaymentConfirmed } = require('./orderNotifications');
 
@@ -463,18 +463,19 @@ async function customerPayment(req) {
 }
 
 // Post-payment bookkeeping for a wallet-settled order: release the table
-// when the order was already served, award loyalty points, and notify.
+// once every order on it is settled, award loyalty points, and notify.
 // Money fields are untouched — payWithWallet owns those.
 async function finalizeCustomerPaidOrder(req, updatedOrder, tf) {
-  // ── Free the table on terminal payment ───────────────────────────
-  // Mirror updateOrderStatus: "served + Paid → release table".
-  if (updatedOrder.status === 'served' && updatedOrder.table) {
+  // ── Free the table on payment ────────────────────────────────────
+  // Table-status rule: Free as soon as no order on the table / merge
+  // group is unsettled — the kitchen status no longer matters (a paid
+  // order still cooking stays on the KDS). payWithWallet already ran
+  // this; repeating it here is idempotent.
+  if (updatedOrder.table) {
     try {
-      const { freedIds } = await freeTableOrUnmergeGroup(updatedOrder.table, tf);
-      const ids = freedIds.length ? freedIds : [updatedOrder.table];
-      for (const tid of ids) {
-        emitStaffTable('table:updated', { tableId: tid, status: 'free' }, updatedOrder.branch);
-      }
+      await releaseTableIfSettled(updatedOrder, tf, {
+        branch: updatedOrder.branch || null, restaurant: updatedOrder.restaurant,
+      });
     } catch (err) {
       logger.warn('Failed to free table after customer payment:', err.message);
     }

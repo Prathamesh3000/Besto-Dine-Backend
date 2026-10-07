@@ -27,6 +27,12 @@ jest.mock('../models/table', () => ({ findById: (...a) => mockChain(mockTableFin
 jest.mock('../models/user', () => ({ findById: (...a) => mockChain(mockUserFind)(...a) }));
 jest.mock('../models/staffWithdrawal', () => ({ findById: (...a) => mockChain(mockWithdrawalFind)(...a) }));
 jest.mock('../models/menuItem', () => ({ bulkWrite: jest.fn() }));
+// Plan lookup for the staff-app socket gate (chef → kitchenDisplay,
+// waiter/captain → waiterDashboard). Default: both apps in the plan.
+const mockRestaurantFind = jest.fn(async () => ({
+    subscription: { features: { kitchenDisplay: true, waiterDashboard: true } },
+}));
+jest.mock('../models/restaurant', () => ({ findById: (...a) => mockChain(mockRestaurantFind)(...a) }));
 
 jest.mock('../middlewares/authMiddleware', () => ({
     TOKEN_TYPES: { USER: 'user', SCAN: 'scan', KIOSK: 'kiosk' },
@@ -459,6 +465,30 @@ describe('socket.io server: handshake auth, auto-join, join gate', () => {
         expect(data).toEqual({ userId: W1, role: 'waiter', branchId: B1, restaurant: T1 });
     });
 
+    test('waiter on a plan without waiterDashboard → no identity, no tenant rooms', async () => {
+        auth.verifyUserToken.mockReturnValue({ id: W1, role: 'waiter', typ: 'user' });
+        auth.loadUserForToken.mockResolvedValue({ _id: W1, role: 'waiter', branch: { _id: B1 }, restaurant: T1, status: 'active' });
+        mockRestaurantFind.mockResolvedValueOnce({ subscription: { features: { waiterDashboard: false, kitchenDisplay: true } } });
+        const { err, data } = await handshake({ token: 'tok' });
+        expect(err).toBeUndefined();
+        expect(data).toEqual({ userId: null, role: null, branchId: null, restaurant: null });
+    });
+
+    test('chef on a plan without kitchenDisplay → no identity; an add-on restores it', async () => {
+        auth.verifyUserToken.mockReturnValue({ id: W1, role: 'chef', typ: 'user' });
+        auth.loadUserForToken.mockResolvedValue({ _id: W1, role: 'chef', branch: { _id: B1 }, restaurant: T1, status: 'active' });
+        mockRestaurantFind.mockResolvedValueOnce({ subscription: { features: { kitchenDisplay: false } } });
+        let res = await handshake({ token: 'tok' });
+        expect(res.data.role).toBeNull();
+
+        mockRestaurantFind.mockResolvedValueOnce({
+            subscription: { features: { kitchenDisplay: false } },
+            addons: [{ key: 'kitchenDisplay', status: 'active' }],
+        });
+        res = await handshake({ token: 'tok' });
+        expect(res.data).toEqual({ userId: W1, role: 'chef', branchId: B1, restaurant: T1 });
+    });
+
     test('customer token → no branchId on the socket', async () => {
         auth.verifyUserToken.mockReturnValue({ id: U1, typ: 'user' });
         auth.loadUserForToken.mockResolvedValue({ _id: U1, role: 'customer', branch: B1, restaurant: T1 });
@@ -791,7 +821,12 @@ describe('orderNotifications', () => {
                 expect(c.restaurant).toBe(T1);
                 expect(c.branch).toBe(B1);
                 expect(c.event).toBe('counter-payment:requested');
-                expect(c.payload).toEqual({ orderId: 'ORD-9', amount: 412.75, table: 'Table T5' });
+                // tableId lets the admin's "Settle cash" CTA open the table drawer (QA 2026-10).
+                const fixtureTable = order().table;
+                expect(c.payload).toEqual({
+                    orderId: 'ORD-9', amount: 412.75, table: 'Table T5',
+                    tableId: fixtureTable ? String(fixtureTable) : null,
+                });
             }
             expect(calls[2].recipients).toEqual([W1]);
             expect(calls[1].notification.meta.table).toBe('T5');

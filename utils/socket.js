@@ -424,7 +424,7 @@ exports.init = (server, allowedOrigins) => {
     // auto-join + `join` gate can check identity without hitting the DB.
     io.use(async (socket, next) => {
         try {
-            const { token, scanToken } = socket.handshake.auth || {};
+            const { token, scanToken, agentToken } = socket.handshake.auth || {};
             // Lazy require — authMiddleware pulls in models; keep this
             // module loadable in isolation (tests, scripts).
             const auth = require('../middlewares/authMiddleware');
@@ -465,6 +465,26 @@ exports.init = (server, allowedOrigins) => {
                                 socket.data.branchId = u.branch ? String(u.branch._id || u.branch) : null;
                             }
                             socket.data.restaurant = u.restaurant ? String(u.restaurant._id || u.restaurant) : null;
+                            // Plan gate for the staff apps (mirrors
+                            // featureGate.staffAppGate on the HTTP side): a
+                            // chef without kitchenDisplay / a waiter or
+                            // captain without waiterDashboard gets no
+                            // tenant rooms, so no live order pushes.
+                            const { STAFF_APP_FEATURE_BY_ROLE } = require('../middlewares/featureGate');
+                            const appFeature = STAFF_APP_FEATURE_BY_ROLE[socket.data.role];
+                            if (appFeature && socket.data.restaurant) {
+                                const Restaurant = require('../models/restaurant');
+                                const { hasFeature } = require('./featureAccess');
+                                const r = await Restaurant.findById(socket.data.restaurant)
+                                    .select('subscription.features featureOverrides addons')
+                                    .lean();
+                                if (!r || !hasFeature(r, appFeature)) {
+                                    socket.data.userId = null;
+                                    socket.data.role = null;
+                                    socket.data.branchId = null;
+                                    socket.data.restaurant = null;
+                                }
+                            }
                         }
                     } catch {
                         // DB hiccup — no verified identity, so no tenant
@@ -490,6 +510,28 @@ exports.init = (server, allowedOrigins) => {
                     }
                 } catch { /* invalid/expired scan token → ignore */ }
             }
+            if (agentToken) {
+                // Print agent (print-agent/). Unlike a bad user token this
+                // is a hard reject: the agent must learn its key is dead
+                // (revoked / rotated / printing disabled) and stop.
+                const reject = () => {
+                    const e = new Error('AGENT_REVOKED');
+                    e.data = { code: 'AGENT_REVOKED' };
+                    return next(e);
+                };
+                try {
+                    const decoded = auth.verifyTypedToken(agentToken, auth.TOKEN_TYPES.AGENT);
+                    const { verifyAgentClaims } = require('../services/printService');
+                    if (!(await verifyAgentClaims(decoded))) return reject();
+                    socket.data.agent = {
+                        restaurant: String(decoded.restaurant),
+                        branch: String(decoded.branch),
+                        agentId: decoded.agentId || '',
+                    };
+                } catch {
+                    return reject();
+                }
+            }
             next();
         } catch (err) {
             logger.warn('Socket auth error:', err.message);
@@ -506,6 +548,15 @@ exports.init = (server, allowedOrigins) => {
             if (auto.length) socket.join(auto);
         } catch (err) {
             logger.warn('Socket auto-join failed:', err.message);
+        }
+
+        // Print agents get their own small protocol (pending / ack).
+        if (socket.data.agent) {
+            try {
+                require('../realtime/printAgentSocket').attach(socket);
+            } catch (err) {
+                logger.warn('print-agent attach failed:', err.message);
+            }
         }
 
         // Clients may still ask for per-resource rooms (order:<id>,

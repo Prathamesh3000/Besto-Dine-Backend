@@ -12,9 +12,11 @@ const DB_ERRORS = new Set(['MongoServerSelectionError', 'MongoNetworkError', 'Mo
 //   'user'  — session access token (login / refresh)
 //   'scan'  — table QR scan session (tableController)
 //   'kiosk' — kiosk order-tracking token (orderController)
+//   'agent' — long-lived print-agent credential for one branch
+//             (printController / utils/socket.js handshake)
 // Tokens issued before `typ` existed are still accepted where their
 // shape is unambiguous (see isLegacyUserPayload) until they expire.
-const TOKEN_TYPES = Object.freeze({ USER: 'user', SCAN: 'scan', KIOSK: 'kiosk' });
+const TOKEN_TYPES = Object.freeze({ USER: 'user', SCAN: 'scan', KIOSK: 'kiosk', AGENT: 'agent' });
 
 // Short-lived access tokens; sessions are extended with /auth/refresh.
 // ACCESS_TOKEN_TTL / SUPERADMIN_ACCESS_TOKEN_TTL accept jsonwebtoken

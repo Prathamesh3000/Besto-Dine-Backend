@@ -12,7 +12,12 @@
 // Once every order is paid+served (or cancelled) the seat frees up.
 // Orders older than PARTY_WINDOW_MS are ignored so an abandoned,
 // never-cleared order can't lock a table forever.
+//
+// The table's STATUS follows a different rule (releaseTableIfSettled
+// below): it turns Free as soon as every order on it is paid or
+// cancelled, even while a paid order is still being cooked.
 
+const mongoose = require('mongoose');
 const Table = require('../models/table');
 const Order = require('../models/order');
 
@@ -111,50 +116,185 @@ async function getTableOccupancy(table, tenantFilterObj = {}) {
     return { capacity, parties, members, orderParties: groupPartyIdentities(orders), tableName: table.name };
 }
 
-// An order still holding its party at the table: in the kitchen
-// pipeline, or served but not yet paid.
-const OPEN_ORDER_MATCH = {
-    $or: [
-        { status: { $in: ['new', 'preparing', 'ready'] } },
-        { status: 'served', paymentStatus: { $nin: ['Paid', 'Refunded'] } },
-    ],
+// An order whose bill is still owed: not cancelled and not settled
+// (Paid / Refunded). Kitchen status is irrelevant — a paid order still
+// being cooked does not keep the table occupied (it stays on the KDS).
+const UNSETTLED_ORDER_MATCH = {
+    status: { $ne: 'cancelled' },
+    paymentStatus: { $nin: ['Paid', 'Refunded'] },
 };
 
-// `order` just closed (cancelled, or served + paid). Free its table (or
-// unmerge the whole group) only when no OTHER open order remains on the
-// table / merge group — independent-orders model: another party may
-// still be waiting for food. When one does remain, the table stays
-// occupied and an activeOrder pointing at the closed order is repointed
-// to the remaining one. Returns { freedIds, repointedTo }.
-async function releaseTableAfterOrderClosed(order, tenantFilterObj = {}) {
-    const tableId = order?.table?._id || order?.table;
-    if (!tableId) return { freedIds: [], repointedTo: null };
-    const table = await Table.findOne({ _id: tableId, ...tenantFilterObj })
-        .select('mergedWith status')
+const toIdString = (v) => (v == null ? null : String(v._id || v));
+
+const timeOf = (d) => (d ? new Date(d).getTime() : 0);
+
+// Pure: live seats (not idle since `cutoff`) of a party that sat down
+// AFTER the table's bill was settled — i.e. somebody new is at the table.
+//   • a seat whose keys (u:<user> / s:<scan session>) match a settled
+//     order is that party's own seat unless it was claimed after that
+//     order settled (the same person sitting down again);
+//   • any other seat (a phone that scanned but never ordered) counts as
+//     a new sitting only when it was claimed after the latest
+//     settlement on the table. A companion who scanned before the bill
+//     was paid leaves with the party that paid the table's bill.
+function seatsOfOtherParties(seats, settledOrders, { cutoff } = {}) {
+    const cut = cutoff ? timeOf(cutoff) : -Infinity;
+    const settledAt = new Map(); // identity → latest settlement time
+    let latest = -Infinity;
+    for (const o of settledOrders || []) {
+        const at = timeOf(o.paidAt || o.cancelledAt || o.updatedAt || o.createdAt);
+        latest = Math.max(latest, at);
+        const ids = [];
+        if (o.user) ids.push('u:' + String(o.user));
+        if (o.scanSessionId) ids.push('s:' + String(o.scanSessionId));
+        for (const k of ids) settledAt.set(k, Math.max(settledAt.get(k) || 0, at));
+    }
+    return (seats || []).filter((s) => {
+        if (timeOf(s.lastSeenAt || s.joinedAt) < cut) return false; // idle → prunable
+        const times = (s.keys || []).map((k) => settledAt.get(k)).filter((t) => t !== undefined);
+        const settledBy = times.length ? Math.max(...times) : latest;
+        return timeOf(s.joinedAt) > settledBy;
+    });
+}
+
+// Live seats on the group held by a party that is not one of the
+// group's (all settled) orders.
+async function liveSeatsOfOtherParties(groupIds, tf) {
+    const tables = await Table.find({ _id: { $in: groupIds }, ...tf }).select('+seats').lean();
+    const seats = (tables || []).flatMap((t) => t.seats || []);
+    if (!seats.length) return [];
+    // Lazy — tableSeats requires this module.
+    const { seatIdleMs } = require('./tableSeats');
+    const cutoff = new Date(Date.now() - seatIdleMs());
+    if (!seats.some((s) => timeOf(s.lastSeenAt || s.joinedAt) >= cutoff.getTime())) return [];
+    // The group's orders, plus settled bills of these seated identities
+    // that were detached from the table (orderCreateService.
+    // detachStalePaidBill sets table: null when the next party orders).
+    const userIds = [];
+    const sessionIds = [];
+    for (const s of seats) {
+        for (const k of s.keys || []) {
+            if (k.startsWith('u:')) userIds.push(k.slice(2));
+            else if (k.startsWith('s:')) sessionIds.push(k.slice(2));
+        }
+    }
+    const identityMatch = [];
+    if (userIds.length) identityMatch.push({ user: { $in: userIds.filter((id) => mongoose.isValidObjectId(id)) } });
+    if (sessionIds.length) identityMatch.push({ scanSessionId: { $in: sessionIds } });
+    const orders = await Order.find({
+        ...tf,
+        createdAt: { $gte: new Date(Date.now() - PARTY_WINDOW_MS) },
+        $or: [
+            { table: { $in: groupIds } },
+            ...(identityMatch.length ? [{ table: null, $or: identityMatch }] : []),
+        ],
+    }).select('user scanSessionId status paymentStatus paidAt cancelledAt updatedAt createdAt').lean();
+    const settledOrders = (orders || []).filter((o) => o.status === 'cancelled'
+        || o.paymentStatus === 'Paid' || o.paymentStatus === 'Refunded');
+    return seatsOfOtherParties(seats, settledOrders, { cutoff });
+}
+
+// Table-status rule (QA): a dine-in table — the whole merge group — is
+// Free as soon as no order on the group (within PARTY_WINDOW_MS) is
+// unsettled. Call this after any order on a table is paid, refunded or
+// cancelled (or served while already paid).
+//
+//   • every order settled → free the table / unmerge the group
+//     (utils/tableMerge.freeTableOrUnmergeGroup, which keeps seat
+//     reservations while a paid order is still in the kitchen) and emit
+//     `table:updated` { tableId, status: 'free' } to the tenant's staff
+//     for every freed id;
+//   • an unsettled order remains (another party has not paid yet) → the
+//     table stays occupied and any activeOrder pointing at a settled /
+//     cancelled order is repointed to the newest unsettled one;
+//   • every order settled but a new party is SEATED (a live seat claimed
+//     after the bill was settled — someone scanned in and has not
+//     ordered yet; see seatsOfOtherParties) → the table stays occupied
+//     and nothing is emitted.
+//
+// `orderOrTableId` is an order (doc or lean object carrying `table`) or a
+// table id. `tenantFilterObj` scopes every query; when empty, the
+// restaurant from opts / the order is used instead (webhooks and
+// background jobs have no req). opts:
+//   branch, restaurant — emit routing (default: the order's, then the table's)
+//   emit               — false to skip the socket emit (default true)
+//   force              — free even while another party is seated
+// Returns { freedIds, repointedTo } (+ seatedParties when kept for seats).
+async function releaseTableIfSettled(orderOrTableId, tenantFilterObj = {}, opts = {}) {
+    const none = { freedIds: [], repointedTo: null };
+    if (!orderOrTableId) return none;
+    // A string or an ObjectId is a table id; any other object is an order.
+    const isOrder = typeof orderOrTableId === 'object' && !orderOrTableId._bsontype;
+    const order = isOrder ? orderOrTableId : null;
+    const tableId = order ? (order.table?._id || order.table) : orderOrTableId;
+    if (!tableId) return none;
+
+    const restaurant = opts.restaurant || order?.restaurant || null;
+    let tf = tenantFilterObj || {};
+    if (!Object.keys(tf).length && restaurant) tf = { restaurant: restaurant._id || restaurant };
+
+    const table = await Table.findOne({ _id: tableId, ...tf })
+        .select('mergedWith status branch restaurant')
         .lean();
-    if (!table) return { freedIds: [], repointedTo: null };
+    if (!table) return none;
     const groupIds = [table._id, ...(Array.isArray(table.mergedWith) ? table.mergedWith : [])];
 
-    const remaining = await Order.findOne({
+    const unsettled = await Order.find({
         table: { $in: groupIds },
-        _id: { $ne: order._id },
-        ...tenantFilterObj,
+        ...tf,
         createdAt: { $gte: new Date(Date.now() - PARTY_WINDOW_MS) },
-        ...OPEN_ORDER_MATCH,
+        ...UNSETTLED_ORDER_MATCH,
     }).sort({ createdAt: -1 }).select('_id').lean();
 
-    if (remaining) {
+    if (unsettled.length) {
+        const newest = unsettled[0]._id;
         await Table.updateMany(
-            { _id: { $in: groupIds }, ...tenantFilterObj, activeOrder: order._id },
-            { $set: { activeOrder: remaining._id } },
+            {
+                _id: { $in: groupIds },
+                ...tf,
+                activeOrder: { $nin: [null, ...unsettled.map((o) => o._id)] },
+            },
+            { $set: { activeOrder: newest } },
         );
-        return { freedIds: [], repointedTo: remaining._id };
+        return { freedIds: [], repointedTo: newest };
+    }
+
+    // A new party is seated (scanned in after the bill was settled, no
+    // order yet) — e.g. party A paid while its food was cooking, party B
+    // sat down, then A's order was served. Freeing now would wipe B's seat and show the
+    // table Free with B sitting at it. Keep it as it is; the settled
+    // parties' seats are pruned once idle (utils/tableSeats). opts.force
+    // skips this guard.
+    if (!opts.force) {
+        const others = await liveSeatsOfOtherParties(groupIds, tf);
+        if (others.length) return { freedIds: [], repointedTo: null, seatedParties: others.length };
     }
 
     // Lazy require — tableMerge is a sibling helper; keeps load order flat.
     const { freeTableOrUnmergeGroup } = require('./tableMerge');
-    const { freedIds } = await freeTableOrUnmergeGroup(tableId, tenantFilterObj);
-    return { freedIds: freedIds.length ? freedIds : [tableId], repointedTo: null };
+    const { freedIds } = await freeTableOrUnmergeGroup(tableId, tf);
+
+    if (opts.emit !== false && freedIds.length) {
+        try {
+            const { getIO, emitToStaff } = require('./socket');
+            const io = getIO();
+            const branch = opts.branch !== undefined ? opts.branch : (order?.branch || table.branch || null);
+            const rid = toIdString(restaurant || table.restaurant);
+            for (const id of freedIds) {
+                emitToStaff(io, branch || null, 'table:updated', {
+                    tableId: id,
+                    status: 'free',
+                    ...(rid ? { restaurant: rid } : {}),
+                });
+            }
+        } catch { /* socket best-effort */ }
+    }
+    return { freedIds, repointedTo: null };
+}
+
+// Kept for existing callers/tests — same rule as releaseTableIfSettled.
+async function releaseTableAfterOrderClosed(order, tenantFilterObj = {}, opts = {}) {
+    return releaseTableIfSettled(order, tenantFilterObj, opts);
 }
 
 // The 409 payload every capacity gate returns (scan, claim, order).
@@ -205,4 +345,8 @@ module.exports = {
     getTableOccupancy,
     tableUnavailableError,
     releaseTableAfterOrderClosed,
+    releaseTableIfSettled,
+    seatsOfOtherParties,
+    UNSETTLED_ORDER_MATCH,
+    PARTY_WINDOW_MS,
 };

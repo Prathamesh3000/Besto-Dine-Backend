@@ -6,6 +6,7 @@ const logger = require('../utils/logger');
 const idGen = require('../utils/idGenerator');
 
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
+const { releaseTableIfSettled } = require('../utils/tableOccupancy');
 
 // ADM-057 — when an admin blocks/suspends a customer's wallet via the
 // three-dots menu on /admin/wallet, the customer's pay / points calls
@@ -584,10 +585,12 @@ exports.payWithWallet = async (req, res) => {
     // whole thing back, so wallet, order and ledger always agree.
     const reply = (status, body) => { const e = new Error('payWithWallet reply'); e.reply = { status, body }; return e; };
     let outcome = null;
+    let settledOrder = null; // { _id, table, branch, restaurant } when this pay settled the bill
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
         outcome = null;
+        settledOrder = null;
         const order = await Order.findOne({ _id: orderId, ...tf }).session(session);
         if (!order) {
           throw reply(404, { success: false, code: 'ORDER_NOT_FOUND', message: 'Order not found for this restaurant.' });
@@ -703,6 +706,9 @@ exports.payWithWallet = async (req, res) => {
           orderPaid: fullyPaid,
           paymentStatus: orderSet.paymentStatus,
         };
+        if (fullyPaid && order.table) {
+          settledOrder = { _id: order._id, table: order.table, branch: order.branch, restaurant: order.restaurant };
+        }
       });
     } catch (err) {
       if (err && err.reply) {
@@ -711,6 +717,19 @@ exports.payWithWallet = async (req, res) => {
       throw err;
     } finally {
       await session.endSession();
+    }
+
+    // Table-status rule: the bill is settled → free the dine-in table now
+    // (unless another order on it is still unpaid). After the commit, so
+    // a rolled-back payment never frees a table. Best-effort.
+    if (settledOrder) {
+      try {
+        await releaseTableIfSettled(settledOrder, tf, {
+          branch: settledOrder.branch || null, restaurant: settledOrder.restaurant,
+        });
+      } catch (relErr) {
+        logger.warn('Failed to free table after wallet payment:', relErr.message);
+      }
     }
 
     return res.status(200).json(outcome);

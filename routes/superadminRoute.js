@@ -191,6 +191,14 @@ router.post(
 
 router.post('/restaurants/:id/suspend',    superAdminFull, validate([restaurantId]), ctrl.suspendRestaurant);
 
+// Paid add-ons — single modules sold on top of the tenant's plan.
+router.get('/addon-catalog', ctrl.getAddonCatalog);
+router.post('/restaurants/:id/addons', superAdminFull, validate([
+    restaurantId,
+    body('key').isString().notEmpty().withMessage('Add-on key is required'),
+]), ctrl.addRestaurantAddon);
+router.delete('/restaurants/:id/addons/:addonId', superAdminFull, validate([restaurantId]), ctrl.cancelRestaurantAddon);
+
 // Phase 7.2 — tenant backups (create / list / download / delete)
 router.post('/restaurants/:id/backup',              superAdminFull, validate([restaurantId]), backup.createBackup);
 router.get('/restaurants/:id/backups',               backup.listBackups);
@@ -287,6 +295,11 @@ router.post(
 router.put('/plans/:id',            superAdminFull, updatePlanRules, ctrl.updatePlan);
 router.patch('/plans/:id/archive',  superAdminFull, validate([planIdParam]), ctrl.archivePlan);
 router.delete('/plans/:id',         superAdminFull, validate([planIdParam]), ctrl.deletePlan);
+// Editing a plan never changes existing tenants on its own. These two let
+// the Super Admin see who'd be affected and then push the plan's current
+// modules + limits to them (agreed price is left alone).
+router.get('/plans/:id/tenant-impact', validate([planIdParam]), ctrl.getPlanTenantImpact);
+router.post('/plans/:id/push',         superAdminFull, validate([planIdParam]), ctrl.pushPlanToTenants);
 
 // ═══════════════ BLOG (marketing content) ═══════════════════════════════
 // Posts for the standalone marketing site's /blog. Reads allowed for any

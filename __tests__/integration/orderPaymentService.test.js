@@ -59,8 +59,14 @@ beforeAll(async () => {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-const item = (t, { price = 500, quantity = 1, prepStation = 'kitchen', name = 'Paneer Tikka' } = {}) => ({
+// Updated 2026-10 (decision 6): coupon scope follows the menu CATEGORY's
+// Food / Drink kind, snapshotted on each order line as `categoryKind`.
+// Drink lines in these fixtures therefore carry categoryKind 'beverages'
+// (what a real Cola order now records) — without it the line would be
+// classified by its menu item, which here is always Paneer Tikka (food).
+const item = (t, { price = 500, quantity = 1, prepStation = 'kitchen', name = 'Paneer Tikka', categoryKind } = {}) => ({
     menuItem: t.items.paneer._id, name, price, quantity, prepStation,
+    ...(categoryKind ? { categoryKind } : {}),
 });
 
 async function makeOrder(t, fields = {}) {
@@ -418,7 +424,7 @@ describe('PATCH /orders/:id/coupon', () => {
 
     test('a food-only coupon is refused when the order has no food', async () => {
         const coupon = await makeCoupon(A, { scope: 'food' });
-        const order = await makeOrder(A, { items: [item(A, { prepStation: 'bar', name: 'Cola', price: 120 })], total: 120 });
+        const order = await makeOrder(A, { items: [item(A, { prepStation: 'bar', name: 'Cola', price: 120, categoryKind: 'beverages' })], total: 120 });
 
         const res = await apply(waiter(), order, coupon.code);
 
@@ -430,7 +436,7 @@ describe('PATCH /orders/:id/coupon', () => {
     test('a beverages coupon discounts only the drinks on a mixed order', async () => {
         const coupon = await makeCoupon(A, { scope: 'beverages', discountType: 'percentage', discountValue: 50 });
         const order = await makeOrder(A, {
-            items: [item(A, { price: 400 }), item(A, { prepStation: 'bar', name: 'Cola', price: 60, quantity: 2 })],
+            items: [item(A, { price: 400 }), item(A, { prepStation: 'bar', name: 'Cola', price: 60, quantity: 2, categoryKind: 'beverages' })],
             total: 520,
         });
 

@@ -330,7 +330,7 @@ const getTableByToken = async (req, res) => {
         const table = await Table.findOne({ qrToken }, null, { skipTenantScope: true })
             .select('+qrToken')
             .populate('area', 'name isActive')
-            .populate('restaurant', 'name slug status subscription featureOverrides logo branding')
+            .populate('restaurant', 'name slug status subscription featureOverrides addons logo branding')
             .populate('branch', 'name slug displayLabel city addressLine1');
 
         // Soft-deleted tables keep their document (and qrToken) for
@@ -372,7 +372,7 @@ const getTableByToken = async (req, res) => {
             if (leaderLean && String(leaderLean._id) !== String(table._id)) {
                 const leaderDoc = await Table.findOne({ _id: leaderLean._id, restaurant: table.restaurant?._id || table.restaurant })
                     .populate('area', 'name isActive')
-                    .populate('restaurant', 'name slug status subscription featureOverrides logo branding')
+                    .populate('restaurant', 'name slug status subscription featureOverrides addons logo branding')
                     .populate('branch', 'name slug displayLabel city addressLine1');
                 if (leaderDoc) effectiveTable = leaderDoc;
             }

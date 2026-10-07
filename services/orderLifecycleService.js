@@ -11,7 +11,7 @@ const logger = require('../utils/logger');
 const { getSettings } = require('../utils/settingsCache');
 const { getIO, emitToStaff } = require('../utils/socket');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
-const { releaseTableAfterOrderClosed } = require('../utils/tableOccupancy');
+const { releaseTableIfSettled } = require('../utils/tableOccupancy');
 const { httpError, reply } = require('./orderErrors');
 const { orderAccessForCaller } = require('./orderAccess');
 const { notifyCustomerCancellation, notify } = require('./orderNotifications');
@@ -156,10 +156,11 @@ async function cancelOrder(req) {
   // the table is part of a merge so all siblings go back to 'free'
   // together — leaving them in 'merged' after a cancel would ghost
   // the admin dashboard.
-  // Another party's still-open order on the same table keeps it
-  // occupied (releaseTableAfterOrderClosed repoints activeOrder instead).
+  // Another party's still-unpaid order on the same table keeps it
+  // occupied (releaseTableIfSettled repoints activeOrder instead). The
+  // helper emits `table:updated` to staff for every freed table.
   if (order.type === 'dine-in' && order.table) {
-    try { await releaseTableAfterOrderClosed(order, tf); }
+    try { await releaseTableIfSettled(order, tf, { branch: order.branch || null, restaurant: order.restaurant }); }
     catch (err) { logger.warn('Failed to free table on cancel:', err.message); }
   }
 
@@ -309,10 +310,7 @@ async function cleanupStaleReadyOrders(req) {
     // activeOrder pointing at a cancelled order.
     if (o.type === 'dine-in' && o.table) {
       try {
-        const { freedIds } = await releaseTableAfterOrderClosed(o, tenantFilter(req));
-        for (const tid of freedIds) {
-          emitToStaff(getIO(), o.branch || null, 'table:updated', { tableId: tid, status: 'free' });
-        }
+        await releaseTableIfSettled(o, tenantFilter(req), { branch: o.branch || null, restaurant: tenantId(req) });
       } catch (err) { logger.warn('Failed to free table on stale cleanup:', err.message); }
     }
   }

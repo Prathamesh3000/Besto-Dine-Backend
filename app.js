@@ -299,6 +299,10 @@ function createApp({ isShuttingDown = () => false } = {}) {
     // CRIT-05 — enforce mustChangePassword server-side. Runs after
     // optionalAuth so req.user is available, before any controller.
     v1.use(requirePasswordCurrent);
+    // Plan gate for the role-specific staff apps: chefs need the
+    // kitchenDisplay module, waiters / captains need waiterDashboard.
+    // Auth endpoints stay open (see middlewares/featureGate.js).
+    v1.use(require('./middlewares/featureGate').staffAppGate);
 
     v1.use('/public', require('./routes/publicRoute'));   // Unauthenticated landing-page endpoints
     v1.use('/auth', require('./routes/authRoute'));
@@ -319,6 +323,7 @@ function createApp({ isShuttingDown = () => false } = {}) {
     v1.use('/tips', require('./routes/tipRoute'));
     v1.use('/staff-wallet', require('./routes/staffWalletRoute'));
     v1.use('/settings', require('./routes/settingsRoute'));
+    v1.use('/print', require('./routes/printRoute'));          // Thermal printers: agent key, test page, bill
     v1.use('/telemetry', require('./routes/telemetryRoute'));
     v1.use('/notifications', require('./routes/notificationRoute'));
     v1.use('/requests', require('./routes/requestRoute'));
@@ -439,6 +444,22 @@ function createApp({ isShuttingDown = () => false } = {}) {
     // eslint-disable-next-line no-unused-vars
     app.use((err, req, res, next) => {
         if (res.headersSent) return next(err);
+        // multer limit errors (file too large, unexpected field, too many
+        // files) are the uploader's fault: answer 400 with a usable
+        // message instead of the generic 500. fileFilter rejections in
+        // middlewares/csvUpload.js / uploadMiddleware.js set status 400
+        // themselves.
+        if (err && err.name === 'MulterError') {
+            const multerMessages = {
+                LIMIT_FILE_SIZE: 'File is too large',
+                LIMIT_UNEXPECTED_FILE: 'Unexpected file field',
+                LIMIT_FILE_COUNT: 'Too many files',
+                LIMIT_PART_COUNT: 'Too many form parts',
+            };
+            err.status = 400;
+            err.expose = true;
+            err.message = multerMessages[err.code] || err.message || 'Invalid upload';
+        }
         let status = Number(err?.status || err?.statusCode) || 500;
         if (status < 400 || status > 599) status = 500;
 

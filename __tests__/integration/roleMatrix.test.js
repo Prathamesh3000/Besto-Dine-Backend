@@ -305,6 +305,13 @@ const EXPECTED = [
     // settings
     ['PUT', '/settings', ADMIN],
     ['PATCH', '/settings/:section', ADMIN],
+    // thermal printing (routes/printRoute.js)
+    ['POST', '/print/agent-key', ADMIN],
+    ['DELETE', '/print/agent-key', ADMIN],
+    ['GET', '/print/agent-status', ADMIN],
+    ['GET', '/print/jobs', ADMIN],
+    ['POST', '/print/test', ADMIN],
+    ['POST', '/print/orders/:id/bill', FLOOR],
     // shifts
     ['GET', '/shifts/my', AUTHED],
     // protect + staffOnly (was protect-only; see the regression test below).
@@ -347,6 +354,9 @@ const EXPECTED = [
     ['PATCH', '/superadmin/restaurants/:id', SA_FULL],
     ['POST', '/superadmin/restaurants/:id/assign-plan', SA_FULL],
     ['POST', '/superadmin/restaurants/:id/suspend', SA_FULL],
+    ['GET', '/superadmin/addon-catalog', SA_ANY],
+    ['POST', '/superadmin/restaurants/:id/addons', SA_FULL],
+    ['DELETE', '/superadmin/restaurants/:id/addons/:addonId', SA_FULL],
     ['POST', '/superadmin/restaurants/:id/backup', SA_FULL],
     ['GET', '/superadmin/restaurants/:id/backups', SA_ANY],
     ['GET', '/superadmin/restaurants/:id/backups/:filename', SA_ANY],
@@ -379,6 +389,8 @@ const EXPECTED = [
     ['PUT', '/superadmin/plans/:id', SA_FULL],
     ['PATCH', '/superadmin/plans/:id/archive', SA_FULL],
     ['DELETE', '/superadmin/plans/:id', SA_FULL],
+    ['GET', '/superadmin/plans/:id/tenant-impact', SA_ANY],
+    ['POST', '/superadmin/plans/:id/push', SA_FULL],
     ['GET', '/superadmin/blog', SA_ANY],
     ['GET', '/superadmin/blog/:id', SA_ANY],
     ['POST', '/superadmin/blog', SA_FULL],

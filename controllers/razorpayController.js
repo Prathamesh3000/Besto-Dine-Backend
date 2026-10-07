@@ -22,7 +22,7 @@ const { notifyTenantHalted, notifyTenantCancelled } = require('../utils/alerts')
 const { tenantFilter, tenantId } = require('../utils/tenantScope');
 const { resolveLoyaltySettings } = require('../utils/paymentDefaults');
 const { createTipForPaidOrder, revokeTipsForOrder } = require('../utils/tipHelpers');
-const { freeTableOrUnmergeGroup } = require('../utils/tableMerge');
+const { releaseTableIfSettled } = require('../utils/tableOccupancy');
 const {
     applyPendingUpgrade,
     applyPaidPlanUpgrade,
@@ -121,25 +121,20 @@ async function fetchPaymentAndOrder(paymentId, razorpayOrderId) {
     return { payment, rzpOrder };
 }
 
-// Free a dine-in table (and every merged sibling) once payment lands
-// AND the order has been served. Mirrors the same rule used by
-// orderController.updateOrderStatus + customerPayment so admin /
-// waiter grids reflect the released table without a fresh fetch.
-// Tenant scope comes from the order's own `restaurant` field — never
-// from the request — so a webhook (which has no req.user) still
-// scopes correctly.
+// Free a dine-in table (and every merged sibling) once payment lands.
+// Table-status rule (utils/tableOccupancy.releaseTableIfSettled): the
+// table turns Free as soon as no order on it / its merge group is
+// unsettled — kitchen status no longer matters (a paid order still being
+// cooked stays on the KDS). Another party's unpaid order keeps it
+// occupied (activeOrder repointed). Tenant scope comes from the order's
+// own `restaurant` field — never from the request — so a webhook / the
+// reconciliation job (no req.user) still scopes and emits correctly.
 async function freeTableIfReady(order) {
     if (!order || !order.table) return;
-    if (order.status !== 'served') return;
-    if (order.paymentStatus !== 'Paid') return;
+    if (order.paymentStatus !== 'Paid' && order.paymentStatus !== 'Refunded') return;
     try {
         const tf = order.restaurant ? { restaurant: order.restaurant } : {};
-        const { freedIds } = await freeTableOrUnmergeGroup(order.table, tf);
-        const ids = freedIds.length ? freedIds : [order.table];
-        const io = getIO();
-        for (const id of ids) {
-            emitToStaff(io, order.branch || null, EVENTS.TABLE_UPDATED, { tableId: id, status: 'free', restaurant: order.restaurant ? String(order.restaurant) : undefined });
-        }
+        await releaseTableIfSettled(order, tf, { branch: order.branch || null, restaurant: order.restaurant });
     } catch (err) {
         logger.warn('Razorpay path failed to free table:', err.message);
     }
@@ -172,7 +167,6 @@ async function settleSiblingDineInRounds(order, paymentMethod) {
             if (!sib.paidAt) sib.paidAt = new Date();
             await sib.save();
             try { await createTipForPaidOrder(sib, sib.restaurant || order.restaurant); } catch { /* tip best-effort */ }
-            await freeTableIfReady(sib);
         }
         if (siblings.length) {
             logger.info(`Settled ${siblings.length} sibling dine-in round(s) with ${order.orderId} on table ${order.table}`);
@@ -236,7 +230,6 @@ async function settleSplitSiblings(order, paymentMethod) {
             );
             if (!updated) continue;
             try { await createTipForPaidOrder(updated, updated.restaurant || order.restaurant); } catch { /* tip best-effort */ }
-            await freeTableIfReady(updated);
         }
         logger.info(`Settled ${splits.length} linked split order(s) with ${order.orderId}`);
     } catch (err) {
@@ -772,7 +765,7 @@ exports.verifyPayment = async (req, res) => {
             // Mixed-cart checkout: the linked counter-side split doc(s).
             await settleSplitSiblings(order, 'online');
 
-            // Release the table if the order was already served.
+            // Release the table now that the bill is settled.
             await freeTableIfReady(order);
 
             // Persist only — the live events go out via broadcastPaymentEvent.
@@ -2314,6 +2307,9 @@ async function settleReconciledCapture(order, captured) {
     }
     await awardLoyaltyPoints(paidOrder);
     await settleSplitSiblings(paidOrder, 'online');
+    // Settled → free the dine-in table (no-op while another order on it
+    // is unpaid).
+    await freeTableIfReady(paidOrder);
     return { status: 'recovered', amount: paidOrder.amountPaid };
 }
 

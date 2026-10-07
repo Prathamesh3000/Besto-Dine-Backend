@@ -53,8 +53,13 @@ jest.mock('../models/advanceBooking', () => ({
 }));
 jest.mock('../models/menuItem', () => ({ updateMany: (...a) => mockMenuUpdateMany(...a) }));
 
+// Updated 2026-10 (table-status rule): the empty-order sweeper releases
+// tables through utils/tableOccupancy.releaseTableIfSettled, which checks
+// for other unpaid orders, frees the group and emits `table:updated`
+// itself (covered by __tests__/tableOccupancyRelease.test.js and the
+// integration suite). Here it is mocked; mockFreeTable stands in for it.
 const mockFreeTable = jest.fn();
-jest.mock('../utils/tableMerge', () => ({ freeTableOrUnmergeGroup: (...a) => mockFreeTable(...a) }));
+jest.mock('../utils/tableOccupancy', () => ({ releaseTableIfSettled: (...a) => mockFreeTable(...a) }));
 
 const mockRoomEmits = [];
 const mockEmitToStaff = jest.fn();
@@ -179,11 +184,12 @@ describe('emptyOrderSweeper', () => {
             { $set: { status: 'cancelled', cancelReason: 'auto-sweeper', cancelReasonNote: expect.any(String), cancelledAt: NOW } },
         );
         expect(mockTableFindOne).toHaveBeenCalledWith({ _id: 'tbl1', activeOrder: 'o1' });
-        expect(mockFreeTable).toHaveBeenCalledWith('tbl1', { restaurant: T1 });
-        expect(mockEmitToStaff.mock.calls).toEqual([
-            [expect.any(Object), B1, 'table:updated', { tableId: 'tbl1', status: 'free', restaurant: T1 }],
-            [expect.any(Object), B1, 'table:updated', { tableId: 'tbl2', status: 'free', restaurant: T1 }],
-        ]);
+        // Updated 2026-10: the release goes through releaseTableIfSettled
+        // (order + tenant scope + emit routing); the staff `table:updated`
+        // emit now happens inside that helper.
+        expect(mockFreeTable).toHaveBeenCalledWith(
+            expect.objectContaining({ _id: 'o1', table: 'tbl1' }), { restaurant: T1 }, { branch: B1, restaurant: T1 },
+        );
         expect(mockRoomEmits).toEqual([
             { room: 'table:tbl1', event: 'session:ended', payload: { tableId: 'tbl1', reason: 'inactivity', graceMinutes: 30 } },
             { room: 'table:tbl2', event: 'session:ended', payload: { tableId: 'tbl2', reason: 'inactivity', graceMinutes: 30 } },
@@ -210,8 +216,12 @@ describe('emptyOrderSweeper', () => {
         mockFreeTable.mockImplementation(async (id) => ({ freedIds: [id] }));
         const r = await runEmptyOrderSweep();
         expect(r).toEqual({ cancelled: 0, freedTables: 2 });
-        expect(mockFreeTable.mock.calls).toEqual([['g1', { restaurant: T1 }], ['g2', { restaurant: T2 }]]);
-        expect(mockEmitToStaff.mock.calls.map((c) => [c[1], c[3].restaurant])).toEqual([[B1, T1], [null, T2]]);
+        // Updated 2026-10: released via releaseTableIfSettled (which emits
+        // table:updated with this branch / tenant routing itself).
+        expect(mockFreeTable.mock.calls).toEqual([
+            ['g1', { restaurant: T1 }, { branch: B1, restaurant: T1 }],
+            ['g2', { restaurant: T2 }, { branch: null, restaurant: T2 }],
+        ]);
         expect(logger.info).toHaveBeenCalledWith('Empty order sweeper finished', expect.objectContaining({ freedGhostTables: 2, restaurant: 'all' }));
     });
 

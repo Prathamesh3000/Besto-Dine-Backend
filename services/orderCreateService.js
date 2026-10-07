@@ -662,7 +662,10 @@ async function detachStalePaidBill(req, type, resolvedTableId) {
       if (stalePaid) {
         stalePaid.table = null;
         await stalePaid.save();
-        await freeTableOrUnmergeGroup(resolvedTableId, tenantFilter(req));
+        // keepSeats: the ordering party claimed its seat moments ago
+        // (claimSeat runs before this phase) — detaching the previous
+        // party's paid bill must not wipe it.
+        await freeTableOrUnmergeGroup(resolvedTableId, tenantFilter(req), { keepSeats: true });
       }
     } catch (err) {
       logger.warn('Stale paid-bill detach skipped:', err.message);
@@ -1261,6 +1264,17 @@ async function createOrder(req) {
     savedOrder, counterSideOrder, settings, hasKitchenWork, type, validTableId,
     resolvedTableId, resolvedAreaId, resolvedTableName, authoritativeTotal,
   });
+
+  // Thermal KOT(s) to the branch's print agent (services/printService.js),
+  // one per station. Post-response and best-effort: a printer problem can
+  // never fail or delay a committed order.
+  postResponseTasks.push(['print kot', async () => {
+    const { enqueueKotJobs } = require('./printService');
+    await enqueueKotJobs({ order: savedOrder, items: savedOrder.items, reason: 'create' });
+    if (counterSideOrder) {
+      await enqueueKotJobs({ order: counterSideOrder, items: counterSideOrder.items, reason: 'create' });
+    }
+  }]);
 
   // Inventory deduction for the kitchen-bypass path. The normal flow
   // runs deductInventoryForOrder when status transitions to

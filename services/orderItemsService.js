@@ -294,6 +294,8 @@ async function repeatOrderItem(req) {
       { orderId: sourceOrder.orderId, addedItems: [stampedItem], deltaTotal: repeatDelta },
       sourceOrder
     );
+    // Thermal "ADDED ITEMS" KOT for the repeated line (best-effort).
+    require('./printService').enqueueKotJobs({ order: sourceOrder, items: [stampedItem], reason: 'append' }).catch(() => {});
     emitOrderEvent(
       'order:updated',
       { orderId: sourceOrder.orderId, status: sourceOrder.status },
@@ -591,6 +593,8 @@ async function appendRepeatToActiveOrder(req, { target, sourceOrder, repeatKitch
 
   emitOrderEvent('order:appended', { orderId: target.orderId, addedItems: repeatKitchen, deltaTotal }, target);
   emitOrderEvent('order:updated', { orderId: target.orderId, status: target.status }, target);
+  // Thermal "ADDED ITEMS" KOT for the repeated lines (best-effort).
+  require('./printService').enqueueKotJobs({ order: target, items: repeatKitchen, reason: 'append' }).catch(() => {});
 
   const isSource = target === sourceOrder;
   return reply(200, {
@@ -931,6 +935,8 @@ async function appendOrderItems(req) {
       },
       order
     );
+    // Thermal "ADDED ITEMS" KOT with only the new lines (best-effort).
+    require('./printService').enqueueKotJobs({ order, items: enrichedItems, reason: 'append' }).catch(() => {});
     emitOrderEvent(
       'order:updated',
       { orderId: order.orderId, status: order.status },

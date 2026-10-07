@@ -25,8 +25,8 @@
 const Order = require('../models/order');
 const Table = require('../models/table');
 const logger = require('./logger');
-const { getIO, emitToStaff } = require('./socket');
-const { freeTableOrUnmergeGroup } = require('./tableMerge');
+const { getIO } = require('./socket');
+const { releaseTableIfSettled } = require('./tableOccupancy');
 const { runWithoutContext } = require('./requestContext');
 
 // Accepts a Restaurant doc, an ObjectId, or an id string; null = all tenants.
@@ -103,20 +103,20 @@ async function runEmptyOrderSweep({ restaurant } = {}) {
                     }).select('_id branch');
 
                     if (table) {
-                        const { freedIds } = await freeTableOrUnmergeGroup(
-                            order.table,
-                            { restaurant: order.restaurant }
+                        // Same table-status rule as every settle / cancel
+                        // path: free (and emit table:updated) only when no
+                        // other order on the table is still unpaid —
+                        // otherwise activeOrder is repointed to it.
+                        const { freedIds } = await releaseTableIfSettled(
+                            order,
+                            { restaurant: order.restaurant },
+                            { branch: order.branch || null, restaurant: order.restaurant }
                         );
                         freedTables += freedIds.length;
 
                         try {
                             const io = getIO();
                             for (const id of freedIds) {
-                                emitToStaff(io, order.branch, 'table:updated', {
-                                    tableId: id,
-                                    status: 'free',
-                                    restaurant: order.restaurant ? String(order.restaurant) : undefined,
-                                });
                                 // Kick the customer-side guest session: any
                                 // browser in the `table:<id>` socket room
                                 // (guest who scanned the QR) gets this event
@@ -160,20 +160,18 @@ async function runEmptyOrderSweep({ restaurant } = {}) {
 
             for (const t of ghostTables) {
                 try {
-                    const { freedIds } = await freeTableOrUnmergeGroup(
+                    // No activeOrder, but never free a table that still
+                    // has an unpaid order on it (releaseTableIfSettled).
+                    const { freedIds } = await releaseTableIfSettled(
                         t._id,
-                        { restaurant: t.restaurant }
+                        { restaurant: t.restaurant },
+                        { branch: t.branch || null, restaurant: t.restaurant }
                     );
                     freedGhostTables += freedIds.length;
 
                     try {
                         const io = getIO();
                         for (const id of freedIds) {
-                            emitToStaff(io, t.branch, 'table:updated', {
-                                tableId: id,
-                                status: 'free',
-                                restaurant: t.restaurant ? String(t.restaurant) : undefined,
-                            });
                             io.to(`table:${id}`).emit('session:ended', {
                                 tableId: String(id),
                                 reason: 'inactivity',

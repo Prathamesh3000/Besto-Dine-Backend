@@ -284,6 +284,10 @@ async function reprintKOT(req) {
     });
   } catch { /* socket not critical */ }
 
+  // Thermal reprint on the station printers too (services/printService.js).
+  // Explicit staff action, so it ignores the auto-print toggles.
+  require('./printService').enqueueKotJobs({ order, items: order.items, reason: 'reprint' }).catch(() => {});
+
   logger.info(`KOT reprinted for ${order.orderId} by ${req.user?._id || 'unknown'}`);
 
   return reply(200, {

@@ -14,8 +14,17 @@ const { idempotency } = require('../middlewares/idempotency');
 const dynamicOrderGate = (req, res, next) => {
     const isTakeaway = req.body?.type === 'takeaway';
     const feature = isTakeaway ? 'takeaway' : 'dineIn';
-    return featureGate(feature)(req, res, next);
+    return featureGate(feature)(req, res, (err) => {
+        if (err) return next(err);
+        // Self-order kiosk is its own paid module. orderCreateService only
+        // honours source='kiosk' from an unauthenticated caller, so that's
+        // exactly the set of requests that must carry the kiosk feature.
+        if (req.body?.source === 'kiosk' && !req.user) return kioskGate(req, res, next);
+        return next();
+    });
 };
+const kioskGate = featureGate('kiosk');
+const kitchenGate = featureGate('kitchenDisplay');
 
 // CRIT-13 — per-table / per-user rate limit on POST /orders.
 // The global 200/min limiter is per-IP and too generous for guest
@@ -74,11 +83,11 @@ router.post('/delivery-quote', optionalAuth, deliveryQuoteLimiter, featureGate('
 router.get('/live', protect, staffOnly, orderController.getLiveOrders);
 router.get('/past', protect, staffOnly, orderController.getPastOrders);
 router.get('/refunds', protect, staffOnly, orderController.getRefunds);
-router.get('/kitchen', protect, staffOnly, checkPermission('accessKitchen'), orderController.getKitchenOrders);
+router.get('/kitchen', protect, staffOnly, kitchenGate, checkPermission('accessKitchen'), orderController.getKitchenOrders);
 // Completed list behind the chef dashboard's "Completed" badge. That
 // badge was a read-only count with nothing to open — the chef could
 // see that 34 orders went out but not which.
-router.get('/kitchen/completed', protect, staffOnly, checkPermission('accessKitchen'), orderController.getCompletedKitchenOrders);
+router.get('/kitchen/completed', protect, staffOnly, kitchenGate, checkPermission('accessKitchen'), orderController.getCompletedKitchenOrders);
 // Floor staff may CANCEL without the general `updateOrderStatus` flag.
 // Waiters ship with updateOrderStatus=false (they shouldn't be moving
 // kitchen state or marking bills paid), so the waiter app's Cancel

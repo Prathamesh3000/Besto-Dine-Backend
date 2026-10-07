@@ -18,7 +18,13 @@ const csvUpload = multer({
         const okMime = ['text/csv', 'application/vnd.ms-excel', 'text/plain', 'application/csv']
             .includes(file.mimetype);
         if (okExt || okMime) return cb(null, true);
-        cb(new Error('Only .csv files are allowed'), false);
+        // Marked as a client error so the global handler answers 400 with
+        // this message instead of a generic 500 (app.js maps MulterError
+        // size/field limits the same way).
+        const err = new Error('Only .csv files are allowed');
+        err.status = 400;
+        err.expose = true;
+        cb(err, false);
     },
 });
 

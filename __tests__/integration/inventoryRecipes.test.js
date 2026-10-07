@@ -518,6 +518,33 @@ describe('recipes', () => {
         });
         expect(res.body.issues[String(dOk._id)]).toBeUndefined();
     });
+
+    // Admin → Inventory → Recipes lists newest activity first, so a recipe
+    // the admin just created (or edited) is the first row on page 1.
+    test('GET /inventory/recipes puts the most recently created / edited recipe first', async () => {
+        const inv = await mkInv();
+        const first = await mkDish();
+        const secondDish = await mkDish();
+        const body = (dish, qty) => ({ menuItemId: String(dish._id), ingredients: [{ inventoryItem: String(inv._id), quantity: qty, unit: 'kg' }], yield: 1 });
+
+        expect((await admin().post('/inventory/recipes').send(body(first, 0.1))).status).toBe(200);
+        await settle(20);
+        expect((await admin().post('/inventory/recipes').send(body(secondDish, 0.2))).status).toBe(200);
+
+        let list = await admin().get('/inventory/recipes');
+        expect(list.status).toBe(200);
+        let ids = list.body.recipes.map((r) => String(r.menuItem._id));
+        expect(ids[0]).toBe(String(secondDish._id));
+        expect(ids[1]).toBe(String(first._id));
+
+        // Editing the older recipe moves it back to the top.
+        await settle(20);
+        expect((await admin().post('/inventory/recipes').send(body(first, 0.3))).status).toBe(200);
+        list = await admin().get('/inventory/recipes');
+        ids = list.body.recipes.map((r) => String(r.menuItem._id));
+        expect(ids[0]).toBe(String(first._id));
+        expect(ids[1]).toBe(String(secondDish._id));
+    });
 });
 
 // ═══════════════════════════════════════════════════════════════════════

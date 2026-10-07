@@ -23,6 +23,9 @@ const { SELF_SIGNUP_TRIAL_DAYS } = require('../utils/selfSignup');
 
 // ─── Shared validation helpers (mirrors superadminController) ──────────
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Plan a self-signup trials on (see registerRestaurant). Override per
+// deployment with SELF_SIGNUP_TRIAL_PLAN.
+const SELF_SIGNUP_TRIAL_PLAN_SLUG = process.env.SELF_SIGNUP_TRIAL_PLAN || 'gold';
 const SLUG_REGEX  = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -100,7 +103,7 @@ exports.listRestaurants = async (req, res) => {
         const restaurants = await Restaurant.find({
             status: { $in: ['active', 'trial'] },
         })
-            .select('name slug city contactPhone logo branding createdAt subscription featureOverrides')
+            .select('name slug city contactPhone logo branding createdAt subscription featureOverrides addons')
             .sort({ name: 1 })
             .lean();
 
@@ -141,7 +144,7 @@ exports.getRestaurantBySlug = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug: String(slug).toLowerCase().trim(),
             status: { $in: ['active', 'trial'] },
-        }).select('name slug city contactPhone logo branding subscription featureOverrides').lean();
+        }).select('name slug city contactPhone logo branding subscription featureOverrides addons').lean();
 
         if (!restaurant) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
@@ -339,10 +342,19 @@ exports.registerRestaurant = async (req, res) => {
         const signupMeta = buildSignupMeta(body, { ownerName: cleanOwner, ip: req.ip });
 
         // ── Resolve default plan ───────────────────────────────────────
-        // Prefer a plan explicitly slug'd 'free'; otherwise take the
-        // cheapest active plan. If no plans exist at all, the platform
-        // isn't set up yet — 503 and let the operator know.
+        // Prefer a plan explicitly slug'd 'free'; then the trial plan
+        // (Gold — "14 days of Gold", PRICING_PACKAGING §3); then the
+        // cheapest active plan that has a list price. Enterprise is priced
+        // 0 because it is quoted, so a plain cheapest-first pick handed
+        // every trial the full Enterprise module set. If no plans exist at
+        // all, the platform isn't set up yet — 503 and let the operator know.
         let plan = await SubscriptionPlan.findOne({ slug: 'free', isActive: true });
+        if (!plan) {
+            plan = await SubscriptionPlan.findOne({ slug: SELF_SIGNUP_TRIAL_PLAN_SLUG, isActive: true });
+        }
+        if (!plan) {
+            plan = await SubscriptionPlan.findOne({ isActive: true, price: { $gt: 0 } }).sort({ price: 1 });
+        }
         if (!plan) {
             plan = await SubscriptionPlan.findOne({ isActive: true }).sort({ price: 1 });
         }

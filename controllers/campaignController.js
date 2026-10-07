@@ -149,6 +149,7 @@ exports.updateCampaign = async (req, res) => {
     const invalid = validateCampaign({ ...existing, ...updates });
     if (invalid) return res.status(400).json({ success: false, message: invalid });
 
+    // AUDIT-EXEMPT: `filter` = { _id, ...tenantFilter(req), ...strictBranchFilter(req) } above
     const campaign = await Campaign.findOneAndUpdate(
       filter,
       updates,

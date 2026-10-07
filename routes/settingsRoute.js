@@ -28,7 +28,7 @@ function handleSettingsValidation(req, res, next) {
 }
 const settingsValidate = (chains) => [...chains, handleSettingsValidation];
 
-const OBJECT_SECTIONS = ['general', 'taxes', 'notifications', 'reservation', 'delivery', 'wallet', 'landingPage'];
+const OBJECT_SECTIONS = ['general', 'taxes', 'notifications', 'reservation', 'delivery', 'wallet', 'landingPage', 'printers'];
 const ARRAY_SECTIONS = ['operatingHours', 'branches'];
 const VALID_SECTIONS = [...OBJECT_SECTIONS, ...ARRAY_SECTIONS];
 
@@ -138,6 +138,37 @@ const SECTION_FIELD_RULES = {
         field(`${p}accentColor`, c).optional({ values: 'falsy' })
             .custom((v) => typeof v === 'string' && HEX_COLOR_RE.test(v.trim()))
             .withMessage('Accent colour must be a hex code like #FE8301'),
+    ],
+    // Thermal printers (models/settings.js `printers`). The `agent`
+    // block is server-owned and ignored here (controller strips it).
+    printers: (p, c) => [
+        field(`${p}enabled`, c).optional({ values: 'null' })
+            .isBoolean({ strict: true }).withMessage('enabled must be true or false'),
+        field(`${p}autoPrint`, c).optional({ values: 'null' })
+            .custom(isPlainObject).withMessage('autoPrint must be an object'),
+        ...['kotOnCreate', 'kotOnAppend', 'billOnPaid'].map((k) =>
+            field(`${p}autoPrint.${k}`, c).optional({ values: 'null' })
+                .isBoolean({ strict: true }).withMessage(`autoPrint.${k} must be true or false`)),
+        field(`${p}list`, c).optional({ values: 'null' })
+            .isArray({ max: 10 }).withMessage('At most 10 printers are allowed'),
+        field(`${p}list.*`, c)
+            .custom(isPlainObject).withMessage('Each printer must be an object').bail()
+            .custom((v) => (v.interface || 'lan') !== 'lan' || (typeof v.host === 'string' && v.host.trim().length > 0))
+            .withMessage('LAN printers need a host (IP address or hostname)'),
+        field(`${p}list.*.name`, c)
+            .isString().withMessage('Printer name must be text').bail()
+            .custom((v) => v.trim().length > 0 && v.trim().length <= 40)
+            .withMessage('Printer name must be 1-40 characters'),
+        field(`${p}list.*.station`, c).optional({ values: 'null' })
+            .isIn(['kitchen', 'bar', 'counter']).withMessage('Station must be kitchen, bar or counter'),
+        field(`${p}list.*.interface`, c).optional({ values: 'null' })
+            .isIn(['lan', 'usb']).withMessage('Interface must be lan or usb'),
+        field(`${p}list.*.port`, c).optional({ values: 'null' })
+            .isInt({ min: 1, max: 65535 }).withMessage('Port must be between 1 and 65535'),
+        field(`${p}list.*.paperWidth`, c).optional({ values: 'null' })
+            .isIn(['58', '80']).withMessage('Paper width must be 58 or 80'),
+        field(`${p}list.*.copies`, c).optional({ values: 'null' })
+            .isInt({ min: 1, max: 3 }).withMessage('Copies must be between 1 and 3'),
     ],
 };
 

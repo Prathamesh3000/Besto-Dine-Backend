@@ -3,6 +3,7 @@ const Branch = require('../models/branch');
 const Restaurant = require('../models/restaurant');
 const MenuItem = require('../models/menuItem');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const { invalidateCache } = require('../utils/settingsCache');
 const { getIO, emitToStaff } = require('../utils/socket');
 
@@ -646,7 +647,29 @@ function sanitizePublicSettings(settings) {
   if (copy.general && copy.general.legal) {
     delete copy.general.legal;
   }
+  // Printer hosts / agent state are staff-only infrastructure details.
+  delete copy.printers;
   return copy;
+}
+
+// PATCH /settings/printers replaces the whole section, but the UI only
+// knows about `enabled`, `autoPrint` and `list`. Carry the server-owned
+// `agent` block (key version, last seen) over from the stored doc so a
+// settings save can never reset `keyVersion` and resurrect a revoked
+// agent key; and give every printer row a stable id the agent can use
+// for per-printer overrides.
+function normalizePrinters(body, existingDoc) {
+  if (!body || typeof body !== 'object') return;
+  delete body.agent;
+  const existingAgent = existingDoc?.printers?.agent;
+  if (existingAgent) {
+    body.agent = typeof existingAgent.toObject === 'function' ? existingAgent.toObject() : { ...existingAgent };
+  }
+  if (Array.isArray(body.list)) {
+    body.list = body.list.map((p) => (p && typeof p === 'object'
+      ? { ...p, id: (typeof p.id === 'string' && p.id.trim()) ? p.id.trim() : crypto.randomUUID() }
+      : p));
+  }
 }
 
 function sanitizeMongoKeys(obj) {
@@ -855,7 +878,7 @@ exports.updateSettings = async (req, res) => {
 exports.updateSettingsSection = async (req, res) => {
   try {
     const { section } = req.params;
-    const validSections = ['general', 'operatingHours', 'taxes', 'notifications', 'reservation', 'wallet', 'branches', 'delivery', 'landingPage'];
+    const validSections = ['general', 'operatingHours', 'taxes', 'notifications', 'reservation', 'wallet', 'branches', 'delivery', 'landingPage', 'printers'];
 
     if (!validSections.includes(section)) {
       return res.status(400).json({ message: `Invalid section: ${section}. Valid sections: ${validSections.join(', ')}` });
@@ -905,6 +928,8 @@ exports.updateSettingsSection = async (req, res) => {
     if (!settings) {
       settings = await Settings.create(await buildDefaults(req));
     }
+
+    if (section === 'printers') normalizePrinters(req.body, settings);
 
     settings[section] = req.body;
 

@@ -37,6 +37,7 @@ const AuditLog = require('../models/auditLog');
 const SubscriptionInvoice = require('../models/subscriptionInvoice');
 const PlanChangeRequest = require('../models/planChangeRequest');
 const logger = require('../utils/logger');
+const { isAddonActive } = require('../utils/featureAccess');
 const {
     isBillingConfigured,
     ensureRazorpayPlan,
@@ -138,6 +139,16 @@ exports.getCurrentSubscription = async (req, res) => {
                     features: sub.features || {},
                     limits: sub.limits || {},
                 },
+                // Paid add-ons in force (modules bought on top of the plan).
+                addons: (restaurant.addons || [])
+                    .filter(a => isAddonActive(a))
+                    .map(a => ({
+                        _id: a._id,
+                        key: a.key,
+                        price: a.price || 0,
+                        startDate: a.startDate || null,
+                        endDate: a.endDate || null,
+                    })),
                 // ADM-105 — surface pending upgrade so the UI can
                 // render "Plan X (upgrading to Y — finish payment)".
                 // Null when no upgrade is in flight.

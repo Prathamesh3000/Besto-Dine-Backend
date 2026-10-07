@@ -501,7 +501,16 @@ exports.importCombosCsv = async (req, res) => {
         };
 
         const errors = [];
+        const skipped = [];
         let created = 0;
+
+        // Re-uploading a sheet must not duplicate combos: a row whose name
+        // already exists at this branch is reported as skipped (same rule
+        // as the menu / tables / halls importers).
+        const existingNames = new Set(
+            (await Combo.find({ restaurant: restaurantId, branch: branchId || null }).select('name').lean())
+                .map((d) => String(d.name || '').trim().toLowerCase()),
+        );
 
         for (let i = 1; i < rows.length; i++) {
             const rowNum = i + 1;
@@ -515,6 +524,11 @@ exports.importCombosCsv = async (req, res) => {
                 const categoriesRaw = get('categories');
 
                 if (!name)        throw new Error('name is required');
+                if (existingNames.has(name.toLowerCase())) {
+                    skipped.push({ row: rowNum, name, reason: `"${name}" already exists` });
+                    continue;
+                }
+                existingNames.add(name.toLowerCase());
                 if (!description) throw new Error('description is required');
                 if (!categoriesRaw) throw new Error('categories cell is required');
                 const price = Number(priceRaw);
@@ -602,6 +616,8 @@ exports.importCombosCsv = async (req, res) => {
         return res.status(200).json({
             success: true,
             created,
+            skippedCount: skipped.length,
+            skipped,
             errorCount: errors.length,
             errors,
         });

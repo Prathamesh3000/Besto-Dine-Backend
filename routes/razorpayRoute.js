@@ -13,6 +13,7 @@ const {
 } = require('../controllers/razorpayController');
 const { optionalAuth, protect, adminOnly, checkPermission } = require('../middlewares/authMiddleware');
 const { idempotency } = require('../middlewares/idempotency');
+const { featureGate } = require('../middlewares/featureGate');
 const { validate, body } = require('../middlewares/validate');
 
 // BUGS_REPORT #33 — request shape checks. Amount rules / required-field
@@ -104,7 +105,11 @@ const refundLimiter = makeLimiter({ name: 'rzp-refund',
 });
 
 // Public — guest checkout support (rate limited)
-router.post('/create-order', paymentCreateLimiter, optionalAuth, createOrderValidation, createRazorpayOrder);
+// Plan gate: starting a NEW online payment needs the paymentGateway module.
+// Verify / webhook / refund endpoints are deliberately left open so a
+// payment already in flight (or money already taken) can always settle.
+const gatewayGate = featureGate('paymentGateway');
+router.post('/create-order', paymentCreateLimiter, optionalAuth, gatewayGate, createOrderValidation, createRazorpayOrder);
 // CRIT-16 — verify endpoints must be idempotent. Clients should send a
 // stable Idempotency-Key (e.g. the Razorpay order_id); retries replay the
 // cached response. Header is optional today for back-compat; tighten to
@@ -126,7 +131,7 @@ router.post('/refund', refundLimiter, protect, adminOnly, checkPermission('refun
 router.post('/orphan-refund', refundLimiter, optionalAuth, orphanRefundValidation, refundOrphanPayment);
 
 // Wallet recharge via Razorpay — authenticated users (rate limited)
-router.post('/create-wallet-recharge', paymentCreateLimiter, protect, createWalletRechargeOrder);
+router.post('/create-wallet-recharge', paymentCreateLimiter, protect, featureGate('walletLoyalty'), gatewayGate, createWalletRechargeOrder);
 router.post('/verify-wallet-recharge', paymentVerifyLimiter, protect, verifyWalletRechargeValidation, idempotency(), verifyWalletRecharge);
 
 // Payment reconciliation — admin only

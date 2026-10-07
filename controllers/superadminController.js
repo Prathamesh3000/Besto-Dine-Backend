@@ -86,6 +86,29 @@ function generateTempPassword(length = 14) {
 // Pull a plain object snapshot of the plan's features/limits — used when a
 // plan is assigned so the tenant's contract doesn't drift if the plan is
 // edited later.
+// Monthly revenue from a tenant's active paid add-ons (aggregation
+// expression). Added on top of the plan price in every MRR figure.
+const ADDON_MRR_EXPR = {
+    $sum: {
+        $map: {
+            input: {
+                $filter: {
+                    input: { $ifNull: ['$addons', []] },
+                    as: 'a',
+                    cond: {
+                        $and: [
+                            { $eq: ['$$a.status', 'active'] },
+                            { $or: [{ $not: ['$$a.endDate'] }, { $gt: ['$$a.endDate', '$$NOW'] }] },
+                        ],
+                    },
+                },
+            },
+            as: 'a',
+            in: { $ifNull: ['$$a.price', 0] },
+        },
+    },
+};
+
 function snapshotPlan(plan) {
     return {
         plan: plan._id,
@@ -114,6 +137,7 @@ function buildRestaurantPayload(r) {
         owner: r.owner,
         subscription: r.subscription,
         featureOverrides: r.featureOverrides || {},
+        addons: r.addons || [],
         suspendedAt: r.suspendedAt,
         suspendedReason: r.suspendedReason,
         signupSource: r.signupSource || 'admin',
@@ -210,7 +234,11 @@ exports.listRestaurants = async (req, res) => {
                                 $cond: [
                                     { $eq: ['$status', 'active'] },
                                     // Agreed (snapshot) price first; live plan price only as a legacy fallback.
-                                    { $ifNull: ['$subscription.price', { $ifNull: [{ $arrayElemAt: ['$planDoc.price', 0] }, 0] }] },
+                                    // Plus any active paid add-ons.
+                                    { $add: [
+                                        { $ifNull: ['$subscription.price', { $ifNull: [{ $arrayElemAt: ['$planDoc.price', 0] }, 0] }] },
+                                        ADDON_MRR_EXPR,
+                                    ] },
                                     0,
                                 ],
                             },
@@ -734,6 +762,23 @@ exports.updateRestaurant = async (req, res) => {
         const restaurant = await Restaurant.findById(id);
         if (!restaurant) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
+        }
+
+        // featureOverrides: { [moduleKey]: true | false } — tiered keys may
+        // also carry a level. Anything else would silently become a
+        // module gate nobody can see, so reject it.
+        if (req.body.featureOverrides !== undefined) {
+            const ov = req.body.featureOverrides;
+            if (!ov || typeof ov !== 'object' || Array.isArray(ov)) {
+                return res.status(400).json({ success: false, message: 'featureOverrides must be an object' });
+            }
+            const known = new Set([...SubscriptionPlan.FEATURE_KEYS, 'revenueAnalytics']);
+            for (const [k, v] of Object.entries(ov)) {
+                const tierOk = k === 'revenueAnalytics' && ['none', 'basic', 'standard', 'advanced'].includes(v);
+                if (!known.has(k) || !(typeof v === 'boolean' || tierOk)) {
+                    return res.status(400).json({ success: false, message: `Invalid feature override "${k}"` });
+                }
+            }
         }
 
         const allowed = ['name', 'contactPhone', 'city', 'logo', 'featureOverrides'];
@@ -1595,7 +1640,11 @@ exports.getPlatformAnalytics = async (_req, res) => {
             // current plan price.
             {
                 $addFields: {
-                    _agreedPrice: { $ifNull: ['$subscription.price', { $ifNull: ['$_plan.price', 0] }] },
+                    _agreedPrice: { $add: [
+                        { $ifNull: ['$subscription.price', { $ifNull: ['$_plan.price', 0] }] },
+                        // Active paid add-ons count toward MRR too.
+                        ADDON_MRR_EXPR,
+                    ] },
                 },
             },
             {
@@ -3702,5 +3751,241 @@ exports.listSubscriptionPayments = async (req, res) => {
     } catch (err) {
         logger.error('listSubscriptionPayments error: ' + err.message);
         return res.status(500).json({ success: false, message: 'Failed to load subscription payments' });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Module management — push plan edits to tenants, paid add-ons
+// ═══════════════════════════════════════════════════════════════════════
+
+const { ADDON_CATALOG, TIERED_KEYS, isAddonActive } = require('../utils/featureAccess');
+
+function planSnapshotParts(plan) {
+    const snap = snapshotPlan(plan);
+    return { features: snap.features, limits: snap.limits };
+}
+
+// Stable JSON for comparing snapshots regardless of key order.
+function stableJson(obj) {
+    if (!obj || typeof obj !== 'object') return JSON.stringify(obj ?? null);
+    return JSON.stringify(Object.keys(obj).sort().reduce((acc, k) => { acc[k] = obj[k]; return acc; }, {}));
+}
+
+// GET /api/v1/superadmin/plans/:id/tenant-impact
+// How many restaurants are on this plan and how many of them still carry
+// an older copy of its modules/limits (i.e. would change on a push).
+exports.getPlanTenantImpact = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.isValidObjectId(id)) {
+            return res.status(400).json({ success: false, message: 'Invalid plan id' });
+        }
+        const plan = await SubscriptionPlan.findById(id);
+        if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
+
+        const { features, limits } = planSnapshotParts(plan);
+        const wantF = stableJson(features);
+        const wantL = stableJson(limits);
+        const tenants = await Restaurant.find({ 'subscription.plan': plan._id })
+            .select('name slug subscription.features subscription.limits')
+            .lean();
+        const outOfSync = tenants.filter(t =>
+            stableJson(t.subscription?.features || {}) !== wantF
+            || stableJson(t.subscription?.limits || {}) !== wantL);
+
+        const [pendingUpgrades, scheduledDowngrades] = await Promise.all([
+            Restaurant.countDocuments({ 'subscription.pendingUpgrade.plan': plan._id }),
+            Restaurant.countDocuments({ 'subscription.scheduledDowngrade.plan': plan._id }),
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                planId: plan._id,
+                planName: plan.name,
+                assignedCount: tenants.length,
+                outOfSyncCount: outOfSync.length,
+                outOfSync: outOfSync.slice(0, 50).map(t => ({ _id: t._id, name: t.name, slug: t.slug })),
+                pendingUpgrades,
+                scheduledDowngrades,
+            },
+        });
+    } catch (err) {
+        logger.error('getPlanTenantImpact error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to load plan impact' });
+    }
+};
+
+// POST /api/v1/superadmin/plans/:id/push   Body: { confirm: true }
+//
+// Copies the plan's CURRENT modules and limits onto every restaurant
+// assigned to it (plus any pending upgrade / scheduled downgrade that
+// targets it). Editing a plan never does this on its own — tenants keep
+// the snapshot they signed up with until the Super Admin pushes.
+//
+// The agreed price is deliberately NOT touched (price protection), and
+// per-tenant featureOverrides / add-ons keep winning over the plan.
+exports.pushPlanToTenants = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!mongoose.isValidObjectId(id)) {
+            return res.status(400).json({ success: false, message: 'Invalid plan id' });
+        }
+        if (req.body?.confirm !== true) {
+            return res.status(400).json({
+                success: false,
+                code: 'CONFIRM_REQUIRED',
+                message: 'Send { "confirm": true } to push this plan to its restaurants.',
+            });
+        }
+        const plan = await SubscriptionPlan.findById(id);
+        if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
+
+        const { features, limits } = planSnapshotParts(plan);
+
+        const [live, pending, scheduled] = await Promise.all([
+            Restaurant.updateMany(
+                { 'subscription.plan': plan._id },
+                { $set: {
+                    'subscription.features': features,
+                    'subscription.limits': limits,
+                    'subscription.planName': plan.name,
+                } },
+            ),
+            Restaurant.updateMany(
+                { 'subscription.pendingUpgrade.plan': plan._id },
+                { $set: {
+                    'subscription.pendingUpgrade.features': features,
+                    'subscription.pendingUpgrade.limits': limits,
+                    'subscription.pendingUpgrade.planName': plan.name,
+                } },
+            ),
+            Restaurant.updateMany(
+                { 'subscription.scheduledDowngrade.plan': plan._id },
+                { $set: {
+                    'subscription.scheduledDowngrade.features': features,
+                    'subscription.scheduledDowngrade.limits': limits,
+                    'subscription.scheduledDowngrade.planName': plan.name,
+                } },
+            ),
+        ]);
+
+        const result = {
+            matched: live.matchedCount,
+            updated: live.modifiedCount,
+            pendingUpgradesUpdated: pending.modifiedCount,
+            scheduledDowngradesUpdated: scheduled.modifiedCount,
+        };
+
+        await recordAudit(req, {
+            action: 'plan.push',
+            targetType: 'plan',
+            targetId: plan._id,
+            targetName: plan.name,
+            details: { slug: plan.slug, ...result },
+        });
+
+        return res.status(200).json({ success: true, data: result });
+    } catch (err) {
+        logger.error('pushPlanToTenants error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to push plan to restaurants' });
+    }
+};
+
+// GET /api/v1/superadmin/addon-catalog
+exports.getAddonCatalog = (_req, res) => {
+    const catalog = Object.entries(ADDON_CATALOG).map(([key, v]) => ({ key, ...v }));
+    return res.status(200).json({ success: true, data: catalog });
+};
+
+// POST /api/v1/superadmin/restaurants/:id/addons
+// Body: { key, price?, endDate?, note? }
+exports.addRestaurantAddon = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { key, note } = req.body || {};
+        if (!SubscriptionPlan.FEATURE_KEYS.includes(key) || TIERED_KEYS.has(key)) {
+            return res.status(400).json({ success: false, message: `"${key}" is not a module that can be sold as an add-on.` });
+        }
+        let price = req.body?.price;
+        if (price === undefined || price === null || price === '') price = ADDON_CATALOG[key]?.monthlyPrice ?? 0;
+        price = Number(price);
+        if (!Number.isFinite(price) || price < 0) {
+            return res.status(400).json({ success: false, message: 'Price must be a number of 0 or more.' });
+        }
+        let endDate = null;
+        if (req.body?.endDate) {
+            endDate = new Date(req.body.endDate);
+            if (Number.isNaN(endDate.getTime()) || endDate <= new Date()) {
+                return res.status(400).json({ success: false, message: 'End date must be a valid future date.' });
+            }
+        }
+
+        const restaurant = await Restaurant.findById(id);
+        if (!restaurant) return res.status(404).json({ success: false, message: 'Restaurant not found' });
+
+        if ((restaurant.addons || []).some(a => a.key === key && isAddonActive(a))) {
+            return res.status(409).json({ success: false, code: 'ADDON_EXISTS', message: 'This add-on is already active for the restaurant.' });
+        }
+
+        restaurant.addons.push({
+            key,
+            price,
+            status: 'active',
+            startDate: new Date(),
+            endDate: endDate || undefined,
+            note: typeof note === 'string' ? note.slice(0, 300) : '',
+            addedBy: req.user?.email || '',
+        });
+        await restaurant.save();
+        const added = restaurant.addons[restaurant.addons.length - 1];
+
+        await recordAudit(req, {
+            action: 'restaurant.addon.add',
+            targetType: 'restaurant',
+            targetId: restaurant._id,
+            targetName: restaurant.name,
+            details: { key, price, endDate },
+        });
+
+        return res.status(201).json({ success: true, data: { addon: added, addons: restaurant.addons } });
+    } catch (err) {
+        logger.error('addRestaurantAddon error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to add add-on' });
+    }
+};
+
+// DELETE /api/v1/superadmin/restaurants/:id/addons/:addonId
+// Cancels (not deletes) so the history stays for billing questions.
+exports.cancelRestaurantAddon = async (req, res) => {
+    try {
+        const { id, addonId } = req.params;
+        if (!mongoose.isValidObjectId(addonId)) {
+            return res.status(400).json({ success: false, message: 'Invalid add-on id' });
+        }
+        const restaurant = await Restaurant.findById(id);
+        if (!restaurant) return res.status(404).json({ success: false, message: 'Restaurant not found' });
+        const addon = restaurant.addons.id(addonId);
+        if (!addon) return res.status(404).json({ success: false, message: 'Add-on not found' });
+        if (addon.status === 'cancelled') {
+            return res.status(200).json({ success: true, data: { addon, addons: restaurant.addons } });
+        }
+        addon.status = 'cancelled';
+        addon.cancelledAt = new Date();
+        addon.cancelledBy = req.user?.email || '';
+        await restaurant.save();
+
+        await recordAudit(req, {
+            action: 'restaurant.addon.cancel',
+            targetType: 'restaurant',
+            targetId: restaurant._id,
+            targetName: restaurant.name,
+            details: { key: addon.key, price: addon.price },
+        });
+
+        return res.status(200).json({ success: true, data: { addon, addons: restaurant.addons } });
+    } catch (err) {
+        logger.error('cancelRestaurantAddon error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to cancel add-on' });
     }
 };

@@ -11,6 +11,11 @@ const logger = require('../utils/logger');
 
 const { tenantFilter, analyticsBranchFilter, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
 const { sendServerError } = require('../utils/httpErrors');
+const { featureTier } = require('../utils/featureAccess');
+
+// Basic-tier revenue analytics covers short windows only (a month);
+// Standard and above get the full 2-year range.
+const BASIC_REPORT_MAX_DAYS = 31;
 
 // Reports roll up by local-business-day / local-business-hour, not UTC.
 // Without this, MongoDB's $hour/$dayOfMonth/$dateToString run in UTC and a
@@ -575,6 +580,20 @@ exports.getReports = async (req, res) => {
     const rangeMatch = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, ...tfb };
     const spanMs = toExclUTC.getTime() - fromUTC.getTime();
     const rangeDays = Math.max(1, Math.round(spanMs / 86400000));
+
+    if (req.restaurant && featureTier(req.restaurant, 'revenueAnalytics') === 'basic'
+        && rangeDays > BASIC_REPORT_MAX_DAYS) {
+      return res.status(403).json({
+        success: false,
+        code: 'FEATURE_LOCKED',
+        feature: 'revenueAnalytics',
+        requiredTier: 'standard',
+        currentTier: 'basic',
+        maxDays: BASIC_REPORT_MAX_DAYS,
+        currentPlan: req.restaurant.subscription?.planName || 'Unknown',
+        message: `Your plan's reports cover up to ${BASIC_REPORT_MAX_DAYS} days at a time. Upgrade for longer date ranges.`,
+      });
+    }
     // Earned = Paid and not cancelled (cancelled-but-unrefunded orders keep 'Paid').
     const PAID = { $and: [{ $eq: ['$paymentStatus', 'Paid'] }, { $ne: ['$status', 'cancelled'] }] };
 

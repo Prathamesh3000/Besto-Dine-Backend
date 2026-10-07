@@ -217,7 +217,8 @@ describe('verifyTypedToken — scan / kiosk tokens', () => {
 
     test('TOKEN_TYPES is frozen', () => {
         expect(Object.isFrozen(auth.TOKEN_TYPES)).toBe(true);
-        expect(auth.TOKEN_TYPES).toEqual({ USER: 'user', SCAN: 'scan', KIOSK: 'kiosk' });
+        // 'agent' = long-lived print-agent credential (thermal printing, Oct 2026).
+        expect(auth.TOKEN_TYPES).toEqual({ USER: 'user', SCAN: 'scan', KIOSK: 'kiosk', AGENT: 'agent' });
     });
 
     test('signTypedToken stamps typ and round-trips through verifyTypedToken', () => {

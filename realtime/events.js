@@ -55,6 +55,11 @@ const EVENTS = Object.freeze({
     SETTINGS_UPDATED: 'settings:updated',
     MENU_UPDATED: 'menu:updated',
     AUTH_RELOAD: 'auth:reload',
+
+    // Thermal printing (services/printService.js ↔ print-agent/)
+    PRINT_JOB: 'print:job',                   // server → agent: a job to print
+    PRINT_JOB_UPDATED: 'print:job-updated',   // server → admin: job status changed
+    PRINT_AGENT_STATUS: 'print:agent-status', // server → admin: agent online/offline
 });
 
 const ALL_EVENTS = Object.freeze(Object.values(EVENTS));

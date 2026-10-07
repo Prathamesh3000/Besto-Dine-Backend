@@ -325,6 +325,7 @@ exports.getCustomerCRM = async (req, res) => {
         // of CUSTOMERS with activity (wallet / orders) in the caller's
         // tenant — never another tenant's users or any staff account.
         const user = (wallet || orders.length)
+            // AUDIT-EXEMPT: users are platform-wide; reached only after a tenant-scoped wallet/order match
             ? await User.findOne({ _id: userId, role: 'customer' }).select('name email')
             : null;
         if (!user) {
@@ -553,6 +554,7 @@ exports.updateCoupon = async (req, res) => {
             if (pinnedBranchId(req)) delete updateData.branch;
             else updateData.branch = branchCheck.branchId;
         }
+        // AUDIT-EXEMPT: `filter` is the tenant/branch-scoped coupon filter used for the findOne above
         const coupon = await Coupon.findOneAndUpdate(
             filter,
             updateData,

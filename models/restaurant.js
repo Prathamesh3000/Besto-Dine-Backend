@@ -271,6 +271,25 @@ const restaurantSchema = new mongoose.Schema({
     // featureOverrides[key] = true | false → wins over subscription.features[key].
     featureOverrides: { type: Object, default: {} },
 
+    // Paid add-ons — single modules bought on top of the base plan (e.g.
+    // hall bookings on Gold). An active add-on switches its feature key on
+    // (see utils/featureAccess). Kept outside `subscription` on purpose:
+    // plan assignment rewrites the subscription block wholesale, and a
+    // plan change must not silently drop an add-on the tenant paid for.
+    addons: [{
+        key:       { type: String, required: true, trim: true },
+        // Agreed monthly price (INR, before GST) — catalog default unless
+        // the Super Admin negotiated something else. Feeds MRR.
+        price:     { type: Number, default: 0, min: 0 },
+        status:    { type: String, enum: ['active', 'cancelled'], default: 'active' },
+        startDate: { type: Date, default: Date.now },
+        endDate:   { type: Date },          // null = until cancelled
+        note:      { type: String, default: '', maxlength: 300 },
+        addedBy:   { type: String, default: '' },   // super admin email
+        cancelledAt: { type: Date },
+        cancelledBy: { type: String, default: '' },
+    }],
+
     // ─── Phase 7.3 — Custom domains ────────────────────────────────────
     // Optional vanity hostname (e.g. order.joescafe.com). When the
     // frontend's origin matches this domain, attachTenant resolves the
@@ -448,15 +467,11 @@ restaurantSchema.index({ contactEmail: 1 });
 // ─── Instance helpers ────────────────────────────────────────────────────
 
 /**
- * Resolves whether a feature is enabled for this tenant. Override flags
- * always win over the base plan snapshot.
+ * Resolves whether a feature is enabled for this tenant (overrides →
+ * paid add-ons → plan snapshot; see utils/featureAccess).
  */
 restaurantSchema.methods.hasFeature = function (key) {
-    const override = this.featureOverrides && this.featureOverrides[key];
-    if (override === true) return true;
-    if (override === false) return false;
-    const value = this.subscription?.features?.[key];
-    return value === true || value === 'advanced' || value === 'standard' || value === 'basic';
+    return require('../utils/featureAccess').hasFeature(this, key);
 };
 
 /**
