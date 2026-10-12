@@ -924,7 +924,7 @@ describe('orderNotifications', () => {
             await runAll(tasks);
             // kitchen emit resolves the branch tenant async, so ordering vs the
             // personal waiter emit is not guaranteed.
-            expect(roomsFor(mockIo, 'order:new').sort()).toEqual([`t:${T1}:kitchen:${B1}`, `t:${T1}:kitchen`, W1].sort());
+            expect(roomsFor(mockIo, 'order:new').sort()).toEqual([`t:${T1}:kitchen:${B1}`, `t:${T1}:kitchen`, `t:${T1}:admin:${B1}`, `t:${T1}:admin`, W1].sort());
             const payload = mockIo.sent.find((s) => s.event === 'order:new').payload;
             expect(payload).toEqual({ orderId: 'ORD-9', type: 'dine-in', table: TB, area: 'area1', tableName: 'T5', items: 'Soup ×2, Tea' });
             const roles = notifyCalls().map((c) => c.notification.recipientRole);
@@ -952,11 +952,15 @@ describe('orderNotifications', () => {
             expect(roomsFor(mockIo, 'order:ready')).toEqual(expect.arrayContaining([`t:${T1}:waiter:${B1}`, 'order:ORD-9', U1]));
             expect(allRooms(mockIo).some((r) => r.includes(':kitchen'))).toBe(false);
             expect(notifyCalls().map((c) => c.notification.recipientRole)).toEqual(['admin', 'waiter', 'customer']);
+            // Admin live lists refetch on order:new — they must get it even when
+            // no kitchen work exists (fixed 2026-10-12, release checklist 2.x).
+            expect(roomsFor(mockIo, 'order:new')).toEqual(expect.arrayContaining([`t:${T1}:admin:${B1}`, `t:${T1}:admin`]));
         });
 
         test('kiosk order: no waiter ping at all', async () => {
             await runAll(on.buildCreateOrderNotificationTasks(base({ savedOrder: order({ source: 'kiosk', user: null }) })));
-            expect(roomsFor(mockIo, 'order:new')).toEqual([`t:${T1}:kitchen:${B1}`, `t:${T1}:kitchen`]);
+            expect(roomsFor(mockIo, 'order:new')).toEqual(expect.arrayContaining([`t:${T1}:kitchen:${B1}`, `t:${T1}:kitchen`, `t:${T1}:admin:${B1}`, `t:${T1}:admin`]));
+            expect(roomsFor(mockIo, 'order:new').some((r) => r.includes(':waiter'))).toBe(false);
             expect(mockFindWaiters).not.toHaveBeenCalled();
             expect(notifyCalls().some((c) => c.recipients)).toBe(false);
         });

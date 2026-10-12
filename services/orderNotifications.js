@@ -14,7 +14,7 @@
  * order:ready, order:updated, table:updated …) are still emitted directly.
  */
 const logger = require('../utils/logger');
-const { getIO, emitToKitchen, emitToWaiter } = require('../utils/socket');
+const { getIO, emitToKitchen, emitToWaiter, emitToAdmin } = require('../utils/socket');
 const { tenantId } = require('../utils/tenantScope');
 const { notify } = require('./notificationService');
 const EVENTS = require('../realtime/events');
@@ -145,6 +145,11 @@ function buildCreateOrderNotificationTasks({
         io.to(`order:${savedOrder.orderId}`).emit(EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
         if (savedOrder.user) io.to(savedOrder.user.toString()).emit(EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
       }
+      // Admin / manager live lists (Admin OrdersDashboard) refetch on
+      // order:new. Until 2026-10-12 only the kitchen and waiter rooms got
+      // it, so an order created on another device reached the admin screen
+      // only on the 120 s poll (RELEASE_CHECKLIST Phase 2, check 18).
+      emitToAdmin(io, orderBranch, EVENTS.ORDER_NEW, orderPayload);
       // Skip the waiter ping on kiosk orders — kiosk is self-service,
       // there is no waiter to assign or table to walk to.
       if (savedOrder.source !== 'kiosk') {
