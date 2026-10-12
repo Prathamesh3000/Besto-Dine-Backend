@@ -404,6 +404,11 @@ function createApp({ isShuttingDown = () => false } = {}) {
         res.json({
             status: 'ok',
             db: dbState[mongoose.connection.readyState],
+            // Which environment answered (staging / production / null) and
+            // which database it is on — the desktop e2e harness refuses to
+            // crawl unless appEnv === 'staging'.
+            appEnv: process.env.APP_ENV || null,
+            dbName: mongoose.connection?.name || null,
             uptime: process.uptime(),
             timestamp: new Date().toISOString()
         });

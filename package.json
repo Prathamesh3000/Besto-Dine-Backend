@@ -5,6 +5,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "db:staging": "node scripts/staging-db.js",
+    "dev:staging": "node scripts/with-env.js .env.staging nodemon server.js",
+    "start:staging": "node scripts/with-env.js .env.staging node server.js",
+    "seed:staging": "node scripts/with-env.js .env.staging node Seed/seedStaging.js",
+    "health:staging": "node scripts/with-env.js .env.staging node scripts/staging-health.js",
     "pretest": "node scripts/audit-tenant-scope.js",
     "test": "jest --forceExit --detectOpenHandles",
     "test:integration": "jest --config jest.integration.config.js --runInBand",
