@@ -36,6 +36,24 @@ exports.createRequest = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Items must be an array' });
     }
 
+    // Operations profile: a self-service restaurant has nobody to answer
+    // "call waiter" / "water", and a pay-first one has no bill to ask for.
+    if (req.restaurant) {
+      const { resolveOperations } = require('../utils/operationsProfile');
+      const app = resolveOperations(req.restaurant).customerApp;
+      const disabled = ((type === 'waiter' || type === 'water') && !app.callWaiter)
+        || (type === 'bill' && !app.requestBill);
+      if (disabled) {
+        return res.status(400).json({
+          success: false,
+          code: 'REQUEST_TYPE_DISABLED',
+          message: type === 'bill'
+            ? 'Please pay from your phone or at the counter — this restaurant does not bring a bill to the table.'
+            : 'This restaurant is self-service — please come to the counter.',
+        });
+      }
+    }
+
     // Validate table and populate assignedWaiter (scoped to tenant)
     const tf = tenantFilter(req);
     // `area` is populated so the notifications this request raises can

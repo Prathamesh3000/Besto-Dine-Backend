@@ -290,6 +290,14 @@ const restaurantSchema = new mongoose.Schema({
         cancelledBy: { type: String, default: '' },
     }],
 
+    // Operations profile — HOW this tenant runs (which operating modules
+    // it uses, who serves, when the customer pays). Super Admin owned;
+    // shape and rules live in utils/operationsProfile (normaliseProfile
+    // validates every write). Absent = today's behaviour, so no default
+    // is stored here. It can only switch things OFF within what the plan
+    // allows (featureAccess stays the "may" layer).
+    operations: { type: Object, default: undefined },
+
     // ─── Phase 7.3 — Custom domains ────────────────────────────────────
     // Optional vanity hostname (e.g. order.joescafe.com). When the
     // frontend's origin matches this domain, attachTenant resolves the

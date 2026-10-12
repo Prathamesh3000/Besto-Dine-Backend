@@ -16,6 +16,7 @@ const path = require('path');
 const { getIO, emitToStaff, emitToAdmin, emitToWaiter } = require('../utils/socket');
 const { getSettings } = require('../utils/settingsCache');
 const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
+const { publicOperationsOf } = require('../utils/operationsProfile');
 const { parseCsv } = require('../utils/csvParser');
 const logger = require('../utils/logger');
 
@@ -36,7 +37,8 @@ const logger = require('../utils/logger');
 // silently issue a never-expiring token.
 const SCAN_TOKEN_TTL = process.env.SCAN_TOKEN_TTL || '4h';
 
-const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
+const { getMainBranchId } = require('../utils/mainBranch');
 const { resolveMergeLeader, freeTableOrUnmergeGroup } = require('../utils/tableMerge');
 const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
 
@@ -65,9 +67,11 @@ const { pickAllowed, TABLE_UPDATE_FIELDS } = require('../utils/bodyAllowlist');
  *   { ok: true, branchId }       — valid branch OR null passed
  *   { ok: false, message }       — invalid / wrong-tenant branch
  *
- * We accept `null` and the empty string as "no branch" (tenant-level
- * table) so a UI that only has one location can keep passing empty
- * strings without a round-trip.
+ * `null` / the empty string mean "no branch chosen": the table goes to
+ * the tenant's Main branch (utils/mainBranch). A table is a physical
+ * thing at one location, and the admin Tables view filters strictly by
+ * the selected branch — a branch:null table was invisible there. Only a
+ * tenant with no branch at all still gets a tenant-level (null) table.
  */
 async function resolveBranch(req, rawBranchId) {
     // Branch-pinned staff (Sub Admins) always create tables at their
@@ -77,7 +81,7 @@ async function resolveBranch(req, rawBranchId) {
     if (pinned) return { ok: true, branchId: pinned };
 
     if (rawBranchId === null || rawBranchId === undefined || rawBranchId === '') {
-        return { ok: true, branchId: null };
+        return { ok: true, branchId: await getMainBranchId(req) };
     }
     if (!mongoose.isValidObjectId(rawBranchId)) {
         return { ok: false, message: 'Invalid branch id' };
@@ -190,8 +194,10 @@ const createTable = async (req, res) => {
  * if we inherited the strict filter.
  */
 function tableBranchFilter(req) {
+    // Main-branch views also include branch:null tables (they belong to
+    // Main — utils/tenantScope.branchScopeClause); other branches stay strict.
     const pinned = pinnedBranchId(req);
-    if (pinned) return { branch: pinned };
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
 
     // Tenant owner via admin switcher: `?branch=<id>` narrows STRICTLY
     // to that branch (no null fallback). Without this, a tenant-null
@@ -205,7 +211,7 @@ function tableBranchFilter(req) {
     if (raw === 'all') return {};
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
     if (raw && mongoose.isValidObjectId(raw)) {
-        return { branch: raw };
+        return branchScopeClause(req, raw);
     }
     if (req?.branch?._id) {
         return { $or: [{ branch: null }, { branch: req.branch._id }] };
@@ -330,7 +336,7 @@ const getTableByToken = async (req, res) => {
         const table = await Table.findOne({ qrToken }, null, { skipTenantScope: true })
             .select('+qrToken')
             .populate('area', 'name isActive')
-            .populate('restaurant', 'name slug status subscription featureOverrides addons logo branding')
+            .populate('restaurant', 'name slug status subscription featureOverrides addons operations logo branding')
             .populate('branch', 'name slug displayLabel city addressLine1');
 
         // Soft-deleted tables keep their document (and qrToken) for
@@ -372,7 +378,7 @@ const getTableByToken = async (req, res) => {
             if (leaderLean && String(leaderLean._id) !== String(table._id)) {
                 const leaderDoc = await Table.findOne({ _id: leaderLean._id, restaurant: table.restaurant?._id || table.restaurant })
                     .populate('area', 'name isActive')
-                    .populate('restaurant', 'name slug status subscription featureOverrides addons logo branding')
+                    .populate('restaurant', 'name slug status subscription featureOverrides addons operations logo branding')
                     .populate('branch', 'name slug displayLabel city addressLine1');
                 if (leaderDoc) effectiveTable = leaderDoc;
             }
@@ -464,6 +470,9 @@ const getTableByToken = async (req, res) => {
                 name: tableObj.restaurant.name,
                 slug: tableObj.restaurant.slug,
                 features: publicFeaturesOf(tableObj.restaurant),
+                operations: publicOperationsOf(tableObj.restaurant, {
+                    branchId: tableObj.branch?._id || tableObj.branch || null,
+                }),
                 // Customer-facing logo — Settings.general.logoUrl first,
                 // then Restaurant.logo as a last resort. ScanTable.jsx
                 // reads `restaurant.logo` for the hero.
@@ -603,8 +612,8 @@ const updateTable = async (req, res) => {
 
         // Phase 6 step 2 — if the update is moving the table to a
         // different branch, validate the target. Accepts the same
-        // nil-variants as createTable (undefined / null / '' →
-        // tenant-level). If `branch` isn't in the body at all, the
+        // nil-variants as createTable (undefined / null / '' → the
+        // Main branch). If `branch` isn't in the body at all, the
         // existing assignment is preserved.
         if (Object.prototype.hasOwnProperty.call(updates, 'branch')) {
             const branchCheck = await resolveBranch(req, updates.branch);
@@ -702,7 +711,7 @@ const deleteTable = async (req, res) => {
             table: id,
             ...tf,
             $or: [
-                { status: { $in: ['new', 'preparing', 'ready'] } },
+                { status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready'] } },
                 { status: 'served', paymentStatus: { $nin: ['Paid', 'Refunded'] } },
             ],
         }).select('_id orderId').lean();
@@ -775,11 +784,27 @@ const regenerateQrToken = async (req, res) => {
     }
 };
 
+// Operations profile: table merging switched off (tables.mergeTables).
+function mergeDisabled(req) {
+    if (!req.restaurant) return false;
+    const { resolveOperations } = require('../utils/operationsProfile');
+    return resolveOperations(req.restaurant).tables.mergeTables === false;
+}
+function mergeDisabledReply(res) {
+    return res.status(400).json({
+        success: false,
+        code: 'MERGE_DISABLED',
+        message: 'Merging tables is turned off for this restaurant.',
+    });
+}
+
 // Merge tables
 const mergeTables = async (req, res) => {
     try {
         const { tableIds } = req.body;
-        
+
+        if (mergeDisabled(req)) return mergeDisabledReply(res);
+
         if (!tableIds || !Array.isArray(tableIds) || tableIds.length < 2) {
             return res.status(400).json({ success: false, message: 'At least two tables are required to merge.' });
         }
@@ -910,6 +935,8 @@ const unmergeTables = async (req, res) => {
         // We can accept a single tableId that is part of a merged group, and unmerge the entire group it belongs to
         const { tableId } = req.body;
 
+        if (mergeDisabled(req)) return mergeDisabledReply(res);
+
         const table = await Table.findOne({ _id: tableId, ...tenantFilter(req) });
         if (!table || table.status !== 'merged') {
             return res.status(400).json({ success: false, message: 'Table is not merged' });
@@ -992,6 +1019,19 @@ const assignWaiter = async (req, res) => {
         const table = await Table.findOne({ _id: id, ...tenantFilter(req) }).populate('area', 'name');
         if (!table) {
             return res.status(404).json({ success: false, message: 'Table not found' });
+        }
+
+        // Operations profile: nobody serves at the table, so there is no
+        // one to assign. Clearing an old assignment is still allowed.
+        if (waiterId && req.restaurant) {
+            const { resolveOperations } = require('../utils/operationsProfile');
+            if (!resolveOperations(req.restaurant).tables.assignWaiters) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'WAITERS_NOT_IN_USE',
+                    message: 'This restaurant is set up without waiters, so tables are not assigned to anyone.',
+                });
+            }
         }
 
         // A branch-pinned captain may only reassign tables at their own
@@ -1114,7 +1154,7 @@ const freeTable = async (req, res) => {
         // Every order still occupying the table — independent-orders model.
         const openOrders = await Order.find({
             table: table._id,
-            status: { $in: ['new', 'preparing', 'ready', 'served'] },
+            status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready', 'served'] },
             paymentStatus: { $ne: 'Paid' },
             ...tf,
         }).select('_id status paymentStatus items amountPaid total inventoryDeducted restaurant branch orderId');

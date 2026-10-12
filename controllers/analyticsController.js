@@ -40,7 +40,7 @@ exports.getSalesHistory = asyncHandler(async (req, res) => {
         {
             $match: {
                 createdAt: { $gte: thirtyDaysAgo },
-                status: { $ne: 'cancelled' },
+                status: { $nin: ['cancelled', 'awaiting-payment'] },
                 paymentStatus: 'Paid',
                 ...tenantFilter(req),
                 ...analyticsBranchFilter(req),
@@ -64,7 +64,7 @@ exports.getSalesHistory = asyncHandler(async (req, res) => {
 // @access  Private/Admin
 exports.getPeakHours = asyncHandler(async (req, res) => {
     const peakHours = await Order.aggregate([
-        { $match: { status: { $ne: 'cancelled' }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
+        { $match: { status: { $nin: ['cancelled', 'awaiting-payment'] }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
         {
             $group: {
                 _id: { $hour: { date: "$createdAt", timezone: reportTz(req) } },
@@ -84,7 +84,7 @@ exports.getTopItems = asyncHandler(async (req, res) => {
     // Sold = not cancelled and not fully refunded (the money went back;
     // /analytics/summary excludes the same orders).
     const topItems = await Order.aggregate([
-        { $match: { status: { $ne: 'cancelled' }, paymentStatus: { $ne: 'Refunded' }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
+        { $match: { status: { $nin: ['cancelled', 'awaiting-payment'] }, paymentStatus: { $ne: 'Refunded' }, ...tenantFilter(req), ...analyticsBranchFilter(req) } },
         { $unwind: "$items" },
         {
             $group: {
@@ -108,11 +108,11 @@ exports.getSummaryReport = asyncHandler(async (req, res) => {
     // object so every aggregation uses identical match criteria.
     const scope = { ...tenantFilter(req), ...analyticsBranchFilter(req) };
     const totalRevenue = await Order.aggregate([
-        { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...scope } },
+        { $match: { paymentStatus: 'Paid', status: { $nin: ['cancelled', 'awaiting-payment'] }, ...scope } },
         { $group: { _id: null, total: { $sum: "$total" } } }
     ]);
 
-    const totalOrders = await Order.countDocuments({ status: { $ne: 'cancelled' }, ...scope });
+    const totalOrders = await Order.countDocuments({ status: { $nin: ['cancelled', 'awaiting-payment'] }, ...scope });
 
     // Customer count = number of unique customers who have ordered
     // from THIS restaurant, not the global customer count.

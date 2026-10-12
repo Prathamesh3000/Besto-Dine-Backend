@@ -540,7 +540,11 @@ async function resolvePlacement(req, { type, resolvedTableId, scanSessionId, bra
     if (!seat.ok) throw httpError(seat.status, seat.body);
 
     if (t.branch) inheritedBranchId = t.branch;
-    if (!validWaiterId && t.assignedWaiter) validWaiterId = t.assignedWaiter;
+    // A restaurant set up without waiters ignores old table assignments
+    // (operations profile) — no waiter of record, no tip routed to them.
+    const waitersInUse = !req.restaurant
+      || require('../utils/operationsProfile').resolveOperations(req.restaurant).tables.assignWaiters;
+    if (!validWaiterId && t.assignedWaiter && waitersInUse) validWaiterId = t.assignedWaiter;
     if (t.area) resolvedAreaId = t.area;
     if (t.name) resolvedTableName = t.name;
   } else if (type === 'takeaway') {
@@ -637,7 +641,7 @@ async function preflightStockCheck(req, enrichedItems, inheritedBranchId) {
 }
 
 // ── Phase: detach a stale paid bill from the table ──────────────────
-async function detachStalePaidBill(req, type, resolvedTableId) {
+async function detachStalePaidBill(req, type, resolvedTableId, ops = null) {
   // ── Independent-orders model (was: auto-append) ──────────────────
   // Each customer "Place Order" tap creates a fresh Order document
   // — no auto-append into an existing active order on the same
@@ -653,9 +657,13 @@ async function detachStalePaidBill(req, type, resolvedTableId) {
   // this was Case A in the old comment.)
   if (type === 'dine-in' && resolvedTableId) {
     try {
+      // Pay-first restaurants: every round is paid up front, so only a
+      // FINISHED round is a "stale bill". A paid round still in the
+      // kitchen keeps its table link (it would otherwise be orphaned).
+      const payFirst = ops?.payment?.dineIn === 'payFirst';
       const stalePaid = await Order.findOne({
         table: resolvedTableId,
-        status: { $in: ['new', 'preparing', 'ready', 'served'] },
+        status: { $in: payFirst ? ['served'] : ['new', 'preparing', 'ready', 'served'] },
         paymentStatus: 'Paid',
         ...tenantFilter(req),
       });
@@ -1114,6 +1122,95 @@ async function occupyTableForNewOrder(req, savedOrder, type, resolvedTableId) {
 }
 
 // Create a new order
+// ── Phase: operations profile (how this restaurant runs) ─────────────
+// OPERATIONS_CONTROL_PANEL_DESIGN.md §5. Returns { ops, hold } where
+// `hold` is null (send to the kitchen as today) or the reason the order
+// must wait in 'awaiting-payment' until it is paid. Staff / POS orders
+// and kiosk orders are never held or blocked here.
+function resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid }) {
+  if (!req.restaurant) return { ops: null, hold: null };
+  const { resolveOperations } = require('../utils/operationsProfile');
+  const ops = resolveOperations(req.restaurant);
+  // Rules below only bite for a restaurant that has an operations
+  // profile; every other tenant keeps today's behaviour exactly.
+  const hasProfile = !!req.restaurant.operations;
+
+  if (hasProfile && authoritativeTip > 0 && !ops.customerApp.tips) {
+    throw httpError(400, {
+      success: false,
+      code: 'TIPS_DISABLED',
+      message: 'This restaurant does not take tips through the app.',
+    });
+  }
+
+  // Staff ordering off: the waiter / captain app can't enter orders
+  // (admin, manager and the POS counter still can).
+  if (!ops.orderFlow.staffOrder && req.user && (req.user.role === 'waiter' || req.user.role === 'captain')) {
+    throw httpError(403, {
+      success: false,
+      code: 'STAFF_ORDER_DISABLED',
+      message: 'Orders are not taken from the waiter app here. Please use the counter.',
+    });
+  }
+
+  const isCustomerCaller = !req.user || req.user.role === 'customer';
+  if (!hasProfile || !isCustomerCaller) return { ops, hold: null };
+
+  // Which channel's payment rule applies. Takeaway / kiosk are pay-first
+  // by default; a profiled pay-first restaurant enforces that for every
+  // customer channel, so a guest can't dodge dine-in pay-first by
+  // posting a takeaway or a (spoofed) kiosk order.
+  const channel = isKioskOrder ? 'kiosk' : (type === 'dine-in' ? 'dineIn' : 'takeaway');
+
+  if (channel === 'dineIn' && !ops.orderFlow.customerSelfOrder) {
+    throw httpError(403, {
+      success: false,
+      code: 'SELF_ORDER_DISABLED',
+      message: 'Ordering from the table is not available here. Please order with the staff.',
+    });
+  }
+  if (ops.payment[channel] !== 'payFirst') return { ops, hold: null };
+
+  const methods = ops.payment.methods;
+  const holdUntilPaid = ops.payment.holdUntilPaid;
+  if (prepaid) {
+    // Online checkout captured and confirmed with the gateway: the money
+    // is in, cook it. Unconfirmed (gateway unreachable): hold until the
+    // verify / webhook / reconciliation confirms it.
+    return { ops, hold: !prepaid.confirmed && holdUntilPaid ? 'online' : null };
+  }
+  // Older takeaway clients say "wallet" through paymentMethod (create,
+  // then pay from the wallet) — treat that as the wallet intent.
+  const intent = req.body.paymentIntent
+    || (req.body.paymentMethod === 'wallet' ? 'wallet' : req.body.paymentMethod === 'cash' ? 'counterCash' : undefined);
+  if (intent === 'counterCash' && methods.counterCash) return { ops, hold: holdUntilPaid ? 'counterCash' : null };
+  if (intent === 'wallet' && methods.wallet) return { ops, hold: holdUntilPaid ? 'wallet' : null };
+
+  throw httpError(402, {
+    success: false,
+    code: 'PAYMENT_REQUIRED_FIRST',
+    message: 'Please pay before placing your order.',
+    methods,
+  });
+}
+
+/** Turn freshly built order docs into held ('awaiting-payment') docs. */
+function holdOrderDocs(docs, { hold, ops }) {
+  const expiresAt = new Date(Date.now() + (ops.payment.holdExpiryMinutes || 20) * 60 * 1000);
+  for (const doc of docs) {
+    if (!doc) continue;
+    doc.holdReleaseStatus = doc.status === 'ready' ? 'ready' : 'new';
+    doc.status = 'awaiting-payment';
+    doc.holdReason = hold;
+    doc.holdExpiresAt = expiresAt;
+    if (hold === 'counterCash') {
+      doc.paymentMethod = 'cash';
+      // Drives the admin "counter payment requested / Mark Paid" alert.
+      doc.counterPaymentRequestedAt = new Date();
+    }
+  }
+}
+
 async function createOrder(req) {
   // (customer / contact / source / table fields are read by the phases below)
   const { type, items, total, note, paymentMethod, pickupTime, branchId, clientIdempotencyKey: rawIdempotencyKey, delivery: deliveryReq } = req.body;
@@ -1198,6 +1295,7 @@ async function createOrder(req) {
   const prepaid = await verifyPrepaidCheckout(req, {
     orderId, validUserId, authoritativeTotal, authoritativeWalletPaid,
   });
+  const { ops, hold } = resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid });
 
   const enrichedItems = pricing.enrichCartItems(items, menuById);
 
@@ -1205,7 +1303,7 @@ async function createOrder(req) {
     type, resolvedTableId, scanSessionId, branchId, isKioskOrder, validWaiterId: attribution.validWaiterId,
   });
   await preflightStockCheck(req, enrichedItems, inheritedBranchId);
-  await detachStalePaidBill(req, type, resolvedTableId);
+  await detachStalePaidBill(req, type, resolvedTableId, ops);
 
   const { primaryDocData, counterDocData, hasKitchenWork } = buildOrderDocs(req, {
     enrichedItems, authoritativeTotal, type, orderId, inheritedBranchId, validUserId,
@@ -1216,6 +1314,9 @@ async function createOrder(req) {
     cleanDeliveryAddress, authoritativeDeliverySlab, authoritativeDeliveryFee,
     authoritativeDeliveryDistance, authoritativeDeliveryCoords, authoritativeManualDiscount,
   });
+
+  if (hold) holdOrderDocs([primaryDocData, counterDocData], { hold, ops });
+  const held = !!hold;
 
   const prepaidClaim = await claimPrepaidCheckout(req, prepaid, primaryDocData);
   // Link a mixed-cart split: the counter doc points at the primary doc so
@@ -1250,6 +1351,8 @@ async function createOrder(req) {
   // skips 'preparing', where the normal deduction fires.
   if (counterSideOrder) {
     bumpMenuItemOrderCounts(counterSideOrder.items, counterSideOrder.restaurant);
+  }
+  if (counterSideOrder && !held) {
     try {
       const { deductInventoryForOrder } = require('../controllers/inventoryController');
       deductInventoryForOrder(counterSideOrder, tenantId(req), req.user?._id)
@@ -1260,15 +1363,31 @@ async function createOrder(req) {
   // Everything below is notification / socket fan-out. It is queued
   // and run AFTER the response is sent so a slow or failing
   // Notification write can never delay or fail a committed order.
-  const postResponseTasks = buildCreateOrderNotificationTasks({
+  // A held order is invisible to the kitchen: no kitchen / waiter pings,
+  // no KOT, no stock deduction until payment releases it
+  // (services/orderHoldService.releaseHeldOrder). Cash at the counter
+  // raises the admin "counter payment requested" alert instead.
+  const postResponseTasks = held ? [] : buildCreateOrderNotificationTasks({
     savedOrder, counterSideOrder, settings, hasKitchenWork, type, validTableId,
     resolvedTableId, resolvedAreaId, resolvedTableName, authoritativeTotal,
   });
+  if (held && hold === 'counterCash') {
+    postResponseTasks.push(['counter payment alert', async () => {
+      const { notifyCounterPaymentRequested } = require('./orderNotifications');
+      await notifyCounterPaymentRequested(req, {
+        order: savedOrder,
+        payableTotal: Number(savedOrder.total || 0) + Number(counterSideOrder?.total || 0),
+        tableLabel: resolvedTableName ? `Table ${resolvedTableName}` : `Order ${savedOrder.orderId}`,
+        tableAreaName: null,
+        responsibleWaiterId: null,
+      });
+    }]);
+  }
 
   // Thermal KOT(s) to the branch's print agent (services/printService.js),
   // one per station. Post-response and best-effort: a printer problem can
   // never fail or delay a committed order.
-  postResponseTasks.push(['print kot', async () => {
+  if (!held) postResponseTasks.push(['print kot', async () => {
     const { enqueueKotJobs } = require('./printService');
     await enqueueKotJobs({ order: savedOrder, items: savedOrder.items, reason: 'create' });
     if (counterSideOrder) {
@@ -1281,7 +1400,7 @@ async function createOrder(req) {
   // 'preparing'. Counter-only orders skip that transition (they're
   // saved as 'ready' from the start), so without this they'd never
   // decrement stock — bottles of water would never tick down.
-  if (!hasKitchenWork) {
+  if (!hasKitchenWork && !held) {
     try {
       const { deductInventoryForOrder } = require('../controllers/inventoryController');
       const restaurantId = tenantId(req);
@@ -1299,6 +1418,21 @@ async function createOrder(req) {
 
   await occupyTableForNewOrder(req, savedOrder, type, resolvedTableId);
 
+  // No kitchen screen and nobody serving (e.g. QR ordering + customer
+  // payment only): the order is complete once it exists and the KOT is
+  // sent; there is no Preparing / Ready / Served step to wait for.
+  let finalOrder = savedOrder;
+  let finalSplit = counterSideOrder;
+  // Dine-in only (takeaway / kiosk keep their pickup "ready" step), and
+  // only for restaurants that set this up in their operations profile.
+  if (!held && ops && req.restaurant?.operations && type === 'dine-in' && !isKioskOrder) {
+    const { completesWithoutKitchen, completeWithoutKitchen } = require('./orderHoldService');
+    if (completesWithoutKitchen(ops)) {
+      finalOrder = await completeWithoutKitchen(savedOrder);
+      if (counterSideOrder) finalSplit = await completeWithoutKitchen(counterSideOrder);
+    }
+  }
+
   // Issue a kiosk-only tracking token so the kiosk's OrderToken
   // screen can poll status without auth or scan token. Other channels
   // already have proper auth paths to /orders/:id/detail.
@@ -1310,8 +1444,8 @@ async function createOrder(req) {
   // so the customer's Orders tab renders each as its own card.
   return reply(201, {
     success: true,
-    order: savedOrder,                   // primary (kitchen) doc
-    splitOrder: counterSideOrder || null, // counter-side doc when cart was mixed
+    order: finalOrder,                   // primary (kitchen) doc
+    splitOrder: finalSplit || null,      // counter-side doc when cart was mixed
     isSplit: !!counterSideOrder,
     trackingToken,
   }, postResponseTasks.map(([label, task]) => [`createOrder ${label}`, task]));

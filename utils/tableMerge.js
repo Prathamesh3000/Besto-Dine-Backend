@@ -110,7 +110,7 @@ async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}, opts = {})
                 table: { $in: groupIds },
                 ...tenantFilterObj,
                 $or: [
-                    { status: { $in: ['new', 'preparing', 'ready'] } },
+                    { status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready'] } },
                     { status: 'served', paymentStatus: { $nin: ['Paid', 'Refunded'] } },
                 ],
             });

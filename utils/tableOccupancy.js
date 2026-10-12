@@ -98,7 +98,7 @@ async function getTableOccupancy(table, tenantFilterObj = {}) {
         ...tenantFilterObj,
         createdAt: { $gte: new Date(Date.now() - PARTY_WINDOW_MS) },
         $or: [
-            { status: { $in: ['new', 'preparing', 'ready'] } },
+            { status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready'] } },
             { status: 'served', paymentStatus: { $nin: ['Paid', 'Refunded'] } },
         ],
     }).select('user scanSessionId').lean();
@@ -123,6 +123,37 @@ const UNSETTLED_ORDER_MATCH = {
     status: { $ne: 'cancelled' },
     paymentStatus: { $nin: ['Paid', 'Refunded'] },
 };
+
+// Pay-first restaurants (operations profile): every round is paid up
+// front, so "paid" says nothing about whether the party is done. A round
+// still waiting for payment or in the kitchen keeps the table; it frees
+// when the kitchen finishes (Ready → served) — design §5.3.
+const PAY_FIRST_UNSETTLED_MATCH = {
+    status: { $ne: 'cancelled' },
+    $or: [
+        { paymentStatus: { $nin: ['Paid', 'Refunded'] } },
+        { status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready'] } },
+    ],
+};
+
+async function unsettledMatchFor(restaurantId) {
+    if (!restaurantId) return UNSETTLED_ORDER_MATCH;
+    // No live DB connection (unit tests with mocked models): a Restaurant
+    // query would just buffer until it times out — keep today's rule.
+    if (mongoose.connection.readyState !== 1) return UNSETTLED_ORDER_MATCH;
+    try {
+        const Restaurant = require('../models/restaurant');
+        const r = await Restaurant.findById(restaurantId)
+            .select('subscription featureOverrides addons operations').lean();
+        if (!r?.operations) return UNSETTLED_ORDER_MATCH;   // today's rule
+        const { resolveOperations } = require('./operationsProfile');
+        return resolveOperations(r).payment.dineIn === 'payFirst'
+            ? PAY_FIRST_UNSETTLED_MATCH
+            : UNSETTLED_ORDER_MATCH;
+    } catch {
+        return UNSETTLED_ORDER_MATCH;
+    }
+}
 
 const toIdString = (v) => (v == null ? null : String(v._id || v));
 
@@ -243,7 +274,7 @@ async function releaseTableIfSettled(orderOrTableId, tenantFilterObj = {}, opts 
         table: { $in: groupIds },
         ...tf,
         createdAt: { $gte: new Date(Date.now() - PARTY_WINDOW_MS) },
-        ...UNSETTLED_ORDER_MATCH,
+        ...(await unsettledMatchFor(table.restaurant || restaurant?._id || restaurant)),
     }).sort({ createdAt: -1 }).select('_id').lean();
 
     if (unsettled.length) {

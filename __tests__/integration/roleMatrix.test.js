@@ -305,6 +305,7 @@ const EXPECTED = [
     // settings
     ['PUT', '/settings', ADMIN],
     ['PATCH', '/settings/:section', ADMIN],
+    ['GET', '/settings/operations', ADMIN],
     // thermal printing (routes/printRoute.js)
     ['POST', '/print/agent-key', ADMIN],
     ['DELETE', '/print/agent-key', ADMIN],
@@ -357,6 +358,10 @@ const EXPECTED = [
     ['GET', '/superadmin/addon-catalog', SA_ANY],
     ['POST', '/superadmin/restaurants/:id/addons', SA_FULL],
     ['DELETE', '/superadmin/restaurants/:id/addons/:addonId', SA_FULL],
+    ['GET', '/superadmin/operations/presets', SA_ANY],
+    ['GET', '/superadmin/restaurants/:id/operations', SA_ANY],
+    ['POST', '/superadmin/restaurants/:id/operations/preview', SA_FULL],
+    ['PUT', '/superadmin/restaurants/:id/operations', SA_FULL],
     ['POST', '/superadmin/restaurants/:id/backup', SA_FULL],
     ['GET', '/superadmin/restaurants/:id/backups', SA_ANY],
     ['GET', '/superadmin/restaurants/:id/backups/:filename', SA_ANY],

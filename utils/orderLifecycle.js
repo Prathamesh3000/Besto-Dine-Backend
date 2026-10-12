@@ -24,6 +24,11 @@
  * produced, so it is permitted but gated — see below.
  */
 const VALID_TRANSITIONS = {
+    // A held pay-first order can only be cancelled by hand. Releasing it
+    // to the kitchen happens ONLY through payment
+    // (services/orderHoldService.releaseHeldOrder), never by a status
+    // change, so nobody can send unpaid food to the kitchen.
+    'awaiting-payment': ['cancelled'],
     'new': ['preparing', 'cancelled'],
     'preparing': ['ready', 'served', 'cancelled'],
     'ready': ['served', 'cancelled'],

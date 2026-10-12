@@ -296,7 +296,15 @@ async function clearFloorAlertsOnClose(status, oldOrder, order, tf) {
 }
 
 // Settling one dine-in round settles the table's other unpaid rounds.
-async function settleSiblingDineInRounds(paymentStatus, oldOrder, order, tf) {
+async function settleSiblingDineInRounds(req, paymentStatus, oldOrder, order, tf) {
+  // Pay-first (operations profile): every round pays for itself, so
+  // paying one round (e.g. a held counter-cash order) must not mark the
+  // table's other unpaid rounds Paid with amountPaid 0.
+  if (oldOrder.holdReason) return;
+  if (req.restaurant) {
+    const { resolveOperations } = require('../utils/operationsProfile');
+    if (resolveOperations(req.restaurant).payment.dineIn === 'payFirst') return;
+  }
   // Aggregated dine-in bill: settling one round's payment clears the
   // WHOLE table's bill (the waiter / customer bill sums every unpaid
   // round on the table — independent-orders model). So when this update
@@ -485,10 +493,27 @@ async function updateOrderStatus(req) {
   applyPaymentFields(oldOrder, req.body, updateData);
   applyKitchenStamps(req, oldOrder, status, updateData);
 
-  const order = await commitStatusUpdate(oldOrder, updateData, tf);
+  let order = await commitStatusUpdate(oldOrder, updateData, tf);
+
+  // Staff "Mark paid" on a held pay-first order (cash at the counter):
+  // the payment is recorded, now release it to the kitchen.
+  if (order && order.status === 'awaiting-payment' && order.paymentStatus === 'Paid') {
+    const { releaseHeldOrder } = require('./orderHoldService');
+    order = (await releaseHeldOrder(order)) || order;
+  }
+
+  // Nobody serves at the table (operations profile, servedStep off): the
+  // chef pressing Ready completes the order — no one will mark it served.
+  if (order && order.status === 'ready' && oldOrder.status !== 'ready' && req.restaurant) {
+    const { resolveOperations } = require('../utils/operationsProfile');
+    if (!resolveOperations(req.restaurant).orderFlow.servedStep) {
+      const { completeWithoutKitchen } = require('./orderHoldService');
+      order = await completeWithoutKitchen(order);
+    }
+  }
 
   await clearFloorAlertsOnClose(status, oldOrder, order, tf);
-  await settleSiblingDineInRounds(paymentStatus, oldOrder, order, tf);
+  await settleSiblingDineInRounds(req, paymentStatus, oldOrder, order, tf);
   runInventoryHooks(req, status, oldOrder, order);
   await releaseTableIfDone(oldOrder, order, tf);
   await notifyStatusTransition({ status, oldOrder, order });
@@ -553,7 +578,19 @@ async function pickupOrder(req) {
     return reply(200, { success: true, order, message: 'Order is already served' });
   }
 
-  if (!allowed || !allowed.includes('served')) {
+  // No kitchen screen but waiters on (operations profile: chef module
+  // off): nobody presses Preparing / Ready, so the order sits at 'new'
+  // until the waiter serves it. Allow new → served on THIS path only;
+  // the state machine (VALID_TRANSITIONS) is unchanged for everyone else.
+  let servedWithoutKitchen = false;
+  if (order.status === 'new' && req.restaurant) {
+    // Profile only (no plan intersection): a tenant that never set a
+    // profile keeps today's rule even if its plan lacks the KDS.
+    const { profileFlow } = require('../utils/operationsProfile');
+    servedWithoutKitchen = profileFlow(req.restaurant).orderFlow.kitchenDisplay === false;
+  }
+
+  if (!servedWithoutKitchen && (!allowed || !allowed.includes('served'))) {
     throw httpError(400, {
       success: false,
       message: `Cannot mark as served from "${order.status}". Order must be in "ready" or "preparing" state.`
@@ -587,6 +624,18 @@ async function pickupOrder(req) {
   }
 
   await order.save();
+
+  // 'preparing' (where stock is normally deducted) was skipped — deduct
+  // now. deductInventoryForOrder is idempotent on order.inventoryDeducted.
+  if (servedWithoutKitchen) {
+    try {
+      const { deductInventoryForOrder } = require('../controllers/inventoryController');
+      const result = await deductInventoryForOrder(order, tenantId(req) || order.restaurant, req.user?._id);
+      if (result?.errors?.length) logger.warn(`Inventory deduction warnings for ${order.orderId}:`, result.errors);
+    } catch (err) {
+      logger.warn(`Inventory deduction on serve-without-kitchen failed for ${order.orderId}: ${err.message}`);
+    }
+  }
 
   // Auto-clear the floor-staff "order ready / new order" alerts now that
   // this order is served. The waiter/captain Pick Up / Serve action goes

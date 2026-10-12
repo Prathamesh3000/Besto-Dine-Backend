@@ -7,7 +7,7 @@
  */
 const mongoose = require('mongoose');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
-const { pinnedBranchId } = require('../utils/tenantScope');
+const { pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 
 // ── Caller ↔ order access check (bugs #5 / #7) ──────────────────────
 // Used by customer-facing mutation endpoints that are mounted with
@@ -84,11 +84,11 @@ function staffBranchFilter(req) {
   // "unassigned legacy data", not "shared". Mixing the two leaked every
   // pre-branch order to every Sub Admin (the data migration in
   // Seed/migrateLegacyBranchNulls.js fixes existing nulls).
+  //
+  // Exception: branch:null orders belong to the Main branch, so a Main
+  // view includes them (utils/tenantScope.branchScopeClause).
   const pinned = pinnedBranchId(req);
-  if (pinned) {
-    const id = pinned._id || pinned;
-    return { branch: id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id)) };
-  }
+  if (pinned) return branchScopeClause(req, pinned._id || pinned);
 
   // Unpinned admin (tenant owner) using the AdminBranchContext switcher
   // — they pass `?branch=<id>` to scope to one branch's orders, or
@@ -99,7 +99,7 @@ function staffBranchFilter(req) {
   if (raw === 'all') return {};
   if (raw === 'tenant-only' || raw === 'none') return { branch: null };
   if (raw && mongoose.Types.ObjectId.isValid(raw)) {
-    return { branch: new mongoose.Types.ObjectId(String(raw)) };
+    return branchScopeClause(req, raw);
   }
   return {};                                     // tenant owner: see everything
 }

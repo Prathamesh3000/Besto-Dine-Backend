@@ -1473,6 +1473,12 @@ exports.resetSubAdminPassword = async (req, res) => {
     }
 };
 
+// Orders that block disabling / deleting a branch: live kitchen tickets
+// plus pay-first orders held until paid ('awaiting-payment',
+// services/orderHoldService.js) - a customer is mid-checkout there and
+// the order would release to a branch that no longer takes orders.
+const OPEN_ORDER_STATUSES = ['awaiting-payment', 'new', 'preparing', 'ready'];
+
 // GET /api/v1/branches/:id/disable-check
 //
 // Phase G: Pre-disable safety check. Returns blockers (things that
@@ -1486,7 +1492,7 @@ exports.preDisableCheck = async (req, res) => {
         const tf = tenantFilter(req);
 
         const [activeOrders, assignedStaff, assignedTables] = await Promise.all([
-            Order.countDocuments({ branch: id, status: { $in: ['new', 'preparing', 'ready'] }, ...tf }),
+            Order.countDocuments({ branch: id, status: { $in: OPEN_ORDER_STATUSES }, ...tf }),
             User.countDocuments({ branch: id, status: 'active', ...tf }),
             Table.countDocuments({ branch: id, ...tf }),
         ]);
@@ -1542,7 +1548,7 @@ exports.deleteBranch = async (req, res) => {
         // branch from customers while it still has live kitchen tickets.
         const activeOrders = await Order.countDocuments({
             branch: id,
-            status: { $in: ['new', 'preparing', 'ready'] },
+            status: { $in: OPEN_ORDER_STATUSES },
             ...tenantFilter(req),
         });
         if (activeOrders > 0) {
@@ -1669,7 +1675,7 @@ exports.hardDeleteBranch = async (req, res) => {
         // and customer expectations — same reasoning as soft-disable.
         const activeOrders = await Order.countDocuments({
             branch: id,
-            status: { $in: ['new', 'preparing', 'ready'] },
+            status: { $in: OPEN_ORDER_STATUSES },
             ...tf,
         });
         if (activeOrders > 0) {

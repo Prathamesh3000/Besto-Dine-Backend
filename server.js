@@ -233,6 +233,12 @@ require('./utils/scheduledTakeawayReleaser').startScheduledTakeawayReleaser();
 // never at risk.
 require('./utils/emptyOrderSweeper').startScheduledEmptyOrderSweep();
 
+// ─── Held-order sweeper — cancels pay-first orders never paid ──────────────
+// Operations profile (pay first, held until paid): an order waiting for
+// cash at the counter that never arrives is cancelled at its deadline and
+// its table released. See utils/heldOrderSweeper.js.
+require('./utils/heldOrderSweeper').startScheduledHeldOrderSweep();
+
 // ─── Shift auto-closer — closes abandoned waiter shifts ────────────────────
 // A shift left in status='active' for longer than SHIFT_AUTOCLOSE_HOURS
 // (default 16h) gets marked 'missed' with a capped clockOut + audit note,

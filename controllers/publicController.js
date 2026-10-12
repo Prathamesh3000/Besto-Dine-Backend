@@ -8,6 +8,7 @@ const Lead = require('../models/lead');
 const MarketingSetting = require('../models/marketingSetting');
 const logger = require('../utils/logger');
 const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
+const { publicOperationsOf } = require('../utils/operationsProfile');
 const { createMainBranchFor } = require('../utils/createMainBranch');
 const { isReservedSlug, checkExplicitRestaurantSlug } = require('../utils/reservedSlugs');
 const mongoose = require('mongoose');
@@ -103,7 +104,7 @@ exports.listRestaurants = async (req, res) => {
         const restaurants = await Restaurant.find({
             status: { $in: ['active', 'trial'] },
         })
-            .select('name slug city contactPhone logo branding createdAt subscription featureOverrides addons')
+            .select('name slug city contactPhone logo branding createdAt subscription featureOverrides addons operations')
             .sort({ name: 1 })
             .lean();
 
@@ -119,6 +120,7 @@ exports.listRestaurants = async (req, res) => {
                 phone: r.contactPhone || '',
                 logo: r.logo || '',
                 features: publicFeaturesOf(r),
+                operations: publicOperationsOf(r),
             })),
         });
     } catch (err) {
@@ -144,7 +146,7 @@ exports.getRestaurantBySlug = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug: String(slug).toLowerCase().trim(),
             status: { $in: ['active', 'trial'] },
-        }).select('name slug city contactPhone logo branding subscription featureOverrides addons').lean();
+        }).select('name slug city contactPhone logo branding subscription featureOverrides addons operations').lean();
 
         if (!restaurant) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
@@ -165,6 +167,7 @@ exports.getRestaurantBySlug = async (req, res) => {
                 phone: restaurant.contactPhone || '',
                 logo: restaurant.logo || '',
                 features: publicFeaturesOf(restaurant),
+                operations: publicOperationsOf(restaurant),
             },
         });
     } catch (err) {

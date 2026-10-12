@@ -460,7 +460,7 @@ describe('GET /public/restaurants (+ /:slug)', () => {
         expect(slugs).toContain(A.slug);
         for (const h of Object.values(hidden)) expect(slugs).not.toContain(h.slug);
         for (const r of res.body.data) {
-            expect(Object.keys(r).sort()).toEqual(['_id', 'city', 'features', 'logo', 'name', 'phone', 'slug']);
+            expect(Object.keys(r).sort()).toEqual(['_id', 'city', 'features', 'logo', 'name', 'operations', 'phone', 'slug']);
         }
         const keys = allKeys(res.body);
         for (const k of FORBIDDEN_KEYS) expect(keys.has(k)).toBe(false);
@@ -502,7 +502,7 @@ describe('GET /public/restaurants (+ /:slug)', () => {
     test('/:slug: active tenant → whitelisted profile (case-insensitive slug); suspended / cancelled / past_due / unknown → 404', async () => {
         const res = await ctx.api.anon().get(`/public/restaurants/${A.slug.toUpperCase()}`);
         expect(res.status).toBe(200);
-        expect(Object.keys(res.body.data).sort()).toEqual(['_id', 'city', 'features', 'logo', 'name', 'phone', 'slug']);
+        expect(Object.keys(res.body.data).sort()).toEqual(['_id', 'city', 'features', 'logo', 'name', 'operations', 'phone', 'slug']);
         expect(typeof res.body.data.features).toBe('object');
         expect(res.headers['cache-control']).toContain('private');
         const keys = allKeys(res.body);
@@ -635,7 +635,7 @@ describe('GET /public/menu-bootstrap', () => {
         expect(res.body.success).toBe(true);
         expect(Object.keys(res.body.data).sort()).toEqual(['branch', 'categories', 'combos', 'coupons', 'menu', 'promotions', 'restaurant', 'settings']);
         expect(res.body.data.branch).toBeNull();
-        expect(Object.keys(res.body.data.restaurant).sort()).toEqual(['_id', 'city', 'features', 'logo', 'name', 'phone', 'slug']);
+        expect(Object.keys(res.body.data.restaurant).sort()).toEqual(['_id', 'city', 'features', 'logo', 'name', 'operations', 'phone', 'slug']);
         expect(res.headers['cache-control']).toBe('public, max-age=60, stale-while-revalidate=300');
 
         const n = names(res);

@@ -87,10 +87,10 @@ describe('ceilings are ordered by blast radius', () => {
         }
     });
 
-    test('customers get the longest ceiling — 24h by default (QA N14)', () => {
-        expect(auth.refreshAbsoluteMs('customer')).toBe(24 * HOUR);
+    test('customers are signed out a fixed 1 hour after sign-in (client decision 2026-10-07)', () => {
+        expect(auth.refreshAbsoluteMs('customer')).toBe(1 * HOUR);
         for (const role of STAFF) {
-            expect(auth.refreshAbsoluteMs('customer')).toBeGreaterThan(auth.refreshAbsoluteMs(role));
+            expect(auth.refreshAbsoluteMs('customer')).toBeLessThan(auth.refreshAbsoluteMs(role));
         }
     });
 });
@@ -114,14 +114,29 @@ describe('customer inactivity timeout (QA N14)', () => {
         expect(auth.refreshTtlMs('customer')).toBe(60 * MIN);
     });
 
-    test('REFRESH_TTL_HOURS_CUSTOMER sets the customer absolute cap', () => {
-        const auth = loadAuth({ REFRESH_TTL_HOURS_CUSTOMER: '6' });
-        expect(auth.refreshAbsoluteMs('customer')).toBe(6 * HOUR);
+    test('the legacy REFRESH_TTL_HOURS_CUSTOMER no longer stretches the 1-hour cap', () => {
+        const auth = loadAuth({ REFRESH_TTL_HOURS_CUSTOMER: '24' });
+        expect(auth.refreshAbsoluteMs('customer')).toBe(1 * HOUR);
     });
 
-    test('SESSION_MAX_HOURS_CUSTOMER still wins when set', () => {
-        const auth = loadAuth({ REFRESH_TTL_HOURS_CUSTOMER: '6', SESSION_MAX_HOURS_CUSTOMER: '3' });
-        expect(auth.refreshAbsoluteMs('customer')).toBe(3 * HOUR);
+    test('SESSION_MAX_HOURS_CUSTOMER overrides the cap (fractions allowed)', () => {
+        expect(loadAuth({ SESSION_MAX_HOURS_CUSTOMER: '3' }).refreshAbsoluteMs('customer')).toBe(3 * HOUR);
+        expect(loadAuth({ SESSION_MAX_HOURS_CUSTOMER: '0.5' }).refreshAbsoluteMs('customer')).toBe(0.5 * HOUR);
+    });
+
+    test('the access token never outlives the session and carries its end (sexp)', () => {
+        const jwt = require('jsonwebtoken');
+        process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-session-lifetime';
+        const { signAccessToken } = jest.requireActual('../middlewares/authMiddleware');
+        const user = { _id: 'u1', role: 'customer', tokenVersion: 0 };
+        const end = new Date(Date.now() + 10 * MIN);          // session ends in 10 min, access TTL is 30 min
+        const d = jwt.decode(signAccessToken(user, { sessionExpiresAt: end }));
+        expect(d.sexp).toBe(Math.floor(end.getTime() / 1000));
+        expect(d.exp).toBe(Math.floor(end.getTime() / 1000));
+        const far = new Date(Date.now() + 5 * HOUR);           // session longer than the TTL → normal TTL
+        const d2 = jwt.decode(signAccessToken(user, { sessionExpiresAt: far }));
+        expect(d2.exp).toBeLessThan(Math.floor(far.getTime() / 1000));
+        expect(jwt.decode(signAccessToken(user)).sexp).toBeUndefined();
     });
 
     test('staff and superadmin windows are unchanged', () => {

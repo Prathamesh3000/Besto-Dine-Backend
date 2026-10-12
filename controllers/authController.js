@@ -126,8 +126,9 @@ function refreshTtlMs(role) {
  * can do:
  *   superadmin  8h  — platform-wide access; shortest leash
  *   staff      12h  — about one shift on a shared floor tablet
- *   customer   24h  — plus a 60-minute INACTIVITY timeout (see
- *                     customerIdleMs / refresh below)
+ *   customer    1h  — a FIXED hour from sign-in, active or not (client
+ *                     decision 2026-10-07). The 60-minute inactivity
+ *                     timeout below can only end it sooner.
  */
 function refreshAbsoluteMs(role) {
     const hours = (envKey, dflt) => {
@@ -136,11 +137,9 @@ function refreshAbsoluteMs(role) {
     };
     if (role === 'superadmin') return hours('SESSION_MAX_HOURS_SUPERADMIN', 8);
     if (STAFF_SESSION_ROLES.has(role)) return hours('SESSION_MAX_HOURS_STAFF', 12);
-    // Customer absolute cap: SESSION_MAX_HOURS_CUSTOMER, else
-    // REFRESH_TTL_HOURS_CUSTOMER (its meaning since the idle timeout took
-    // over the per-token window), else 24h. Combined with the 60-minute
-    // inactivity timeout, an active customer re-signs in at least daily.
-    return hours('SESSION_MAX_HOURS_CUSTOMER', envNumber('REFRESH_TTL_HOURS_CUSTOMER', 24));
+    // Customer: signed out 1 hour after sign-in (SESSION_MAX_HOURS_CUSTOMER
+    // overrides; fractions allowed, e.g. 0.5).
+    return hours('SESSION_MAX_HOURS_CUSTOMER', 1);
 }
 
 const sha256 = (raw) => crypto.createHash('sha256').update(String(raw)).digest('hex');
@@ -180,8 +179,10 @@ exports.customerIdleMs = customerIdleMs;
 
 /** Mint an access token + refresh token for `user`. */
 async function issueSession(req, res, user, family, familyExpiresAt) {
-    const token = signAccessToken(user);
-    const refreshToken = await createRefreshSession(user, req, family, familyExpiresAt);
+    // The login's absolute end: inherited on rotation, fresh on sign-in.
+    const ceiling = familyExpiresAt || new Date(Date.now() + refreshAbsoluteMs(user.role));
+    const token = signAccessToken(user, { sessionExpiresAt: ceiling });
+    const refreshToken = await createRefreshSession(user, req, family, ceiling);
     setAuthCookie(res, token);  // CRIT-08 — no-op unless USE_COOKIE_AUTH=true
     return { token, refreshToken };
 }
@@ -440,6 +441,7 @@ const assertTenantNotLocked = async (user) => {
  * feature unlocked).
  */
 const { effectiveFeatures, activeAddonKeys } = require('../utils/featureAccess');
+const { resolveOperations } = require('../utils/operationsProfile');
 const ALL_FEATURE_KEYS = [...require('../models/subscriptionPlan').FEATURE_KEYS, 'revenueAnalytics'];
 
 const buildAuthResponse = async (user) => {
@@ -449,7 +451,7 @@ const buildAuthResponse = async (user) => {
 
     try {
         const r = await Restaurant.findById(user.restaurant)
-            .select('name slug status subscription featureOverrides addons')
+            .select('name slug status subscription featureOverrides addons operations')
             .lean();
         if (!r) return payload;
 
@@ -470,6 +472,9 @@ const buildAuthResponse = async (user) => {
             addons: [...activeAddonKeys(r)],
             limits: r.subscription?.limits || {},
             featureOverrides: r.featureOverrides || {},
+            // HOW the tenant runs (roles in use, order flow, payment
+            // timing), already intersected with plan access.
+            operations: resolveOperations(r, { branchId: user.branch || null }),
         };
     } catch (err) {
         logger.warn('buildAuthResponse: failed to load tenant for user ' + user._id + ': ' + err.message);
@@ -1144,6 +1149,11 @@ exports.refresh = async (req, res) => {
             const prior = await RefreshSession.findOne({ tokenHash }).lean();
             if (!prior) return invalid();
             if (prior.expiresAt <= now) {
+                // The token's window is capped at the login's absolute end,
+                // so a lapse AT that end is the fixed-hour logout, not idling.
+                if (prior.familyExpiresAt && new Date(prior.familyExpiresAt) <= now) {
+                    return invalid('SESSION_EXPIRED');
+                }
                 // A customer token that lapsed = the inactivity timeout
                 // (N14) — tell the client so it can say "session expired".
                 const owner = await User.findById(prior.user).select('role').lean();

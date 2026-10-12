@@ -197,8 +197,38 @@ function emitAll({ io, restaurant, branch, audience, recipients, rooms, events }
  * Persist + emit a notification. See the usage block at the top of the file.
  * @returns {Promise<{ok:boolean, docs:object[], persisted:boolean, emitted:boolean, error?:Error}>}
  */
+// Operations profile: a restaurant set up without waiters / captain has
+// nobody in those audiences — skip them instead of piling up unread
+// notifications. Profile-only (no plan intersection), and tenants that
+// never set a profile skip the lookup entirely.
+async function dropUnusedFloorAudiences(restaurant, audience) {
+    const list = toArray(audience);
+    if (!restaurant || !list.some(a => a === 'waiter' || a === 'captain')) return audience;
+    // No live DB connection (unit tests with mocked models): skip the
+    // lookup rather than let it buffer until timeout.
+    if (require('mongoose').connection.readyState !== 1) return audience;
+    try {
+        const Restaurant = require('../models/restaurant');
+        const r = await Restaurant.findById(restaurant._id || restaurant).select('operations').lean();
+        if (!r?.operations) return audience;
+        const { profileFlow } = require('../utils/operationsProfile');
+        const roles = profileFlow(r).roles;
+        const kept = list.filter(a => (a === 'waiter' ? roles.waiter : a === 'captain' ? roles.captain : true));
+        if (kept.length === list.length) return audience;
+        return Array.isArray(audience) ? kept : (kept[0] || null);
+    } catch {
+        return audience;
+    }
+}
+
 async function notify(opts = {}) {
     const result = { ok: true, docs: [], persisted: false, emitted: false, error: null };
+    if (opts.audience && opts.restaurant) {
+        const audience = await dropUnusedFloorAudiences(opts.restaurant, opts.audience);
+        const recipientsLeft = toArray(opts.recipients).length || toArray(opts.rooms).length;
+        if (!toArray(audience).length && !recipientsLeft) return result;
+        opts = { ...opts, audience };
+    }
     try {
         const {
             event = EVENTS.NOTIFICATION_NEW,

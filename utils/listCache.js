@@ -131,7 +131,28 @@ function create({ name, loader, ttlMs = 60_000, maxEntries = DEFAULT_MAX_ENTRIES
         if (name) cacheBus.publish(BUS_CHANNEL, { name, key });
     }
 
-    const handle = { name, get, invalidate, _invalidateLocal: invalidateLocal, _size: () => cache.size };
+    // Drop every entry of one tenant (all branch scopes). Mutations must
+    // use this rather than invalidate(req): a tenant owner's POST carries
+    // no `?branch`, so invalidate(req) only cleared the `tenant:null`
+    // entry while the admin's list was cached under `tenant:<branchId>`
+    // — the "created an area, list still empty for a minute" bug.
+    function invalidateTenantLocal(prefix) {
+        generation += 1;
+        for (const k of [...cache.keys()]) if (k.startsWith(prefix)) cache.delete(k);
+    }
+
+    function invalidateTenant(restaurantId) {
+        const rid = restaurantId && typeof restaurantId === 'object' ? restaurantId._id : restaurantId;
+        if (!rid) return invalidate();
+        const prefix = `${String(rid)}:`;
+        invalidateTenantLocal(prefix);
+        if (name) cacheBus.publish(BUS_CHANNEL, { name, prefix });
+    }
+
+    const handle = {
+        name, get, invalidate, invalidateTenant,
+        _invalidateLocal: invalidateLocal, _invalidateTenantLocal: invalidateTenantLocal, _size: () => cache.size,
+    };
     _registry.add(handle);
     if (name) _byName.set(name, handle);
     return handle;
@@ -141,7 +162,9 @@ function create({ name, loader, ttlMs = 60_000, maxEntries = DEFAULT_MAX_ENTRIES
 cacheBus.subscribe(BUS_CHANNEL, (msg) => {
     if (!msg || typeof msg.name !== 'string') return;
     const h = _byName.get(msg.name);
-    if (h) h._invalidateLocal(typeof msg.key === 'string' ? msg.key : null);
+    if (!h) return;
+    if (typeof msg.prefix === 'string' && msg.prefix) h._invalidateTenantLocal(msg.prefix);
+    else h._invalidateLocal(typeof msg.key === 'string' ? msg.key : null);
 });
 
 function invalidateAll() {

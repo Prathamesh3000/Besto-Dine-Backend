@@ -5,7 +5,7 @@ const Hall = require('../models/hall');
 const Branch = require('../models/branch');
 const logger = require('../utils/logger');
 
-const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const { parseCsv } = require('../utils/csvParser');
 const { _resolveBulkTargetBranch: resolveBulkTargetBranch } = require('./bookingInfoController');
 const { sendServerError } = require('../utils/httpErrors');
@@ -31,12 +31,12 @@ function hallBranchFilter(req) {
   // is set via X-Branch-Id header, not a query param).
   const pinned = pinnedBranchId(req);
   if (pinned) {
-    return { branch: pinned };
+    return branchScopeClause(req, pinned._id || pinned);
   }
   const raw = req?.query?.branch;
   if (raw === 'all') return null;
   if (raw === 'tenant-only' || raw === 'none') return { branch: null };
-  if (raw && mongoose.isValidObjectId(raw)) return { branch: raw };
+  if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
   if (req?.branch?._id) {
     return { $or: [{ branch: null }, { branch: req.branch._id }] };
   }

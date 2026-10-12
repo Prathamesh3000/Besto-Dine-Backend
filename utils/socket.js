@@ -470,15 +470,18 @@ exports.init = (server, allowedOrigins) => {
                             // chef without kitchenDisplay / a waiter or
                             // captain without waiterDashboard gets no
                             // tenant rooms, so no live order pushes.
-                            const { STAFF_APP_FEATURE_BY_ROLE } = require('../middlewares/featureGate');
+                            const { STAFF_APP_FEATURE_BY_ROLE, roleInUse } = require('../middlewares/featureGate');
                             const appFeature = STAFF_APP_FEATURE_BY_ROLE[socket.data.role];
                             if (appFeature && socket.data.restaurant) {
                                 const Restaurant = require('../models/restaurant');
                                 const { hasFeature } = require('./featureAccess');
                                 const r = await Restaurant.findById(socket.data.restaurant)
-                                    .select('subscription.features featureOverrides addons')
+                                    .select('subscription.features featureOverrides addons operations')
                                     .lean();
-                                if (!r || !hasFeature(r, appFeature)) {
+                                // …and the operations profile must have the
+                                // role in use (a switched-off waiter app gets
+                                // no live pushes either).
+                                if (!r || !hasFeature(r, appFeature) || !roleInUse(r, socket.data.role)) {
                                     socket.data.userId = null;
                                     socket.data.role = null;
                                     socket.data.branchId = null;

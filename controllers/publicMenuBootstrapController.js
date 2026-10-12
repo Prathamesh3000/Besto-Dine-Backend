@@ -10,6 +10,7 @@ const Promotion = require('../models/promotion');
 const Coupon = require('../models/coupon');
 const logger = require('../utils/logger');
 const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
+const { publicOperationsOf } = require('../utils/operationsProfile');
 const { hasFeature } = require('../utils/featureAccess');
 const { buildAvailabilityFilter } = require('../utils/menuAvailability');
 
@@ -51,7 +52,7 @@ exports.getMenuBootstrap = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug,
             status: { $in: ['active', 'trial'] },
-        }).select('_id name slug city contactPhone logo branding subscription featureOverrides addons').lean();
+        }).select('_id name slug city contactPhone logo branding subscription featureOverrides addons operations').lean();
 
         if (!restaurant) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
@@ -301,6 +302,7 @@ exports.getMenuBootstrap = async (req, res) => {
                     phone: restaurant.contactPhone || '',
                     logo: restaurant.logo || '',
                     features: publicFeaturesOf(restaurant),
+                    operations: publicOperationsOf(restaurant, { branchId: branch?._id || null }),
                 },
                 branch: branch ? {
                     _id: branch._id,

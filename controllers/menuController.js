@@ -17,7 +17,7 @@ const MENU_ITEM_TEMPLATE_PATH = path.join(__dirname, '..', 'data', 'menuItem-mas
 // ─── Public cache header for customer-facing reads (60s fresh, 5min stale) ───
 const PUBLIC_CACHE = 'public, max-age=60, stale-while-revalidate=300';
 
-const { tenantFilter, tenantId, isBranchPinned, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, isBranchPinned, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
 const { applyBranchPrice } = require('../utils/priceResolver');
 const { buildAvailabilityFilter, isStaffCaller } = require('../utils/menuAvailability');
 const { pickAllowed, MENU_ITEM_FIELDS } = require('../utils/bodyAllowlist');
@@ -105,12 +105,16 @@ function buildBranchFilter(query, req) {
     // Branch Admin cannot pass ?branch=all to widen scope.
     const pinned = pinnedBranchId(req);
     if (pinned) {
-        return {
-            $or: [
-                { branch: pinned },
-                { 'branchPrices.branch': pinned },
-            ],
-        };
+        const or = [
+            { branch: pinned },
+            { 'branchPrices.branch': pinned },
+        ];
+        // Shared (branch:null) items are the Main branch's menu, so staff
+        // pinned to Main see them too (utils/tenantScope.branchScopeClause).
+        if (req?.mainBranchId && String(req.mainBranchId) === String(pinned._id || pinned)) {
+            or.push({ branch: null });
+        }
+        return { $or: or };
     }
 
     const { branch, branchScope } = query;
@@ -121,7 +125,7 @@ function buildBranchFilter(query, req) {
     }
     if (branch === 'tenant-only' || branch === 'none') return { branch: null };
     if (branch === 'all') return null;
-    if (mongoose.isValidObjectId(branch)) return { branch };
+    if (mongoose.isValidObjectId(branch)) return branchScopeClause(req, branch);
 
     // No explicit branch query — fall back to req.branch (Phase 6
     // step 5). Tenant-level callers (no header, no staff branch)

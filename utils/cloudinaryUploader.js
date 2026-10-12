@@ -30,31 +30,48 @@ async function compressAndUpload({
     throw new Error('Empty buffer — nothing to upload.');
   }
 
-  // Same compression rules as the old disk-based pipeline so image
+  // Every upload is re-encoded to one of three web formats. Inputs that
+  // can carry transparency (PNG, GIF, SVG, ICO) become PNG, WebP stays
+  // WebP, everything else (JPG, HEIC, AVIF, BMP, TIFF…) becomes JPG.
+  // Same compression settings as the old disk-based pipeline so image
   // quality on existing pages stays visually identical.
   const ext = String(originalname || '').split('.').pop().toLowerCase();
-  let pipeline = sharp(buffer).resize({ width: maxWidth, withoutEnlargement: true });
-  let outBuf;
+  const mime = String(mimetype || '').toLowerCase();
+  const isType = (exts, mimes) => exts.includes(ext) || mimes.includes(mime);
   let format = 'jpg';
-
-  if (ext === 'png' || mimetype === 'image/png') {
-    outBuf = await pipeline.png({ quality: 80, compressionLevel: 9 }).toBuffer();
+  if (isType(['png', 'gif', 'svg', 'ico'], ['image/png', 'image/gif', 'image/svg+xml', 'image/x-icon', 'image/vnd.microsoft.icon'])) {
     format = 'png';
-  } else if (ext === 'webp' || mimetype === 'image/webp') {
-    outBuf = await pipeline.webp({ quality: 80 }).toBuffer();
+  } else if (isType(['webp'], ['image/webp'])) {
     format = 'webp';
-  } else {
-    outBuf = await pipeline.jpeg({ quality: 80 }).toBuffer();
-    format = 'jpg';
+  }
+
+  let outBuf = null;
+  try {
+    // .rotate() applies the EXIF orientation so phone photos aren't sideways.
+    const pipeline = sharp(buffer).rotate().resize({ width: maxWidth, withoutEnlargement: true });
+    if (format === 'png') outBuf = await pipeline.png({ quality: 80, compressionLevel: 9 }).toBuffer();
+    else if (format === 'webp') outBuf = await pipeline.webp({ quality: 80 }).toBuffer();
+    else outBuf = await pipeline.jpeg({ quality: 80 }).toBuffer();
+  } catch (err) {
+    // An SVG is only ever stored rasterised — never pass the markup on.
+    if (ext === 'svg' || mime === 'image/svg+xml') throw err;
+    // Sharp can't decode this one (e.g. iPhone HEIC — the prebuilt
+    // binary has no HEVC decoder, or BMP / ICO). Hand the original to
+    // Cloudinary instead: it decodes far more formats and converts to
+    // `format` on upload, with the same width cap applied there.
+    outBuf = null;
   }
 
   // Cloudinary's stream uploader takes the buffer directly — no temp
   // file on disk, so this works on read-only deploy filesystems too.
+  const options = outBuf
+    ? { folder, format, resource_type: 'image' }
+    : { folder, format, resource_type: 'image', transformation: [{ width: maxWidth, crop: 'limit', quality: 80 }] };
   return new Promise((resolve, reject) => {
     cloudinary.uploader.upload_stream(
-      { folder, format, resource_type: 'image' },
+      options,
       (err, result) => (err ? reject(err) : resolve(result)),
-    ).end(outBuf);
+    ).end(outBuf || buffer);
   });
 }
 

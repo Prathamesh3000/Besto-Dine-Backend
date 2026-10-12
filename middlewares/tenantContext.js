@@ -11,6 +11,8 @@ const {
 } = require('../utils/requestContext');
 
 /**
+ * Also stamps req.mainBranchId (see attachMainBranchId below).
+ *
  * BUGS_REPORT #30 — continue the chain inside a request-scoped
  * AsyncLocalStorage context carrying the resolved tenant/branch/user, so
  * utils/tenantScopePlugin.js can auto-scope queries that forgot
@@ -18,7 +20,38 @@ const {
  * (plugin no-op). Route-level re-mounts of attachTenant update the
  * existing store instead of nesting a new one.
  */
-function proceed(req, next) {
+// ── Main branch id on every tenant request ─────────────────────────────
+// Records stored with branch:null (created before branches existed, or by
+// a path that didn't pick a branch) belong to the tenant's Main branch.
+// utils/tenantScope's branch filters need the Main id synchronously to
+// show those records in the Main view, so it is resolved here once per
+// request (micro-cached per tenant) and kept on req.mainBranchId.
+// Resolution matches utils/mainBranch.getMainBranchId: slug 'main', else
+// the oldest active branch.
+const mainBranchCache = new Map();   // restaurantId → { id, expires }
+const MAIN_BRANCH_TTL_MS = 60 * 1000;
+
+async function attachMainBranchId(req) {
+    if (req.mainBranchId !== undefined) return;          // route-level re-mount
+    const rid = req.restaurant?._id ? String(req.restaurant._id) : null;
+    if (!rid) { req.mainBranchId = null; return; }
+    const hit = mainBranchCache.get(rid);
+    if (hit && hit.expires > Date.now()) { req.mainBranchId = hit.id; return; }
+    try {
+        let main = await Branch.findOne({ restaurant: rid, isActive: true, slug: 'main' }).select('_id').lean();
+        if (!main) {
+            main = await Branch.findOne({ restaurant: rid, isActive: true }).sort({ createdAt: 1 }).select('_id').lean();
+        }
+        req.mainBranchId = main?._id || null;
+        mainBranchCache.set(rid, { id: req.mainBranchId, expires: Date.now() + MAIN_BRANCH_TTL_MS });
+    } catch (err) {
+        logger.warn('tenant.mainBranch.lookup-failed', { restaurant: rid, error: err.message });
+        req.mainBranchId = null;
+    }
+}
+
+async function proceed(req, next) {
+    await attachMainBranchId(req);
     const store = contextFromRequest(req);
     if (getContext()) {
         updateContext(store);
@@ -416,6 +449,26 @@ const attachTenant = async (req, res, next) => {
                 return res.status(bres.status).json({ success: false, code: bres.code, message: bres.message });
             }
             req.branch = bres.branch;
+
+            // Admin branch switcher: `?branch=<id>` is injected into every
+            // staff GET and used as a STRICT filter by list endpoints. An
+            // id from another tenant (stale localStorage after switching
+            // restaurants in the same browser) or a deleted branch used
+            // to pass straight through and every list came back empty.
+            // Refuse it the same way a bad X-Branch-Id is refused so the
+            // client drops the stale value. 'all' / 'tenant-only' / 'none'
+            // are keywords, not ids, and are left alone.
+            const qBranch = req.query?.branch;
+            if (typeof qBranch === 'string' && mongoose.isValidObjectId(qBranch)) {
+                const known = await Branch.exists({ _id: qBranch, restaurant: r._id, isActive: true });
+                if (!known) {
+                    return res.status(404).json({
+                        success: false,
+                        code: 'BRANCH_NOT_FOUND',
+                        message: 'The selected branch is not part of this restaurant or is inactive.',
+                    });
+                }
+            }
             return proceed(req, next);
         }
 

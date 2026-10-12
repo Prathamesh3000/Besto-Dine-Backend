@@ -3,7 +3,7 @@ const Category = require('../models/category');
 const MenuItem = require('../models/menuItem');
 const Branch = require('../models/branch');
 
-const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
 const { pickAllowed, CATEGORY_FIELDS } = require('../utils/bodyAllowlist');
 
 /**
@@ -68,9 +68,11 @@ exports.getCategories = async (req, res) => {
         //   branch=all         → no filter (tenant-owner view)
         //   branchScope=auto+id→ tenant-level PLUS the given branch (customer)
         //   (none of the above)→ fall back to req.branch (customer flow)
+        // Main-branch views also include shared (branch:null) categories —
+        // they are Main's (utils/tenantScope.branchScopeClause).
         const pinned = pinnedBranchId(req);
         if (pinned) {
-            filter.branch = pinned;
+            Object.assign(filter, branchScopeClause(req, pinned._id || pinned));
         } else {
             const { branch, branchScope } = req.query;
             if (branchScope === 'auto' && mongoose.isValidObjectId(branch)) {
@@ -78,7 +80,7 @@ exports.getCategories = async (req, res) => {
             } else if (branch === 'tenant-only' || branch === 'none') {
                 filter.branch = null;
             } else if (branch && branch !== 'all' && mongoose.isValidObjectId(branch)) {
-                filter.branch = branch;
+                Object.assign(filter, branchScopeClause(req, branch));
             } else if (branch !== 'all' && req.branch?._id) {
                 filter.$or = [{ branch: null }, { branch: req.branch._id }];
             }

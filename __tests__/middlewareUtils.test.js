@@ -52,13 +52,19 @@ jest.mock('cloudinary', () => ({
 }));
 
 const mockSharpCalls = [];
+// Set to true to make sharp fail to decode (e.g. iPhone HEIC).
+let mockSharpCannotDecode = false;
 jest.mock('sharp', () => (buf) => {
     const chain = {
+        rotate: () => { mockSharpCalls.push(['rotate']); return chain; },
         resize: (o) => { mockSharpCalls.push(['resize', o]); return chain; },
         png: (o) => { mockSharpCalls.push(['png', o]); return chain; },
         webp: (o) => { mockSharpCalls.push(['webp', o]); return chain; },
         jpeg: (o) => { mockSharpCalls.push(['jpeg', o]); return chain; },
-        toBuffer: async () => Buffer.concat([Buffer.from('OUT:'), buf]),
+        toBuffer: async () => {
+            if (mockSharpCannotDecode) throw new Error('Input buffer contains unsupported image format');
+            return Buffer.concat([Buffer.from('OUT:'), buf]);
+        },
     };
     return chain;
 });
@@ -527,6 +533,14 @@ describe('uploadMiddleware (images)', () => {
         ['a.JPEG', 'image/jpeg'],
         ['a.png', 'image/png'],
         ['a.webp', 'image/webp'],
+        ['a.gif', 'image/gif'],
+        ['logo.svg', 'image/svg+xml'],          // rasterised to PNG by cloudinaryUploader
+        ['a.bmp', 'image/bmp'],
+        ['a.avif', 'image/avif'],
+        ['a.tiff', 'image/tiff'],
+        ['IMG_0001.HEIC', 'image/heic'],
+        ['IMG_0002.heic', 'application/octet-stream'],   // Windows browsers
+        ['fav.ico', 'image/x-icon'],
     ])('accepts %s (%s)', async (name, mime) => {
         const res = await send(name, mime);
         expect(res.status).toBe(200);
@@ -534,9 +548,9 @@ describe('uploadMiddleware (images)', () => {
     });
 
     test.each([
-        ['svg (XSS vector)', 'logo.svg', 'image/svg+xml'],
-        ['gif', 'a.gif', 'image/gif'],
         ['html renamed', 'a.html', 'text/html'],
+        ['pdf', 'menu.pdf', 'application/pdf'],
+        ['svg ext + html mime', 'logo.svg', 'text/html'],
         ['png ext + html mime', 'a.png', 'text/html'],
         ['exe ext + png mime', 'evil.exe', 'image/png'],
         ['no extension', 'image', 'image/png'],
@@ -553,11 +567,9 @@ describe('uploadMiddleware (images)', () => {
         expect(res.status).toBe(200);
     });
 
-    test('regex is unanchored: "image/png-evil" mime and ".jpgx" ext slip through', async () => {
-        // /jpeg|jpg|png|webp/ matches substrings — ".pngx" or "application/x-png+json"
-        // are treated as images. Content is re-encoded by sharp later, so impact is low.
+    test('extension must be an exact image extension: ".pngx" with a non-image mime is rejected', async () => {
         const res = await send('x.pngx', 'application/x-png-but-not');
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
     });
 
     test('5 MB limit: 5 MB - 1 byte passes; exactly 5 MB is already LIMIT_FILE_SIZE (busboy emits limit on reaching it)', async () => {
@@ -668,6 +680,7 @@ describe('parseCsv', () => {
 describe('cloudinaryUploader.compressAndUpload', () => {
     beforeEach(() => {
         mockSharpCalls.length = 0;
+        mockSharpCannotDecode = false;
         mockUploadStream.mockReset();
         mockUploadStream.mockImplementation((opts, cb) => ({
             end: (buf) => cb(null, { secure_url: `https://res.cloudinary.test/${opts.folder}/x.${opts.format}`, bytes: buf.length, opts }),
@@ -696,12 +709,16 @@ describe('cloudinaryUploader.compressAndUpload', () => {
         ['a.bin', 'image/png', 'png'],
         ['a.webp', 'image/webp', 'webp'],
         ['a.jpg', 'image/jpeg', 'jpeg'],
-        ['noext', 'image/gif', 'jpeg'],
+        ['noext', 'image/gif', 'png'],          // GIF keeps transparency → PNG
+        ['logo.svg', 'image/svg+xml', 'png'],
+        ['photo.heic', 'image/heic', 'jpeg'],
+        ['scan.bmp', 'image/bmp', 'jpeg'],
         [undefined, undefined, 'jpeg'],
     ])('%s / %s → %s pipeline', async (originalname, mimetype, encoder) => {
         const result = await compressAndUpload({ buffer: Buffer.from('img'), originalname, mimetype });
-        expect(mockSharpCalls[0]).toEqual(['resize', { width: 1200, withoutEnlargement: true }]);
-        expect(mockSharpCalls[1][0]).toBe(encoder);
+        expect(mockSharpCalls[0]).toEqual(['rotate']);      // EXIF orientation applied
+        expect(mockSharpCalls[1]).toEqual(['resize', { width: 1200, withoutEnlargement: true }]);
+        expect(mockSharpCalls[2][0]).toBe(encoder);
         const fmt = encoder === 'jpeg' ? 'jpg' : encoder;
         expect(mockUploadStream).toHaveBeenCalledWith(
             { folder: 'bestodine/uploads', format: fmt, resource_type: 'image' },
@@ -712,9 +729,26 @@ describe('cloudinaryUploader.compressAndUpload', () => {
 
     test('custom folder + maxWidth are honoured and the RE-ENCODED buffer is uploaded', async () => {
         const result = await compressAndUpload({ buffer: Buffer.from('raw'), originalname: 'c.jpg', folder: 'bestodine/blog', maxWidth: 1280 });
-        expect(mockSharpCalls[0]).toEqual(['resize', { width: 1280, withoutEnlargement: true }]);
+        expect(mockSharpCalls[1]).toEqual(['resize', { width: 1280, withoutEnlargement: true }]);
         expect(result.opts.folder).toBe('bestodine/blog');
         expect(result.bytes).toBe(Buffer.from('OUT:raw').length);
+    });
+
+    test('format sharp cannot decode (HEIC) → original sent to Cloudinary, converted to JPG with the width cap', async () => {
+        mockSharpCannotDecode = true;
+        const original = Buffer.from('heic-bytes');
+        const result = await compressAndUpload({ buffer: original, originalname: 'IMG_1.HEIC', mimetype: 'image/heic', maxWidth: 1200 });
+        expect(mockUploadStream).toHaveBeenCalledWith(
+            { folder: 'bestodine/uploads', format: 'jpg', resource_type: 'image', transformation: [{ width: 1200, crop: 'limit', quality: 80 }] },
+            expect.any(Function),
+        );
+        expect(result.bytes).toBe(original.length);   // the untouched original went up
+    });
+
+    test('an SVG sharp cannot rasterise is rejected, never uploaded as markup', async () => {
+        mockSharpCannotDecode = true;
+        await expect(compressAndUpload({ buffer: Buffer.from('<svg'), originalname: 'x.svg', mimetype: 'image/svg+xml' })).rejects.toThrow();
+        expect(mockUploadStream).not.toHaveBeenCalled();
     });
 
     test('cloudinary error rejects', async () => {

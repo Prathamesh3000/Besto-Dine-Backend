@@ -365,6 +365,7 @@ exports.addStaff = async (req, res) => {
     if (!['chef', 'waiter', 'captain', 'admin', 'manager'].includes(role)) {
       return res.status(400).json({ success: false, message: 'Invalid staff role' });
     }
+    if (!opsRoleInUse(req, role)) return res.status(400).json(roleNotInUseBody(role));
 
     // ── Privilege-escalation guard ───────────────────────────────────
     // Creating a `role: 'admin'` is a tenant-owner decision regardless
@@ -803,6 +804,11 @@ exports.updateStaff = async (req, res) => {
     if (role !== undefined && !['chef', 'waiter', 'captain', 'admin', 'manager'].includes(role)) {
       return res.status(400).json({ success: false, message: 'Invalid staff role' });
     }
+    // Moving someone INTO a role the restaurant doesn't use is refused;
+    // editing an existing waiter's name etc. (role unchanged) still works.
+    if (role !== undefined && role !== existing.role && !opsRoleInUse(req, role)) {
+      return res.status(400).json(roleNotInUseBody(role));
+    }
 
     const updateData = { name, email, mobile, role, staffId, avatar, permissions: permissionsToWrite, kitchenResponsibility };
 
@@ -1112,7 +1118,9 @@ exports.getStaffPerformance = async (req, res) => {
       // particular tend to place orders and hand off the table to a waiter
       // for serving, so 'served' alone undercounted them severely.
       const waiterObjectId = new (require('mongoose').Types.ObjectId)(id);
-      const handledStatuses = { $nin: ['cancelled'] };
+      // A pay-first order held until paid ('awaiting-payment') isn't
+      // handled work yet — it only counts once it is released.
+      const handledStatuses = { $nin: ['cancelled', 'awaiting-payment'] };
 
       const [
         totalHandled, todayHandled, weekHandled,
@@ -1284,6 +1292,26 @@ exports.downloadStaffTemplate = (req, res) => {
 // admin CSV.
 const BULK_STAFF_ROLES = new Set(['admin', 'manager', 'captain', 'chef', 'waiter']);
 
+// ── Operations profile: roles the restaurant doesn't use ─────────────
+// A self-service restaurant (no waiters / captain / kitchen screen) can't
+// hire into those roles. Profile-only (utils/operationsProfile.profileFlow),
+// NOT plan-intersected: a plan without the waiter app could always create
+// waiter accounts, and a tenant that never set a profile must not change.
+function opsRoleInUse(req, role) {
+  if (!['waiter', 'captain', 'chef'].includes(role) || !req.restaurant) return true;
+  const { profileFlow } = require('../utils/operationsProfile');
+  return profileFlow(req.restaurant).roles[role] !== false;
+}
+function roleNotInUseBody(role) {
+  const label = { waiter: 'waiters', captain: 'captains', chef: 'a kitchen screen (chef)' }[role] || role;
+  return {
+    success: false,
+    code: 'ROLE_NOT_IN_USE',
+    role,
+    message: `Your restaurant is set up without ${label}. Contact BestoDine support to change how your restaurant operates.`,
+  };
+}
+
 // POST /api/staff/import
 // Body: multipart/form-data with:
 //   file   = .csv (header: name,email,role,mobile — `mobile` is optional)
@@ -1424,6 +1452,7 @@ exports.importStaffCsv = async (req, res) => {
         if (!BULK_STAFF_ROLES.has(roleRaw)) {
           throw new Error(`role must be one of: ${[...BULK_STAFF_ROLES].join(', ')}`);
         }
+        if (!opsRoleInUse(req, roleRaw)) throw new Error(roleNotInUseBody(roleRaw).message);
         if (roleRaw === 'admin' && req.user?.isTenantOwner !== true) {
           throw new Error('Only tenant owners can import Admin accounts');
         }

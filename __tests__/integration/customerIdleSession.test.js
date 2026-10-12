@@ -4,9 +4,10 @@
  * Customer refresh sessions slide by CUSTOMER_IDLE_TIMEOUT_MINUTES
  * (default 60): a refresh within the window works and extends it; after
  * 60 minutes without use the refresh is refused with
- * SESSION_IDLE_TIMEOUT. An absolute cap (REFRESH_TTL_HOURS_CUSTOMER,
- * default 24h) ends even an active session. Staff lifetimes are
- * unchanged. Time travel = rewriting the RefreshSession rows.
+ * SESSION_IDLE_TIMEOUT. On top of that a customer login ends a FIXED
+ * 1 hour after sign-in, however active (SESSION_MAX_HOURS_CUSTOMER,
+ * client decision 2026-10-07). Staff lifetimes are unchanged. Time
+ * travel = rewriting the RefreshSession rows.
  */
 const path = require('path');
 const { useIntegrationApp } = require('./helpers/harness');
@@ -46,13 +47,14 @@ async function ageSessions(userId, ms) {
                 lastUsedAt: back(row.lastUsedAt || row.createdAt),
                 createdAt: back(row.createdAt),
                 expiresAt: back(row.expiresAt),
+                ...(row.familyExpiresAt ? { familyExpiresAt: back(row.familyExpiresAt) } : {}),
             },
         });
     }
 }
 
 describe('customer refresh session — 60-minute inactivity timeout', () => {
-    test('login issues a customer refresh session that expires 60 min out (≤ 24h cap)', async () => {
+    test('login issues a customer refresh session that expires 60 min out, capped 1 hour after sign-in', async () => {
         const cust = await createCustomer('idle-ttl');
         await login(cust, 'customer');
         const row = await RefreshSession.findOne({ user: cust._id, revokedAt: null }).lean();
@@ -60,11 +62,21 @@ describe('customer refresh session — 60-minute inactivity timeout', () => {
         expect(ttl).toBeGreaterThan(59 * MIN);
         expect(ttl).toBeLessThanOrEqual(60 * MIN + 1000);
         const cap = new Date(row.familyExpiresAt).getTime() - new Date(row.createdAt).getTime();
-        expect(cap).toBeGreaterThan(23.9 * HOUR);
-        expect(cap).toBeLessThanOrEqual(24 * HOUR + 1000);
+        expect(cap).toBeGreaterThan(59 * MIN);
+        expect(cap).toBeLessThanOrEqual(1 * HOUR + 1000);
     });
 
-    test('refresh within 60 min works and extends the window', async () => {
+    test('the access token carries the session end (sexp) and never outlives it', async () => {
+        const cust = await createCustomer('idle-sexp');
+        const s0 = await login(cust, 'customer');
+        const jwt = require('jsonwebtoken');
+        const claims = jwt.decode(s0.token);
+        const row = await RefreshSession.findOne({ user: cust._id, revokedAt: null }).lean();
+        expect(claims.sexp).toBe(Math.floor(new Date(row.familyExpiresAt).getTime() / 1000));
+        expect(claims.exp).toBeLessThanOrEqual(claims.sexp);
+    });
+
+    test('an active customer refreshes fine within the hour, and is signed out at the hour anyway', async () => {
         const cust = await createCustomer('idle-ok');
         const s0 = await login(cust, 'customer');
 
@@ -72,24 +84,38 @@ describe('customer refresh session — 60-minute inactivity timeout', () => {
         const r1 = await refresh(s0.refreshToken);
         expect(r1.status).toBe(200);
         expect(r1.body.token).toEqual(expect.any(String));
+        expect((await ctx.api.as(r1.body.token).get('/auth/me')).status).toBe(200);
 
-        // The new token restarts the 60-minute window: another 45 min
-        // later (90 min after login) it still works.
-        await ageSessions(cust._id, 45 * MIN);
-        const r2 = await refresh(r1.body.refreshToken);
-        expect(r2.status).toBe(200);
-        expect((await ctx.api.as(r2.body.token).get('/auth/me')).status).toBe(200);
+        // Still active, but 65 min after sign-in: the fixed hour is up.
+        await ageSessions(cust._id, 20 * MIN);
+        const r2 = await refresh(r1.body.refreshToken, { idleMs: 1000 });
+        expect(r2.status).toBe(401);
+        expect(r2.body.code).toBe('SESSION_EXPIRED');
     });
 
-    test('refresh after 60 min idle is refused with SESSION_IDLE_TIMEOUT', async () => {
+    test('refresh after 60 min idle is refused — with the default 1-hour login that is the hour itself', async () => {
         const cust = await createCustomer('idle-expired');
         const s0 = await login(cust, 'customer');
 
         await ageSessions(cust._id, 61 * MIN);
         const r = await refresh(s0.refreshToken);
         expect(r.status).toBe(401);
-        expect(r.body.code).toBe('SESSION_IDLE_TIMEOUT');
+        expect(r.body.code).toBe('SESSION_EXPIRED');
         expect(r.body.message).toMatch(/sign in again/i);
+    });
+
+    test('with a longer login cap configured, 60 min idle is still SESSION_IDLE_TIMEOUT', async () => {
+        process.env.SESSION_MAX_HOURS_CUSTOMER = '24';
+        try {
+            const cust = await createCustomer('idle-expired-24');
+            const s0 = await login(cust, 'customer');
+            await ageSessions(cust._id, 61 * MIN);
+            const r = await refresh(s0.refreshToken);
+            expect(r.status).toBe(401);
+            expect(r.body.code).toBe('SESSION_IDLE_TIMEOUT');
+        } finally {
+            delete process.env.SESSION_MAX_HOURS_CUSTOMER;
+        }
     });
 
     test('idle detected via lastUsedAt alone (legacy row with a long expiresAt)', async () => {
@@ -125,10 +151,10 @@ describe('customer refresh session — 60-minute inactivity timeout', () => {
         expect(ok.status).toBe(200);
     });
 
-    test('absolute 24h cap ends even an active customer session', async () => {
+    test('the absolute cap ends even an active customer session', async () => {
         const cust = await createCustomer('idle-cap');
         const s0 = await login(cust, 'customer');
-        // Recently used, but the login itself is 25h old.
+        // Recently used, but the session's end has passed.
         await RefreshSession.updateMany({ user: cust._id, revokedAt: null }, {
             $set: { familyExpiresAt: new Date(Date.now() - HOUR) },
         });

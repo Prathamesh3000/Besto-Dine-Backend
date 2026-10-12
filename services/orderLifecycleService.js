@@ -143,14 +143,29 @@ async function cancelOrder(req) {
     });
   }
 
-  // Only 'new' status orders can be cancelled
-  if (order.status !== 'new') {
+  // Only 'new' orders — or held pay-first orders the kitchen never saw —
+  // can be cancelled by the customer.
+  if (order.status !== 'new' && order.status !== 'awaiting-payment') {
     throw httpError(403, { success: false, message: `Cannot cancel order with status "${order.status}".` });
   }
 
-  order.status = 'cancelled';
-  order.note = (order.note ? order.note + ' | ' : '') + `Cancelled by customer: ${reason || 'No reason'}`;
-  await order.save();
+  // Atomic on the status we just checked: a held pay-first order can be
+  // released to the kitchen (payment arriving) between the read above
+  // and this write — a plain save() would then cancel food already
+  // being cooked.
+  const cancelled = await Order.findOneAndUpdate(
+    { _id: order._id, restaurant: order.restaurant, status: order.status },
+    { $set: {
+      status: 'cancelled',
+      note: (order.note ? order.note + ' | ' : '') + `Cancelled by customer: ${reason || 'No reason'}`,
+    } },
+    { returnDocument: 'after' },
+  );
+  if (!cancelled) {
+    throw httpError(409, { success: false, code: 'ORDER_CHANGED', message: 'This order was just updated — please refresh and try again.' });
+  }
+  order.status = cancelled.status;
+  order.note = cancelled.note;
 
   // Free the table if it was dine-in (scoped). Unmerges the group if
   // the table is part of a merge so all siblings go back to 'free'
@@ -387,4 +402,7 @@ module.exports = {
   rateOrder,
   cleanupStaleReadyOrders,
   cleanupEmptyOrdersNow,
+  // Reused by razorpayController.markOrderPaidAtomically when a capture
+  // lands on an order that was already cancelled.
+  queueRefundRequestOnCancel,
 };

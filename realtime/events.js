@@ -54,6 +54,10 @@ const EVENTS = Object.freeze({
     // Settings / menu / auth
     SETTINGS_UPDATED: 'settings:updated',
     MENU_UPDATED: 'menu:updated',
+
+    // Super Admin changed how the tenant operates (operations profile) —
+    // staff apps refetch /auth/me.
+    TENANT_OPERATIONS_UPDATED: 'tenant:operations-updated',
     AUTH_RELOAD: 'auth:reload',
 
     // Thermal printing (services/printService.js ↔ print-agent/)

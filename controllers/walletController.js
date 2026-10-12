@@ -719,6 +719,17 @@ exports.payWithWallet = async (req, res) => {
       await session.endSession();
     }
 
+    // A held pay-first order (customer chose to pay from the wallet) is
+    // released to the kitchen once the wallet fully paid it.
+    if (outcome?.orderPaid) {
+      try {
+        const { releaseHeldOrder } = require('../services/orderHoldService');
+        await releaseHeldOrder(orderId);
+      } catch (relErr) {
+        logger.warn('Failed to release held order after wallet payment:', relErr.message);
+      }
+    }
+
     // Table-status rule: the bill is settled → free the dine-in table now
     // (unless another order on it is still unpaid). After the commit, so
     // a rolled-back payment never frees a table. Best-effort.

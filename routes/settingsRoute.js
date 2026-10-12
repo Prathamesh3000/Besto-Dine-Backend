@@ -202,6 +202,11 @@ const patchValidation = settingsValidate([
 // @access  Public / Optional Auth
 router.get('/', optionalAuth, settingsController.getSettings);
 
+// @route   GET /api/settings/operations
+// @access  Private/Admin — read-only view of the tenant's operations
+//          profile (set by the Super Admin; see controllers/operationsController).
+router.get('/operations', protect, adminOnly, require('../controllers/operationsController').getMyOperations);
+
 // @route   PUT /api/settings
 // @access  Private/Admin
 router.put('/', protect, adminOnly, putValidation, settingsController.updateSettings);
