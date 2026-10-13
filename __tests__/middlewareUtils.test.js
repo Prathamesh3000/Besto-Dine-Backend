@@ -572,11 +572,11 @@ describe('uploadMiddleware (images)', () => {
         expect(res.status).toBe(400);
     });
 
-    test('5 MB limit: 5 MB - 1 byte passes; exactly 5 MB is already LIMIT_FILE_SIZE (busboy emits limit on reaching it)', async () => {
+    test('5 MB limit: exactly 5 MB passes; 5 MB + 1 byte is LIMIT_FILE_SIZE (multer >= 2.3 treats fileSize as inclusive)', async () => {
         const five = 5 * 1024 * 1024;
-        const ok = await send('big.png', 'image/png', Buffer.alloc(five - 1));
+        const ok = await send('big.png', 'image/png', Buffer.alloc(five));
         expect(ok.status).toBe(200);
-        const tooBig = await send('big.png', 'image/png', Buffer.alloc(five));
+        const tooBig = await send('big.png', 'image/png', Buffer.alloc(five + 1));
         expect(tooBig.status).toBe(400);
         expect(tooBig.body.code).toBe('LIMIT_FILE_SIZE');
     });
@@ -619,9 +619,9 @@ describe('csvUpload', () => {
         expect(res.status).toBe(200);
     });
 
-    test('1 MB cap (effective max is 1 MB - 1 byte)', async () => {
-        expect((await send('a.csv', 'text/csv', Buffer.alloc(1024 * 1024 - 1, 0x61))).status).toBe(200);
-        const big = await send('a.csv', 'text/csv', Buffer.alloc(1024 * 1024, 0x61));
+    test('1 MB cap (inclusive: exactly 1 MB passes, 1 MB + 1 byte is rejected)', async () => {
+        expect((await send('a.csv', 'text/csv', Buffer.alloc(1024 * 1024, 0x61))).status).toBe(200);
+        const big = await send('a.csv', 'text/csv', Buffer.alloc(1024 * 1024 + 1, 0x61));
         expect(big.status).toBe(400);
         expect(big.body.code).toBe('LIMIT_FILE_SIZE');
     });
