@@ -6,6 +6,7 @@
 const path = require('path');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
+const os = require('os');
 
 const BACKEND = path.join(__dirname, '..', '..');
 const User = require(path.join(BACKEND, 'models/user'));
@@ -19,7 +20,9 @@ beforeAll(async () => {
     const u = new URL(process.env.MONGO_URL);
     u.pathname = `/${process.env.INTEGRATION_DB_NAME}_fresh`;
     global.assertInMemoryMongo(u.toString());
-    conn = await mongoose.createConnection(u.toString()).asPromise();
+    // mongodb 7.7 loads its os adapter via dynamic import(), which Jest's CJS runtime cannot do;
+    // passing the adapter explicitly skips that (same fix as helpers/db.js).
+    conn = await mongoose.createConnection(u.toString(), { runtimeAdapters: { os } }).asPromise();
     FreshUser = conn.model('User', User.schema);
     FreshOrder = conn.model('Order', Order.schema);
     await FreshUser.init();
