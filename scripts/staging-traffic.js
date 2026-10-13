@@ -13,7 +13,7 @@
  * Three steps per order at 10 creations/min need ~30 steps/min to keep the kitchen board bounded, hence
  * the batch of 3 per 5 s tick. Nothing is cancelled or deleted — the orders stay as historical data.
  *
- * Rate limits it respects: POST /orders is capped by the backend at 5 per minute PER USER
+ * Rate limits it respects: POST /orders is capped by the backend at 60/min per STAFF user (5/min for customers/kiosk)
  * (routes/orderRoute.js orderCreateLimiter), so the script rotates over the staging seed
  * staff accounts (admin + waiter by default) and backs off per account on a 429 (Retry-After).
  * The achieved rate is printed every minute and in the final summary. Login is done ONCE per

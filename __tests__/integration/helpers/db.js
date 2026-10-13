@@ -3,11 +3,21 @@
  * per-file database on the in-memory replica set (helpers/env.js), and
  * refuses any other URI.
  */
+const os = require('os');
 const mongoose = require('mongoose');
+
+// mongodb >= 7.7 loads its default `os` adapter with a dynamic `import()`
+// (lib/runtime_adapters.js). Jest's CommonJS runtime cannot perform that
+// import, the rejection is squashed, the client metadata resolves to {}
+// and every connect fails with "Missing required sub-document 'driver'
+// in the client metadata document". Supplying the adapter explicitly
+// (a documented MongoClient option, passed through by mongoose) skips
+// the dynamic import. Harmless on older drivers.
+const DRIVER_RUNTIME_ADAPTERS = { runtimeAdapters: { os } };
 
 async function connect() {
     global.assertInMemoryMongo(process.env.MONGO_URL);
-    await mongoose.connect(process.env.MONGO_URL, { serverSelectionTimeoutMS: 15000 });
+    await mongoose.connect(process.env.MONGO_URL, { serverSelectionTimeoutMS: 15000, ...DRIVER_RUNTIME_ADAPTERS });
     global.assertInMemoryMongo(`mongodb://${mongoose.connection.host}:${mongoose.connection.port}/`);
 }
 

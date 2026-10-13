@@ -24,6 +24,15 @@ function buildKitchenInvolvementFilter() {
   };
 }
 
+// GET /orders/kitchen `?limit=` bounds: default 150, hard max 300.
+const KITCHEN_DEFAULT_LIMIT = 150;
+const KITCHEN_MAX_LIMIT = 300;
+function clampKitchenLimit(raw) {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return KITCHEN_DEFAULT_LIMIT;
+  return Math.min(n, KITCHEN_MAX_LIMIT);
+}
+
 // ── Kitchen Orders (Chef Dashboard) ─────────────────────────────────────────
 // Returns orders filtered by the logged-in chef's kitchenResponsibility.
 // Chef with 'veg' only sees orders that have at least one veg item, etc.
@@ -54,11 +63,22 @@ async function getKitchenOrders(req) {
   // proper floor/section label instead of the raw ObjectId. The
   // `completedToday` tally is a pure count — no need to format those
   // rows, so we only fetch the minimum (_id + updatedAt) for it.
-  const [liveOrders, servedTodayCount] = await Promise.all([
+  //
+  // Safety cap (desktop soak 2026-10-13: 282 open orders / 241 KB per poll,
+  // all rendered by the KDS). `?limit=` defaults to KITCHEN_DEFAULT_LIMIT
+  // and is clamped to KITCHEN_MAX_LIMIT. Oldest-first at the DB so the
+  // kitchen never loses the orders it must cook first; the UI ordering
+  // (sortKitchenOrders) is applied to the capped set afterwards. `total`
+  // counts every open kitchen order in scope so the client can show
+  // "150 of 282" and the board can flag the backlog.
+  const limit = clampKitchenLimit(req.query?.limit);
+  const [liveOrders, totalLive, servedTodayCount] = await Promise.all([
     Order.find({ status: { $in: activeStatuses }, ...tf, ...sbf, ...kitchenInvolvementFilter })
       .populate({ path: 'table', select: 'name area mergedWith', populate: { path: 'area', select: 'name' } })
       .populate('chef', 'name')
-      .sort({ createdAt: -1 }),
+      .sort({ createdAt: 1, _id: 1 })
+      .limit(limit),
+    Order.countDocuments({ status: { $in: activeStatuses }, ...tf, ...sbf, ...kitchenInvolvementFilter }),
     // Same window as getCompletedKitchenOrders (servedAt, falling back to
     // updatedAt for legacy rows) so the badge count matches the drawer.
     Order.countDocuments({
@@ -142,11 +162,21 @@ async function getKitchenOrders(req) {
   // serverTime anchors the client-side elapsed timer. The chef dashboard
   // subtracts (Date.now() - serverTime) from `now` on every tick, so a
   // tablet with a skewed clock still shows the true age of each order.
+  // `meta` is additive — `orders` / `completedToday` / `serverTime` keep
+  // their shape. `returned` is after the per-chef JS filters above, so it
+  // can be below `limit` without `truncated` being set; `truncated` means
+  // the DB query itself had more open orders than `limit`.
   return reply(200, {
     success: true,
     orders: formattedOrders,
     completedToday,
     serverTime: new Date().toISOString(),
+    meta: {
+      total: totalLive,
+      returned: formattedOrders.length,
+      limit,
+      truncated: totalLive > limit,
+    },
   });
 }
 
@@ -307,6 +337,9 @@ async function reprintKOT(req) {
 
 module.exports = {
   buildKitchenInvolvementFilter,
+  clampKitchenLimit,
+  KITCHEN_DEFAULT_LIMIT,
+  KITCHEN_MAX_LIMIT,
   getKitchenOrders,
   getCompletedKitchenOrders,
   reprintKOT,
