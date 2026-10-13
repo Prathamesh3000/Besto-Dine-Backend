@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 const logger = require('../utils/logger');
+const loginAttempts = require('../utils/loginAttempts');
 const { setAuthCookie, clearAuthCookie, signAccessToken } = require('../middlewares/authMiddleware');
 
 // Roles whose shift status should follow their auth session. Every
@@ -693,6 +694,27 @@ exports.login = async (req, res) => {
             return res.status(401).json({ success: false, message: 'Invalid email or password' });
         }
 
+        // ── Per-account lockout (utils/loginAttempts.js) ─────────────────────
+        // 10 failed password checks in 15 min lock THIS account for 15 min
+        // (auto-expiring). Checked before bcrypt so a locked account costs
+        // nothing, and answered with the same generic text as a wrong
+        // password so the response never says whether the account exists.
+        // Super admins are never locked — repeated failures are only logged.
+        const lockKey = loginAttempts.accountKey({ user, email: cleanEmail });
+        const lockExempt = loginAttempts.isExempt(user);
+        if (!lockExempt) {
+            const lock = await loginAttempts.getLock(lockKey);
+            if (lock.locked) {
+                logger.warn('auth.login.locked-attempt', {
+                    accountKey: loginAttempts.maskKey(lockKey),
+                    lockedUntil: lock.lockedUntil,
+                    ip: req.ip,
+                });
+                res.set('Retry-After', String(lock.retryAfterSec));
+                return res.status(429).json({ success: false, code: 'ACCOUNT_LOCKED', message: 'Invalid email or password' });
+            }
+        }
+
         // ── Password check ───────────────────────────────────────────────────
         // A Google-only account has NO stored password. Without this
         // guard bcrypt.compare(candidate, undefined) is reached, which
@@ -709,6 +731,27 @@ exports.login = async (req, res) => {
 
         const isMatch = await user.comparePassword(password);
         if (!isMatch) {
+            // Only FAILED checks count. A DB error here must not turn a
+            // wrong password into a 500 — the answer is still 401.
+            try {
+                const r = await loginAttempts.recordFailure(lockKey, { ip: req.ip, exempt: lockExempt });
+                if (r.justLocked) {
+                    logger.warn('auth.account.locked', {
+                        accountKey: loginAttempts.maskKey(lockKey),
+                        fails: r.fails,
+                        lockedUntil: r.lockedUntil,
+                        ip: req.ip,
+                    });
+                } else if (lockExempt && r.fails >= loginAttempts.maxFails()) {
+                    logger.warn('auth.superadmin.repeated-fails', {
+                        accountKey: loginAttempts.maskKey(lockKey),
+                        fails: r.fails,
+                        ip: req.ip,
+                    });
+                }
+            } catch (err) {
+                logger.error('auth.login.attempts-write-failed', { error: err.message });
+            }
             return res.status(401).json({ success: false, message: 'Invalid email or password' });
         }
 
@@ -744,6 +787,11 @@ exports.login = async (req, res) => {
         // suspended/cancelled, refuse to issue a new session token.
         const tenantLock = await assertTenantNotLocked(user);
         if (tenantLock) return res.status(tenantLock.status).json(tenantLock.body);
+
+        // Successful login resets the per-account failure counter.
+        try { await loginAttempts.clear(lockKey); } catch (err) {
+            logger.error('auth.login.attempts-clear-failed', { error: err.message });
+        }
 
         const session = await issueSession(req, res, user);
 

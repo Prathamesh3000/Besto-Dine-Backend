@@ -254,15 +254,14 @@ function createApp({ isShuttingDown = () => false } = {}) {
     // utils/rateLimitStore.makeLimiter: Redis-backed (shared across instances)
     // when REDIS_URL is set, in-memory otherwise.
     const { makeLimiter } = require('./utils/rateLimitStore');
-    const authLimiter = makeLimiter({
-        name: 'auth',
-        windowMs: 15 * 60 * 1000,
-        max: 50,
-        message: { success: false, message: 'Too many attempts. Try again in 15 minutes.' },
-        standardHeaders: true,
-        legacyHeaders: false,
-    });
-    app.use('/api/v1/auth/login', authLimiter);
+    // /auth limiters (utils/authLimiters.js): only FAILED requests count,
+    // and /auth/login is keyed on ip + sha256(email) so a restaurant's
+    // staff behind one NAT IP never spend each other's budget. The hard
+    // brute-force stop is the per-ACCOUNT lock in authController.login
+    // (utils/loginAttempts.js — 10 fails / 15 min, auto-expiring).
+    const { createAuthLimiters } = require('./utils/authLimiters');
+    const { loginLimiter, loginIpBackstop, authLimiter } = createAuthLimiters();
+    app.use('/api/v1/auth/login', loginIpBackstop, loginLimiter);
     app.use('/api/v1/auth/register', authLimiter);
     app.use('/api/v1/auth/send-otp', authLimiter);
     app.use('/api/v1/auth/verify-otp', authLimiter);

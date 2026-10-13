@@ -111,6 +111,12 @@ router.get('/:id/performance', protect, adminOnly, featureGate('staffPerformance
 // in their own branch only — controller enforces self-guard,
 // owner-guard, and branch isolation before the bcrypt rotate.
 router.post('/:id/reset-password', ...staffGuard, validate([staffIdParam]), staffController.resetStaffPassword);
+// POST /api/staff/:id/unlock-login - Clear the per-account login lockout
+// (10 wrong passwords in 15 min) so the staff member can sign in before
+// the 15-minute lock expires on its own. Admin + manager with manageStaff;
+// tenant-scoped (404 for another tenant's staff), branch-pinned callers
+// can only unlock staff in their own branch.
+router.post('/:id/unlock-login', ...staffGuard, validate([staffIdParam]), staffController.unlockStaffLogin);
 // DELETE /api/staff/:id - Delete staff member.
 // Branch Admins / branch-pinned Managers can delete staff from their own
 // branch. The controller (`deleteStaff`) enforces:

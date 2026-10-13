@@ -7,6 +7,7 @@ const Order = require('../models/order');
 const Branch = require('../models/branch');
 const Shift = require('../models/shift');
 const logger = require('../utils/logger');
+const loginAttempts = require('../utils/loginAttempts');
 const { revokeAllSessions } = require('./authController');
 
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
@@ -1250,10 +1251,63 @@ exports.resetStaffPassword = async (req, res) => {
     await staff.save();
     // Kill every existing session so the old password's logins die now.
     await revokeAllSessions(staff._id);
+    // A fresh password must be usable at once — drop any login lockout
+    // the old (forgotten) password accumulated.
+    await clearLoginLock(req, staff, 'reset-password');
 
     res.status(200).json({ success: true, tempPassword });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to reset password' });
+  }
+};
+
+/**
+ * Clear the per-account login lockout for `staff` (utils/loginAttempts.js)
+ * and log who did it. Best-effort: never throws out of the caller.
+ * Returns true when a counter / lock row actually existed.
+ */
+async function clearLoginLock(req, staff, via) {
+  const key = loginAttempts.accountKey({ user: staff });
+  try {
+    const existed = await loginAttempts.clear(key);
+    logger.info('auth.account.unlocked', {
+      accountKey: loginAttempts.maskKey(key),
+      staffId: String(staff._id),
+      actorId: String(req.user?._id || req.user?.id || ''),
+      actorRole: req.user?.role || '',
+      via,
+      hadLock: existed,
+      ip: req.ip,
+    });
+    return existed;
+  } catch (err) {
+    logger.error('auth.account.unlock-failed', { staffId: String(staff._id), error: err.message });
+    return false;
+  }
+}
+
+// POST /api/staff/:id/unlock-login — clear a staff member's login lockout
+// (10 failed passwords in 15 min, utils/loginAttempts.js) before it
+// expires on its own. Tenant-scoped (404 for another tenant's staff);
+// pinned callers may only unlock staff in their own branch.
+exports.unlockStaffLogin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const staff = await User.findOne({ _id: id, ...tenantFilter(req) }).select('email role restaurant branch');
+    if (!staff) return res.status(404).json({ success: false, message: 'Staff member not found' });
+
+    const branchGate = staffBranchGate(req, staff);
+    if (branchGate) return res.status(branchGate.status).json(branchGate.body);
+
+    const hadLock = await clearLoginLock(req, staff, 'unlock-login');
+    res.status(200).json({
+      success: true,
+      unlocked: hadLock,
+      message: hadLock ? 'Login unlocked. The staff member can sign in again now.' : 'This account was not locked.',
+    });
+  } catch (error) {
+    logger.error('unlockStaffLogin error', { error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to unlock login' });
   }
 };
 

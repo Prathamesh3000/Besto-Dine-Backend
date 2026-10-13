@@ -331,6 +331,7 @@ const EXPECTED = [
     ['PUT', '/staff/:id', adminPerm('manageStaff')],
     ['GET', '/staff/:id/performance', ADMIN],
     ['POST', '/staff/:id/reset-password', adminPerm('manageStaff')],
+    ['POST', '/staff/:id/unlock-login', adminPerm('manageStaff')],
     ['DELETE', '/staff/:id', adminPerm('manageStaff')],
     // staff wallet + tips (settlements)
     ['GET', '/staff-wallet/me', STAFF_WALLET],
