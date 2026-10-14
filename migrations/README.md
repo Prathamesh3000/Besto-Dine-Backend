@@ -46,3 +46,33 @@ Run from `Backend/`: `node migrations/<file>.js`. Most support `--dry`
 | `freeStaleTables.js` | Frees tables stuck "occupied" with no active order. |
 | `realignOrderBranchFromTable.js` | Sets each order's branch from its table's branch. |
 | `moveBranchData.js` | Repair tool: moves records between two branch ids (`--from= --to= [--before=] [--dry]`; find ids with `node Seed/listBranches.js`). |
+
+## Index changes that need attention on existing databases
+
+Mongoose builds schema indexes at boot (`autoIndex`). On a small collection
+that is instant; on a large one it is a foreground-style build that reads the
+whole collection, so plan it.
+
+### Request TTL index (`completed_request_ttl`, added 2026-10-13)
+
+`models/request.js` declares a TTL index on `createdAt` (90 days,
+`partialFilterExpression: { status: 'completed' }`). It only deletes handled
+service requests (water / waiter / bill calls); `pending` and `accepted` rows
+are never touched. Nothing financial is affected.
+
+- **Fresh databases** get it automatically at first boot. No action.
+- **Existing databases:** the first boot of a build that includes the model
+  change creates the index. On a `requests` collection with millions of rows
+  that build can take minutes and compete with live traffic, and the moment
+  it finishes the TTL monitor starts deleting every completed request older
+  than 90 days (in batches, roughly once a minute). So:
+  1. Run it during a quiet period (after closing time), not at a lunch peak.
+  2. Take a `mongodump` of `requests` first if you want the old rows for
+     anything (reports do not read them; see DATABASE_SCALING_PLAN.md 2.3).
+  3. To build it ahead of the deploy instead of at boot, from `mongosh`:
+     `db.requests.createIndex({ createdAt: 1 }, { name: 'completed_request_ttl', expireAfterSeconds: 7776000, partialFilterExpression: { status: 'completed' } })`
+     The boot-time build then finds the index already present and skips it.
+  4. To change the period later, use `collMod` (`db.runCommand({ collMod: 'requests', index: { name: 'completed_request_ttl', expireAfterSeconds: <n> } })`)
+     or drop and recreate; editing the schema alone does not alter an existing
+     TTL index. Mongoose swallows the resulting IndexOptionsConflict at boot
+     (model.init().catch(noop)), so nothing is logged and the old period stays.
