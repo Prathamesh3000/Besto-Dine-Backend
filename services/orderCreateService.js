@@ -657,16 +657,19 @@ async function detachStalePaidBill(req, type, resolvedTableId, ops = null) {
   // this was Case A in the old comment.)
   if (type === 'dine-in' && resolvedTableId) {
     try {
-      // Pay-first restaurants: every round is paid up front, so only a
-      // FINISHED round is a "stale bill". A paid round still in the
-      // kitchen keeps its table link (it would otherwise be orphaned).
-      const payFirst = ops?.payment?.dineIn === 'payFirst';
-      const stalePaid = await Order.findOne({
+      // A pay-first round is paid up front, so only a FINISHED one is a
+      // "stale bill": a paid round still in the kitchen keeps its table
+      // link (it would otherwise be orphaned). Decided per candidate bill
+      // (utils/operationsProfile.orderIsPayFirst) — on an 'either' tenant
+      // a pay-first and a pay-after round can share the table.
+      const { orderIsPayFirst } = require('../utils/operationsProfile');
+      const paidOnTable = await Order.find({
         table: resolvedTableId,
-        status: { $in: payFirst ? ['served'] : ['new', 'preparing', 'ready', 'served'] },
+        status: { $in: ['new', 'preparing', 'ready', 'served'] },
         paymentStatus: 'Paid',
         ...tenantFilter(req),
       });
+      const stalePaid = paidOnTable.find((o) => o.status === 'served' || !orderIsPayFirst(o, ops));
       if (stalePaid) {
         stalePaid.table = null;
         await stalePaid.save();
@@ -1169,7 +1172,23 @@ function resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prep
       message: 'Ordering from the table is not available here. Please order with the staff.',
     });
   }
-  if (ops.payment[channel] !== 'payFirst') return { ops, hold: null };
+  const mode = ops.payment[channel];
+  // `paymentChannel` records on the order which way a customer DINE-IN
+  // round pays, so the table / sibling rules can tell a pay-first round
+  // from a pay-after one on an 'either' tenant's table
+  // (utils/operationsProfile.orderIsPayFirst). Takeaway / kiosk have no
+  // table; staff orders return above and keep the tenant-mode fallback.
+  const dineIn = channel === 'dineIn';
+  const payAfter = { ops, hold: null, paymentChannel: dineIn ? 'payAfter' : undefined };
+  const payFirst = (hold) => ({ ops, hold, paymentChannel: dineIn ? 'payFirst' : undefined });
+  if (mode !== 'payFirst' && mode !== 'either') return payAfter;
+
+  // 'either' (design §5.3): the customer chose at the cart. A request
+  // that pays now — a verified checkout (`razorpayPayment`) or an
+  // explicit `paymentIntent` — follows the pay-first rules below exactly
+  // as a payFirst tenant's would (held / prepaid); one without either
+  // is "pay after the meal" and takes today's path untouched.
+  if (mode === 'either' && !prepaid && !req.body.paymentIntent) return payAfter;
 
   const methods = ops.payment.methods;
   const holdUntilPaid = ops.payment.holdUntilPaid;
@@ -1177,14 +1196,14 @@ function resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prep
     // Online checkout captured and confirmed with the gateway: the money
     // is in, cook it. Unconfirmed (gateway unreachable): hold until the
     // verify / webhook / reconciliation confirms it.
-    return { ops, hold: !prepaid.confirmed && holdUntilPaid ? 'online' : null };
+    return payFirst(!prepaid.confirmed && holdUntilPaid ? 'online' : null);
   }
   // Older takeaway clients say "wallet" through paymentMethod (create,
   // then pay from the wallet) — treat that as the wallet intent.
   const intent = req.body.paymentIntent
     || (req.body.paymentMethod === 'wallet' ? 'wallet' : req.body.paymentMethod === 'cash' ? 'counterCash' : undefined);
-  if (intent === 'counterCash' && methods.counterCash) return { ops, hold: holdUntilPaid ? 'counterCash' : null };
-  if (intent === 'wallet' && methods.wallet) return { ops, hold: holdUntilPaid ? 'wallet' : null };
+  if (intent === 'counterCash' && methods.counterCash) return payFirst(holdUntilPaid ? 'counterCash' : null);
+  if (intent === 'wallet' && methods.wallet) return payFirst(holdUntilPaid ? 'wallet' : null);
 
   throw httpError(402, {
     success: false,
@@ -1295,7 +1314,7 @@ async function createOrder(req) {
   const prepaid = await verifyPrepaidCheckout(req, {
     orderId, validUserId, authoritativeTotal, authoritativeWalletPaid,
   });
-  const { ops, hold } = resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid });
+  const { ops, hold, paymentChannel } = resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid });
 
   const enrichedItems = pricing.enrichCartItems(items, menuById);
 
@@ -1315,6 +1334,10 @@ async function createOrder(req) {
     authoritativeDeliveryDistance, authoritativeDeliveryCoords, authoritativeManualDiscount,
   });
 
+  if (paymentChannel) {
+    primaryDocData.paymentChannel = paymentChannel;
+    if (counterDocData) counterDocData.paymentChannel = paymentChannel;
+  }
   if (hold) holdOrderDocs([primaryDocData, counterDocData], { hold, ops });
   const held = !!hold;
 

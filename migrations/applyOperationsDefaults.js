@@ -17,8 +17,21 @@
  */
 const { DEFAULT_PROFILE } = require('../utils/operationsProfile');
 
+// "No profile yet": the field is missing OR stored as null (an explicit
+// `operations: null` is how a cleared profile looks). `$exists: false`
+// alone never matches null, so the write below would silently skip it.
+const NO_PROFILE_FILTER = { $or: [{ operations: { $exists: false } }, { operations: null }] };
+
+/**
+ * Report:
+ *   scanned     restaurants looked at
+ *   alreadySet  had a profile object → skipped
+ *   written     dry run: would be written; real run: actually modified
+ *   raced       real run only: a profile appeared between the read and
+ *               the guarded write, so nothing was written for it
+ */
 async function applyOperationsDefaults({ Restaurant }, { dryRun = false, log = console.log } = {}) {
-    const report = { scanned: 0, alreadySet: 0, written: 0 };
+    const report = { scanned: 0, alreadySet: 0, written: 0, raced: 0 };
 
     const restaurants = await Restaurant.find({}).select('_id name operations').lean();
     for (const r of restaurants) {
@@ -27,21 +40,24 @@ async function applyOperationsDefaults({ Restaurant }, { dryRun = false, log = c
             report.alreadySet += 1;
             continue;
         }
-        report.written += 1;
         log(`• default profile: ${r.name || r._id}`);
-        if (dryRun) continue;
-        // Guard on the field still being missing, so a profile saved by the
-        // Super Admin between the read and this write is never clobbered.
-        await Restaurant.updateOne(
-            { _id: r._id, operations: { $exists: false } },
+        if (dryRun) { report.written += 1; continue; }
+        // Guard on the field still being missing / null, so a profile saved
+        // by the Super Admin between the read and this write is never
+        // clobbered — and count only what the database really changed.
+        const res = await Restaurant.updateOne(
+            { _id: r._id, ...NO_PROFILE_FILTER },
             { $set: { operations: { ...JSON.parse(JSON.stringify(DEFAULT_PROFILE)), updatedAt: new Date() } } },
         );
+        const modified = res && typeof res.modifiedCount === 'number' ? res.modifiedCount : (res?.nModified ?? 1);
+        if (modified > 0) report.written += 1;
+        else report.raced += 1;
     }
 
     return report;
 }
 
-module.exports = { applyOperationsDefaults };
+module.exports = { applyOperationsDefaults, NO_PROFILE_FILTER };
 
 if (require.main === module) {
     const mongoose = require('mongoose');

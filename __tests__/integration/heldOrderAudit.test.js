@@ -275,3 +275,37 @@ describe('settleSiblingDineInRounds is skipped for pay-first', () => {
         expect(sib.amountPaid).toBe(0);
     });
 });
+
+// ── A7: a failed operations-profile lookup must not skip sibling settlement ──
+describe('settleSiblingDineInRounds — profile lookup error falls back to today\'s behaviour (A7)', () => {
+    const holdService = require(path.join(BACKEND, 'services/orderHoldService'));
+
+    test('loadOps throws → pay-after tenant still settles the other unpaid rounds on the table', async () => {
+        const T = await seedTenant({ label: 'ha7' });
+        const table = await createTable(T);
+        const paid = await mkOrder(T, { type: 'dine-in', table: table._id, status: 'new', amountPaid: 400, paymentMethod: 'online' });
+        const sibling = await mkOrder(T, { type: 'dine-in', table: table._id, status: 'new', paymentStatus: 'Pending', total: 200 });
+
+        const spy = jest.spyOn(holdService, 'loadOps').mockRejectedValue(new Error('restaurant lookup failed'));
+        try {
+            await _settleSiblingDineInRounds(paid, 'online');
+            expect(spy).toHaveBeenCalled();
+        } finally {
+            spy.mockRestore();
+        }
+        const sib = await Order.findById(sibling._id).lean();
+        expect(sib.paymentStatus).toBe('Paid');
+        expect(sib.amountPaid).toBe(0);
+        expect(sib.paymentMethod).toBe('online');
+    });
+
+    test('a held (pay-first) order still never settles siblings, lookup error or not', async () => {
+        const T = await seedTenant({ label: 'ha7b' });
+        const table = await createTable(T);
+        const held = await mkOrder(T, { type: 'dine-in', table: table._id, status: 'new', holdReason: 'online', amountPaid: 200 });
+        const sibling = await mkOrder(T, { type: 'dine-in', table: table._id, status: 'new', paymentStatus: 'Pending', total: 200 });
+        const spy = jest.spyOn(holdService, 'loadOps').mockRejectedValue(new Error('boom'));
+        try { await _settleSiblingDineInRounds(held, 'online'); } finally { spy.mockRestore(); }
+        expect((await Order.findById(sibling._id).lean()).paymentStatus).toBe('Pending');
+    });
+});

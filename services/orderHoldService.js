@@ -160,44 +160,165 @@ async function releaseHeldOrder(orderOrId, { ops: knownOps } = {}) {
     return out;
 }
 
+/** A failed online attempt gives the customer this long to retry before the hold expires. */
+const ONLINE_FAILED_GRACE_MS = 15 * 60 * 1000;
+/** An online hold that never heard from the gateway at all is given up after this long. */
+const ONLINE_HOLD_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+
+const SWEEP_FIELDS = '_id orderId type status paymentStatus user table branch restaurant holdReason razorpayOrderId razorpayOrderIds total amountPaid walletAmountPaid paidAt onlinePaymentFailedAt createdAt';
+
+/**
+ * Razorpay reported `payment.failed` for a held online order. The order
+ * stays held (the customer can retry from the same page) but now has a
+ * short deadline: holdExpiresAt = now + 15 min, after which the sweeper
+ * may cancel it — provided reconciliation finds no capture (see
+ * cancelExpiredHolds). No-op unless the order is held with holdReason
+ * 'online', so pay-after tenants (never held) are untouched.
+ */
+async function noteOnlinePaymentFailed(order, { now = new Date() } = {}) {
+    if (!order || order.status !== HELD || order.holdReason !== 'online') return false;
+    const res = await Order.updateOne(
+        { _id: order._id, restaurant: order.restaurant, status: HELD, holdReason: 'online' },
+        { $set: { onlinePaymentFailedAt: now, holdExpiresAt: new Date(now.getTime() + ONLINE_FAILED_GRACE_MS) } },
+    );
+    if (res.modifiedCount) {
+        logger.info(`order ${order.orderId}: online payment failed while held — hold now expires in 15 min unless paid`);
+    }
+    return !!res.modifiedCount;
+}
+
+/**
+ * Cancel one held order with the same side effects a manual cancel has
+ * (orderStatusService): status flip pinned on 'awaiting-payment' and
+ * unpaid, counter-payment alert cleared, stale staff notification rows
+ * deleted, order:cancelled + order:updated to the staff rooms, the
+ * order's room and the customer's room, table released, one log line.
+ * Returns true when THIS call cancelled it.
+ */
+async function cancelHeldOrder(o, { now = new Date(), reason = 'payment-timeout', note = 'Pay-first order was not paid in time', by = 'held-order sweeper' } = {}) {
+    const res = await Order.updateOne(
+        { _id: o._id, restaurant: o.restaurant, status: HELD, paymentStatus: { $nin: ['Paid', 'Partially Paid'] } },
+        { $set: {
+            status: 'cancelled',
+            cancelReason: reason,
+            cancelReasonNote: note,
+            cancelledAt: now,
+        }, $unset: { holdExpiresAt: 1, counterPaymentRequestedAt: 1 } },
+    );
+    if (!res.modifiedCount) return false;
+
+    // Counter "Mark paid" alerts and waiter / captain rows for this order
+    // are no longer actionable (same cleanup as a manual cancel, plus the
+    // counter-payment rows a held cash order created).
+    try {
+        const Notification = require('../models/notification');
+        await Notification.deleteMany({
+            restaurant: o.restaurant,
+            'meta.orderId': o.orderId,
+            recipientRole: { $in: ['admin', 'waiter', 'captain'] },
+        });
+    } catch (err) {
+        logger.warn(`Notification cleanup after hold cancel failed for ${o.orderId}: ${err.message}`);
+    }
+
+    // Live updates — same audience as a manual cancel: staff rooms
+    // (emitToStaff), the per-order room and the customer's own room.
+    try {
+        const { emitOrderEvent } = require('./orderHelpers');
+        const base = {
+            orderId: o.orderId, status: 'cancelled', paymentStatus: o.paymentStatus || 'Pending',
+            cancelReason: reason, table: o.table || null, restaurant: String(o.restaurant),
+        };
+        emitOrderEvent(EVENTS.ORDER_CANCELLED, base, o);
+        emitOrderEvent(EVENTS.ORDER_UPDATED, base, o);
+    } catch { /* socket not critical */ }
+
+    if (o.table) {
+        try {
+            const { releaseTableIfSettled } = require('../utils/tableOccupancy');
+            await releaseTableIfSettled(o, { restaurant: o.restaurant }, { branch: o.branch || null, restaurant: o.restaurant });
+        } catch (err) {
+            logger.warn(`Table release after hold expiry failed for ${o.orderId}: ${err.message}`);
+        }
+    }
+
+    logger.info(`order ${o.orderId} cancelled by ${by} (${reason})`, {
+        orderId: o.orderId, restaurant: String(o.restaurant), holdReason: o.holdReason || null, cancelReason: reason,
+    });
+    return true;
+}
+
+/**
+ * Before an ONLINE hold is cancelled: ask Razorpay whether a capture
+ * exists on any checkout opened for the order. Found → the capture is
+ * settled exactly as reconciliation does (claim, Paid, releaseHeldOrder).
+ *   { outcome: 'none' }       no capture — safe to cancel
+ *   { outcome: 'released' }   captured → order released, do NOT cancel
+ *   { outcome: 'unknown' }    gateway unreachable / payment claimed elsewhere
+ *                             / underpaid — leave the hold alone this round
+ */
+async function recoverOnlineHold(o) {
+    try {
+        const { recoverCapturedPaymentForOrder } = require('../controllers/razorpayController');
+        const r = await recoverCapturedPaymentForOrder(o);
+        if (r.status === 'none') return { outcome: 'none' };
+        if (r.status === 'recovered' || r.status === 'already_settled') return { outcome: 'released', detail: r.status };
+        return { outcome: 'unknown', detail: r.status };
+    } catch (err) {
+        logger.warn(`Held-order sweeper: could not verify online payment for ${o.orderId} — keeping the hold: ${err.message}`);
+        return { outcome: 'unknown', detail: 'error' };
+    }
+}
+
 /**
  * Cancel held orders nobody paid for before holdExpiresAt (cash promised
  * at the counter that never arrived, an abandoned checkout). Nothing was
- * cooked, printed or deducted, so this is a plain cancel + table release.
+ * cooked, printed or deducted, so this is a cancel + table release.
+ *
+ * Online holds (holdReason 'online'): the customer MAY already have been
+ * charged and the gateway confirmation is just late, so they are never
+ * cancelled on holdExpiresAt alone. One is considered only when
+ *   (a) Razorpay reported payment.failed (onlinePaymentFailedAt set) and
+ *       the 15-minute retry window (holdExpiresAt) has passed, or
+ *   (b) the hold is older than 2 hours,
+ * and even then it is cancelled only after reconciliation
+ * (recoverOnlineHold) found no capture on any of its checkouts. A capture
+ * found there releases the order instead (same path as verify-payment);
+ * a gateway error leaves it for the next sweep.
  */
 async function cancelExpiredHolds({ now = new Date(), limit = 200 } = {}) {
-    // Online holds are NOT expired here: the customer may already have
-    // been charged and the gateway confirmation is just late — the
-    // webhook / reconciliation releases it, or the orphan-refund path
-    // returns the money. Cancelling it would leave a paid, cancelled
-    // order. Only cash / wallet promises expire.
     // AUDIT-EXEMPT: system sweep across every tenant (no request context); each write below is pinned to the order's own restaurant.
     const expired = await Order.find({ status: HELD, holdReason: { $ne: 'online' }, holdExpiresAt: { $lte: now } })
-        .select('_id orderId table branch restaurant')
-        .limit(limit);
+        .select(SWEEP_FIELDS)
+        .limit(limit)
+        .lean();
     let cancelled = 0;
     for (const o of expired) {
-        const res = await Order.updateOne(
-            { _id: o._id, restaurant: o.restaurant, status: HELD, paymentStatus: { $nin: ['Paid', 'Partially Paid'] } },
-            { $set: {
-                status: 'cancelled',
-                cancelReason: 'payment-timeout',
-                cancelReasonNote: 'Pay-first order was not paid in time',
-                cancelledAt: now,
-            }, $unset: { holdExpiresAt: 1 } },
-        );
-        if (!res.modifiedCount) continue;
-        cancelled += 1;
-        if (o.table) {
-            try {
-                const { releaseTableIfSettled } = require('../utils/tableOccupancy');
-                await releaseTableIfSettled(o, { restaurant: o.restaurant }, { branch: o.branch || null, restaurant: o.restaurant });
-            } catch (err) {
-                logger.warn(`Table release after hold expiry failed for ${o.orderId}: ${err.message}`);
-            }
-        }
+        if (await cancelHeldOrder(o, { now })) cancelled += 1;
     }
-    return { scanned: expired.length, cancelled };
+
+    // AUDIT-EXEMPT: system sweep across every tenant (no request context); each write below is pinned to the order's own restaurant.
+    const onlineDue = await Order.find({
+        status: HELD,
+        holdReason: 'online',
+        $or: [
+            { onlinePaymentFailedAt: { $ne: null }, holdExpiresAt: { $lte: now } },
+            { createdAt: { $lte: new Date(now.getTime() - ONLINE_HOLD_MAX_AGE_MS) } },
+        ],
+    }).select(SWEEP_FIELDS).limit(limit).lean();
+    let released = 0;
+    let kept = 0;
+    for (const o of onlineDue) {
+        const { outcome } = await recoverOnlineHold(o);
+        if (outcome === 'none') {
+            const why = o.onlinePaymentFailedAt ? 'online payment failed and was not retried in time' : 'online payment never confirmed';
+            if (await cancelHeldOrder(o, { now, note: `Pay-first order was not paid in time (${why})` })) cancelled += 1;
+        } else if (outcome === 'released') {
+            released += 1;
+            logger.info(`Held-order sweeper: ${o.orderId} had a captured online payment — released instead of cancelled`);
+        } else kept += 1;
+    }
+    return { scanned: expired.length + onlineDue.length, cancelled, released, kept };
 }
 
 module.exports = {
@@ -206,5 +327,9 @@ module.exports = {
     completeWithoutKitchen,
     completesWithoutKitchen,
     cancelExpiredHolds,
+    cancelHeldOrder,
+    noteOnlinePaymentFailed,
+    ONLINE_FAILED_GRACE_MS,
+    ONLINE_HOLD_MAX_AGE_MS,
     loadOps,
 };

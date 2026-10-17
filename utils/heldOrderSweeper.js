@@ -9,6 +9,12 @@
  * cancelled ('payment-timeout') and its table released. Nothing was
  * cooked, printed or deducted, so no money or stock is involved.
  *
+ * Online holds (holdReason 'online') are the exception: money may have
+ * been captured. They are only considered after Razorpay reported
+ * payment.failed + 15 min, or after 2 h with no news, and are cancelled
+ * only once reconciliation finds no capture — a capture releases the
+ * order instead (services/orderHoldService.cancelExpiredHolds).
+ *
  * Disabled via HELD_ORDER_SWEEP_DISABLED=true (external cron);
  * cadence via HELD_ORDER_SWEEP_MINUTES (default 2).
  */
@@ -22,6 +28,7 @@ async function runHeldOrderSweep() {
         const { cancelExpiredHolds } = require('../services/orderHoldService');
         const r = await cancelExpiredHolds();
         if (r.cancelled > 0) logger.info(`Held-order sweeper: cancelled ${r.cancelled} unpaid pay-first order(s)`);
+        if (r.released > 0) logger.info(`Held-order sweeper: released ${r.released} online order(s) whose payment reconciliation found captured`);
         return r;
     } catch (err) {
         logger.error('Held-order sweeper error', { error: err.message });

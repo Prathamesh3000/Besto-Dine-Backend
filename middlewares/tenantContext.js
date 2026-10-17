@@ -31,24 +31,113 @@ const {
 const mainBranchCache = new Map();   // restaurantId → { id, expires }
 const MAIN_BRANCH_TTL_MS = 60 * 1000;
 
+// A tenant with no Main branch yet (fresh signup before createMainBranchFor
+// has run, or Main renamed / deactivated) must NOT be remembered as "no
+// Main" for a whole TTL — every branch:null record would vanish from the
+// Main view for a minute. A null result is therefore never cached; the
+// next request re-resolves, and invalidateBranchCache() (branch writes)
+// drops any positive entry immediately.
 async function attachMainBranchId(req) {
     if (req.mainBranchId !== undefined) return;          // route-level re-mount
     const rid = req.restaurant?._id ? String(req.restaurant._id) : null;
     if (!rid) { req.mainBranchId = null; return; }
     const hit = mainBranchCache.get(rid);
     if (hit && hit.expires > Date.now()) { req.mainBranchId = hit.id; return; }
+    if (hit) mainBranchCache.delete(rid);
     try {
         let main = await Branch.findOne({ restaurant: rid, isActive: true, slug: 'main' }).select('_id').lean();
         if (!main) {
             main = await Branch.findOne({ restaurant: rid, isActive: true }).sort({ createdAt: 1 }).select('_id').lean();
         }
         req.mainBranchId = main?._id || null;
-        mainBranchCache.set(rid, { id: req.mainBranchId, expires: Date.now() + MAIN_BRANCH_TTL_MS });
+        if (req.mainBranchId) {
+            mainBranchCache.set(rid, { id: req.mainBranchId, expires: Date.now() + MAIN_BRANCH_TTL_MS });
+        }
     } catch (err) {
         logger.warn('tenant.mainBranch.lookup-failed', { restaurant: rid, error: err.message });
         req.mainBranchId = null;
     }
 }
+
+// ── Branch existence / activity micro-cache ────────────────────────────
+// The admin branch switcher injects `?branch=<id>` into every staff GET,
+// and attachTenant has to confirm the id belongs to the caller's tenant
+// on each one. Cache the verdict for 60 s per (tenant, branch) so the
+// check is one Mongo hit per minute instead of one per request. "Not
+// found" is cached too (a stale id in localStorage is re-sent on every
+// request until the client drops it); both verdicts are dropped by
+// invalidateBranchCache() when a branch is created / updated /
+// deactivated / reactivated / deleted.
+const branchStateCache = new Map();  // `${restaurantId}:${branchId}` → { exists, isActive, expires }
+const BRANCH_STATE_TTL_MS = 60 * 1000;
+const BRANCH_STATE_MAX = 2000;
+
+async function getBranchState(restaurantId, branchId) {
+    const key = `${restaurantId}:${branchId}`;
+    const hit = branchStateCache.get(key);
+    if (hit && hit.expires > Date.now()) return hit;
+    if (hit) branchStateCache.delete(key);
+    const doc = await Branch.findOne({ _id: branchId, restaurant: restaurantId }).select('isActive').lean();
+    const state = {
+        exists: !!doc,
+        isActive: !!doc && doc.isActive !== false,
+        expires: Date.now() + BRANCH_STATE_TTL_MS,
+    };
+    branchStateCache.set(key, state);
+    if (branchStateCache.size > BRANCH_STATE_MAX) {
+        const oldest = branchStateCache.keys().next().value;
+        branchStateCache.delete(oldest);
+    }
+    return state;
+}
+
+// Tenant owner (admin) and manager may still OPEN a deactivated branch of
+// their own tenant — its historical orders and reports stay reachable from
+// the switcher. Writes against it are refused. Other staff roles never
+// see an inactive branch (404, same as a foreign or deleted id).
+const INACTIVE_BRANCH_READ_ROLES = new Set(['admin', 'manager']);
+const READ_METHODS = new Set(['GET', 'HEAD']);
+
+function canTouchInactiveBranch(req) {
+    return INACTIVE_BRANCH_READ_ROLES.has(req.user?.role);
+}
+
+function canReadInactiveBranch(req) {
+    return canTouchInactiveBranch(req) && READ_METHODS.has(String(req.method || '').toUpperCase());
+}
+
+const BRANCH_INACTIVE_WRITE = {
+    status: 409,
+    code: 'BRANCH_INACTIVE',
+    message: 'This branch is deactivated. Its history is read-only; reactivate the branch before creating or changing anything in it.',
+};
+
+const BRANCH_BUS_CHANNEL = 'tenantBranch';
+
+function clearBranchLocal(restaurantId) {
+    const rid = String(restaurantId);
+    let n = mainBranchCache.delete(rid) ? 1 : 0;
+    const prefix = `${rid}:`;
+    for (const key of Array.from(branchStateCache.keys())) {
+        if (key.startsWith(prefix)) { branchStateCache.delete(key); n++; }
+    }
+    return n;
+}
+
+/**
+ * Drop the cached Main-branch id and every cached branch verdict of one
+ * tenant, here and on every other instance. Call after any Branch write
+ * (create / update / deactivate / reactivate / hard delete).
+ */
+function invalidateBranchCache(restaurantId) {
+    if (!restaurantId) return;
+    clearBranchLocal(restaurantId);
+    cacheBus.publish(BRANCH_BUS_CHANNEL, { restaurantId: String(restaurantId) });
+}
+
+cacheBus.subscribe(BRANCH_BUS_CHANNEL, (msg) => {
+    if (msg && typeof msg === 'object' && msg.restaurantId) clearBranchLocal(msg.restaurantId);
+});
 
 async function proceed(req, next) {
     await attachMainBranchId(req);
@@ -382,6 +471,17 @@ async function resolveActiveBranch(req) {
                 isActive: true,
             }).lean();
             if (b) return { ok: true, branch: b };
+            // Miss. For the tenant's own admin / manager, check whether it
+            // is a DEACTIVATED branch of this tenant: they may read its
+            // history, nobody may write to it. Everyone else (customers,
+            // other roles, foreign ids) gets the 404 below as before.
+            if (req.user?.restaurant && String(req.user.restaurant) === String(req.restaurant._id) && canTouchInactiveBranch(req)) {
+                const inactive = await Branch.findOne({ _id: rawHeader, restaurant: req.restaurant._id }).lean();
+                if (inactive) {
+                    if (canReadInactiveBranch(req)) return { ok: true, branch: inactive };
+                    return { ok: false, ...BRANCH_INACTIVE_WRITE };
+                }
+            }
         } catch (err) {
             logger.warn('resolveActiveBranch: header branch lookup error', { err: err.message });
             return {
@@ -458,10 +558,25 @@ const attachTenant = async (req, res, next) => {
             // Refuse it the same way a bad X-Branch-Id is refused so the
             // client drops the stale value. 'all' / 'tenant-only' / 'none'
             // are keywords, not ids, and are left alone.
+            //
+            // A DEACTIVATED branch of this tenant is different from a
+            // foreign / deleted one: the owner (admin) and managers still
+            // need its historical orders and reports, so their GET / HEAD
+            // pass; their writes get 409 BRANCH_INACTIVE; every other
+            // role keeps the 404. The verdict is micro-cached
+            // (getBranchState) so the switcher costs one lookup a minute.
             const qBranch = req.query?.branch;
             if (typeof qBranch === 'string' && mongoose.isValidObjectId(qBranch)) {
-                const known = await Branch.exists({ _id: qBranch, restaurant: r._id, isActive: true });
-                if (!known) {
+                const state = await getBranchState(String(r._id), qBranch);
+                if (state.exists && !state.isActive && canTouchInactiveBranch(req)) {
+                    if (!canReadInactiveBranch(req)) {
+                        return res.status(BRANCH_INACTIVE_WRITE.status).json({
+                            success: false,
+                            code: BRANCH_INACTIVE_WRITE.code,
+                            message: BRANCH_INACTIVE_WRITE.message,
+                        });
+                    }
+                } else if (!state.exists || !state.isActive) {
                     return res.status(404).json({
                         success: false,
                         code: 'BRANCH_NOT_FOUND',
@@ -547,4 +662,7 @@ module.exports = {
     isStrictExempt,
     invalidateSlug,
     invalidateTenant,
+    invalidateBranchCache,
+    // Test hooks — cache internals (not for application code).
+    _branchCaches: { mainBranchCache, branchStateCache, MAIN_BRANCH_TTL_MS, BRANCH_STATE_TTL_MS },
 };

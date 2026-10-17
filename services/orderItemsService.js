@@ -132,7 +132,7 @@ const isSettled = (order) => SETTLED_PAYMENT_STATUSES.has(order?.paymentStatus);
 function assertRepeatAllowedByOps(req, sourceOrder) {
   if (!req.restaurant || sourceOrder.type !== 'dine-in') return;
   if (req.user && req.user.role !== 'customer') return;
-  const { resolveOperations } = require('../utils/operationsProfile');
+  const { resolveOperations, orderIsPayFirst } = require('../utils/operationsProfile');
   const ops = resolveOperations(req.restaurant);
   if (!ops.customerApp.appendToOrder) {
     throw httpError(403, {
@@ -141,7 +141,9 @@ function assertRepeatAllowedByOps(req, sourceOrder) {
       message: 'Adding items to an order is not available here. Please place a new order.',
     });
   }
-  if (ops.payment.dineIn === 'payFirst') {
+  // Decided from the source round itself ('either' tenants mix both
+  // kinds); tenant mode is the fallback for orders without a channel.
+  if (orderIsPayFirst(sourceOrder, ops)) {
     throw httpError(409, {
       success: false,
       code: 'REPEAT_REQUIRES_PAYMENT',
