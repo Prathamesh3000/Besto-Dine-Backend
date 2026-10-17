@@ -26,44 +26,18 @@ const dynamicOrderGate = (req, res, next) => {
 const kioskGate = featureGate('kiosk');
 const kitchenGate = featureGate('kitchenDisplay');
 
-// CRIT-13 — per-table / per-user rate limit on POST /orders.
-// The global 200/min limiter is per-IP and too generous for guest
-// traffic on a QR flow where one scanToken could be shared (or leaked)
-// across devices. This keyed limiter caps to 5 order creates per minute
-// per logical actor: authenticated users by userId (trusted), guests by
-// the tableId they're ordering for. Covers both dine-in table spam and
-// takeaway-from-guest scenarios.
-//
-// Still memory-backed — Redis-backed clustering is Phase 8 (op infra).
-// In a multi-node deploy each node enforces 5/min independently, which
-// is still dramatically tighter than no per-actor cap.
-const orderCreateLimiter = makeLimiter({
-    name: 'order-create',
-    windowMs: 60 * 1000,
-    max: 5,
-    standardHeaders: true,
-    legacyHeaders: false,
-    keyGenerator: (req) => {
-        if (req.user?._id) return 'user:' + String(req.user._id);
-        const tableId = req.body?.tableId || req.body?.table;
-        if (tableId) return 'table:' + String(tableId);
-        // IPv6-safe fallback. Raw req.ip would let an attacker rotate the
-        // low 64 bits of an IPv6 address to bypass the limit; the helper
-        // normalises to a /56 CIDR block per express-rate-limit v8.
-        return 'ip:' + ipKeyGenerator(req.ip);
-    },
-    message: {
-        success: false,
-        code: 'ORDER_RATE_LIMIT',
-        message: 'Too many orders in a short time. Please wait a moment before trying again.',
-    },
-});
+// CRIT-13 — per-actor rate limit on POST /orders (5/min customers,
+// guests by tableId, anonymous by IP; 60/min per staff user). Lives in
+// middlewares/orderCreateLimiter.js so the tiers are unit-testable; it
+// MUST sit after optionalAuth so `req.user` is populated when the key
+// and the tier are chosen.
+const { orderCreateLimiter } = require('../middlewares/orderCreateLimiter');
 
 // Customer-facing (createOrder allows guest orders via QR scan, so no strict auth)
 // Bug #13 — `Idempotency-Key` header replays the first response on a
 // retry (placed after optionalAuth so the key can be scoped per caller).
 // The body `clientIdempotencyKey` is the second, DB-level safety net.
-router.post('/', orderCreateLimiter, optionalAuth, idempotency(), dynamicOrderGate, orderController.createOrder);
+router.post('/', optionalAuth, orderCreateLimiter, idempotency(), dynamicOrderGate, orderController.createOrder);
 
 // Home-delivery distance + fee quote for the takeaway checkout. Guests
 // allowed (takeaway supports guest checkout); rate-limited because an

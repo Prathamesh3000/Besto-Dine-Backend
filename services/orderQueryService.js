@@ -93,6 +93,9 @@ async function trackKioskOrder(req) {
 async function getLiveOrders(req) {
   const { floor } = req.query;
   const activeStatuses = ['new', 'preparing', 'ready'];
+  // Pay-first held orders ('awaiting-payment') belong to the cashier:
+  // admin/manager see them so they can mark them paid; floor roles don't.
+  if (req.user && ['admin', 'manager'].includes(req.user.role)) activeStatuses.push('awaiting-payment');
 
   // Include today's served orders so WaiterOrders "Served" tab is populated
   const todayStart = new Date();

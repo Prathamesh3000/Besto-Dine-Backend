@@ -99,8 +99,9 @@ const config = {
         accessTokenTtl: str('ACCESS_TOKEN_TTL', '30m'),
         superadminAccessTokenTtl: str('SUPERADMIN_ACCESS_TOKEN_TTL', '15m'),
         refreshTtlHoursStaff: int('REFRESH_TTL_HOURS_STAFF', 168, { min: 1 }),
-        // Customer ABSOLUTE session cap (hours) — the per-token window is
-        // the inactivity timeout below. Read live by authController.
+        // Legacy — no longer used: the customer login now ends a fixed
+        // SESSION_MAX_HOURS_CUSTOMER (default 1) after sign-in; see
+        // authController.refreshAbsoluteMs. Kept so old .env files validate.
         refreshTtlHoursCustomer: int('REFRESH_TTL_HOURS_CUSTOMER', 24, { min: 1 }),
         customerIdleTimeoutMinutes: int('CUSTOMER_IDLE_TIMEOUT_MINUTES', 60, { min: 1 }),
         refreshTtlHoursSuperadmin: int('REFRESH_TTL_HOURS_SUPERADMIN', 12, { min: 1 }),

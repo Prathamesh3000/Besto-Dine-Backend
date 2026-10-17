@@ -6,7 +6,7 @@ const User = require('../models/user');
 const Wallet = require('../models/wallet');
 const MenuItem = require('../models/menuItem');
 
-const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const { mergedBranchFilter, mergedCustomerBranchFilter, getMainBranchId } = require('../utils/mainBranch');
 const { computeCouponDiscount, withCategoryKinds, menuCategoryKind } = require('../utils/couponScope');
 const { devError } = require('../utils/AppError');
@@ -47,7 +47,7 @@ const customerBranchFilter = async (req) => {
     // inheritance, no tenant-level (branch:null) leak. Sharing happens
     // explicitly at branch-create via "Copy from Main".
     const pinned = pinnedBranchId(req);
-    if (pinned) return { branch: pinned };
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
 
     // Tenant owner via admin switcher: `?branch=<id>` narrows STRICTLY
     // to that branch (no null fallback). Without this, switching to
@@ -60,7 +60,7 @@ const customerBranchFilter = async (req) => {
     const raw = req?.query?.branch;
     if (raw === 'all') return {};
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
-    if (raw && mongoose.isValidObjectId(raw)) return { branch: raw };
+    if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
 
     const merged = await mergedCustomerBranchFilter(req);
     if (!merged || Object.keys(merged).length === 0) return {};
@@ -82,7 +82,7 @@ const customerBranchFilter = async (req) => {
 const adminBranchFilter = (req) => {
     const mongoose = require('mongoose');
     const pinned = pinnedBranchId(req);
-    if (pinned) return { branch: pinned };
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
     const raw = req?.query?.branch;
     if (raw === 'all') return {};
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
@@ -94,7 +94,7 @@ const adminBranchFilter = (req) => {
     // an admin scoped to a specific branch (e.g. "Main") via the switcher,
     // while the coupon list + redemption table (both `.find()`) looked fine.
     // Mirrors strictBranchFilter() in utils/tenantScope.js.
-    if (raw && mongoose.isValidObjectId(raw)) return { branch: new mongoose.Types.ObjectId(String(raw)) };
+    if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
     return {};
 };
 
@@ -679,7 +679,8 @@ exports.getPerformanceStats = async (req, res) => {
         //     COUNT, peaking at ~33% — so the card and the chart contradicted
         //     each other. Both now share this single, meaningful basis.
         const orderAgg = await Order.aggregate([
-            { $match: { ...tf, ...bf, createdAt: { $gte: startDate }, status: { $ne: 'cancelled' } } },
+            // Held pay-first orders ('awaiting-payment') aren't placed orders yet.
+            { $match: { ...tf, ...bf, createdAt: { $gte: startDate }, status: { $nin: ['cancelled', 'awaiting-payment'] } } },
             { $group: { _id: { $dateToString: dayFmt }, count: { $sum: 1 } } }
         ]);
         const orderMap = {};

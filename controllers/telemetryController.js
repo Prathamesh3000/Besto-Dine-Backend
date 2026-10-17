@@ -17,6 +17,14 @@ const { featureTier } = require('../utils/featureAccess');
 // Standard and above get the full 2-year range.
 const BASIC_REPORT_MAX_DAYS = 31;
 
+// Pay-first orders held from the kitchen until paid ('awaiting-payment',
+// services/orderHoldService.js) are not orders yet: never in an order
+// count, earnings, item sales or "today" figure. NOT_A_SALE is used by
+// every earnings / items aggregation; HELD_STATUS where cancelled orders
+// still count (order totals, cancellation rate).
+const HELD_STATUS = 'awaiting-payment';
+const NOT_A_SALE = ['cancelled', HELD_STATUS];
+
 // Reports roll up by local-business-day / local-business-hour, not UTC.
 // Without this, MongoDB's $hour/$dayOfMonth/$dateToString run in UTC and a
 // cafe serving an 11 AM IST customer sees that order in "hour 5" (5:30 AM
@@ -145,7 +153,7 @@ exports.getStats = async (req, res) => {
     ] = await Promise.all([
       // 1. Today's orders stats — single aggregation (per-tenant + branch)
       Order.aggregate([
-        { $match: { createdAt: { $gte: today }, ...tfb } },
+        { $match: { createdAt: { $gte: today }, status: { $ne: HELD_STATUS }, ...tfb } },
         { $group: {
           _id: null,
           count: { $sum: 1 },
@@ -199,7 +207,7 @@ exports.getStats = async (req, res) => {
       // midnight. A fresh tenant on day 3 of the month sees the popular
       // items from days 1+2+3 combined, not just day 3's orders.
       Order.aggregate([
-        { $match: { createdAt: { $gte: monthStart }, status: { $ne: 'cancelled' }, ...tfb } },
+        { $match: { createdAt: { $gte: monthStart }, status: { $nin: NOT_A_SALE }, ...tfb } },
         { $unwind: '$items' },
         { $group: { _id: { name: '$items.name', menuItem: '$items.menuItem' }, count: { $sum: '$items.quantity' } } },
         { $sort: { count: -1 } },
@@ -471,7 +479,7 @@ function parseYmd(s) {
 //   longer      → one point per calendar month
 async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}, REPORT_TZ = DEFAULT_REPORT_TZ) {
   const spanDays = Math.round((toExclUTC.getTime() - fromUTC.getTime()) / 86400000);
-  const matchPaid = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf };
+  const matchPaid = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tf };
 
   if (spanDays <= 1) {
     // Hourly — reuse the same 9–23 window the dashboard uses.
@@ -577,7 +585,7 @@ exports.getReports = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Date range too large (max 2 years).' });
     }
 
-    const rangeMatch = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, ...tfb };
+    const rangeMatch = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, status: { $ne: HELD_STATUS }, ...tfb };
     const spanMs = toExclUTC.getTime() - fromUTC.getTime();
     const rangeDays = Math.max(1, Math.round(spanMs / 86400000));
 
@@ -600,7 +608,7 @@ exports.getReports = async (req, res) => {
     // Previous equal-length window, immediately before `from` — powers the
     // period-over-period trend (is the business up or down vs last time?).
     const prevFromUTC = new Date(fromUTC.getTime() - spanMs);
-    const prevRangeMatch = { createdAt: { $gte: prevFromUTC, $lt: fromUTC }, ...tfb };
+    const prevRangeMatch = { createdAt: { $gte: prevFromUTC, $lt: fromUTC }, status: { $ne: HELD_STATUS }, ...tfb };
 
     const [earnings, itemFacetArr, orderFacetArr, prevAgg] = await Promise.all([
       // 1. Earnings time-series (auto-bucketed by span) — the headline trend.
@@ -608,7 +616,7 @@ exports.getReports = async (req, res) => {
 
       // 2. Item-level analytics in one pass (unwound line items, non-cancelled).
       Order.aggregate([
-        { $match: { ...rangeMatch, status: { $ne: 'cancelled' } } },
+        { $match: { ...rangeMatch, status: { $nin: NOT_A_SALE } } },
         { $unwind: '$items' },
         { $facet: {
           topItems: [
@@ -660,11 +668,11 @@ exports.getReports = async (req, res) => {
             }},
           ],
           byWeekday: [
-            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
+            { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
             { $group: { _id: { $dayOfWeek: { date: '$createdAt', timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byHour: [
-            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
+            { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
             { $group: { _id: { $hour: { date: '$createdAt', timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byChannel: [
@@ -674,11 +682,11 @@ exports.getReports = async (req, res) => {
             { $group: { _id: '$source', orders: { $sum: 1 }, earnings: { $sum: { $cond: [PAID, '$total', 0] } } } },
           ],
           byPayment: [
-            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
+            { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
             { $group: { _id: '$paymentMethod', orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byDay: [
-            { $match: { paymentStatus: 'Paid', status: { $ne: 'cancelled' } } },
+            { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
             { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } }, earnings: { $sum: '$total' }, orders: { $sum: 1 } } },
             { $sort: { earnings: -1 } },
           ],
@@ -850,7 +858,7 @@ exports.getForecast = async (req, res) => {
 
     // Daily PAID earnings over the lookback window.
     const result = await Order.aggregate([
-      { $match: { createdAt: { $gte: histStart, $lt: histEndExcl }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tfb } },
+      { $match: { createdAt: { $gte: histStart, $lt: histEndExcl }, paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tfb } },
       { $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } },
         total: { $sum: '$total' },
@@ -1046,7 +1054,7 @@ async function buildEarningsAggregation(period, today, tf = {}, REPORT_TZ = DEFA
     const weekStart = new Date(today);
     weekStart.setDate(weekStart.getDate() - 6);
     const result = await Order.aggregate([
-      { $match: { createdAt: { $gte: weekStart }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf } },
+      { $match: { createdAt: { $gte: weekStart }, paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tf } },
       { $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } },
         total: { $sum: '$total' }
@@ -1086,7 +1094,7 @@ async function buildEarningsAggregation(period, today, tf = {}, REPORT_TZ = DEFA
     // Approximate month-start by pulling back (todayDay - 1) days from today.
     const monthStart = new Date(today.getTime() - (todayDay - 1) * 86400000);
     const result = await Order.aggregate([
-      { $match: { createdAt: { $gte: monthStart }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf } },
+      { $match: { createdAt: { $gte: monthStart }, paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tf } },
       { $group: {
         _id: { $dayOfMonth: { date: '$createdAt', timezone: REPORT_TZ } },
         total: { $sum: '$total' }
@@ -1104,7 +1112,7 @@ async function buildEarningsAggregation(period, today, tf = {}, REPORT_TZ = DEFA
 
   // daily — hourly breakdown in REPORT_TZ
   const result = await Order.aggregate([
-    { $match: { createdAt: { $gte: today }, paymentStatus: 'Paid', status: { $ne: 'cancelled' }, ...tf } },
+    { $match: { createdAt: { $gte: today }, paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tf } },
     { $group: {
       _id: { $hour: { date: '$createdAt', timezone: REPORT_TZ } },
       total: { $sum: '$total' }

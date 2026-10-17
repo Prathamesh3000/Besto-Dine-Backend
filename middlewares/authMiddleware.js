@@ -26,17 +26,25 @@ function accessTokenTtl(role) {
     return process.env.ACCESS_TOKEN_TTL || '30m';
 }
 
-function signAccessToken(user) {
-    return jwt.sign(
-        {
-            id: String(user._id),
-            role: user.role,
-            typ: TOKEN_TYPES.USER,
-            tv: Number(user.tokenVersion) || 0,
-        },
-        process.env.JWT_SECRET,
-        { expiresIn: accessTokenTtl(user.role) },
-    );
+// opts.sessionExpiresAt — the login's absolute end (refresh-family
+// ceiling). The access token never outlives it, and carries it as `sexp`
+// (epoch seconds) so the client can end the session on time without a
+// round-trip — customer logins end exactly 1 hour after sign-in.
+function signAccessToken(user, opts = {}) {
+    const payload = {
+        id: String(user._id),
+        role: user.role,
+        typ: TOKEN_TYPES.USER,
+        tv: Number(user.tokenVersion) || 0,
+    };
+    const ceiling = opts.sessionExpiresAt ? new Date(opts.sessionExpiresAt).getTime() : null;
+    if (ceiling) payload.sexp = Math.floor(ceiling / 1000);
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: accessTokenTtl(user.role) });
+    if (!ceiling) return token;
+    const { exp } = jwt.decode(token);
+    if (exp * 1000 <= ceiling) return token;
+    // Normal TTL would run past the session end — re-sign ending exactly there.
+    return jwt.sign({ ...payload, exp: Math.max(Math.floor(ceiling / 1000), Math.floor(Date.now() / 1000) + 1) }, process.env.JWT_SECRET);
 }
 
 // A pre-`typ` token is only treated as a user token when it has an `id`

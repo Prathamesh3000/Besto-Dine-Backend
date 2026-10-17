@@ -42,6 +42,7 @@ const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope
 const { generateTempPassword, getNextStaffIdForBranch, validateStaffEmail } = require('../utils/staffUtils');
 const { createMainBranchFor } = require('../utils/createMainBranch');
 const { pickAllowed, BRANCH_UPDATE_FIELDS } = require('../utils/bodyAllowlist');
+const { invalidateBranchCache } = require('../middlewares/tenantContext');
 
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -1104,6 +1105,7 @@ exports.updateBranch = async (req, res) => {
         if (!branch) {
             return res.status(404).json({ success: false, message: 'Branch not found' });
         }
+        invalidateBranchCache(branch.restaurant);
 
         // ── Inheritance sync (post-update, never on Main) ──────────
         // The Edit modal exposes "Sync from Main" toggles. Run only
@@ -1473,6 +1475,12 @@ exports.resetSubAdminPassword = async (req, res) => {
     }
 };
 
+// Orders that block disabling / deleting a branch: live kitchen tickets
+// plus pay-first orders held until paid ('awaiting-payment',
+// services/orderHoldService.js) - a customer is mid-checkout there and
+// the order would release to a branch that no longer takes orders.
+const OPEN_ORDER_STATUSES = ['awaiting-payment', 'new', 'preparing', 'ready'];
+
 // GET /api/v1/branches/:id/disable-check
 //
 // Phase G: Pre-disable safety check. Returns blockers (things that
@@ -1486,7 +1494,7 @@ exports.preDisableCheck = async (req, res) => {
         const tf = tenantFilter(req);
 
         const [activeOrders, assignedStaff, assignedTables] = await Promise.all([
-            Order.countDocuments({ branch: id, status: { $in: ['new', 'preparing', 'ready'] }, ...tf }),
+            Order.countDocuments({ branch: id, status: { $in: OPEN_ORDER_STATUSES }, ...tf }),
             User.countDocuments({ branch: id, status: 'active', ...tf }),
             Table.countDocuments({ branch: id, ...tf }),
         ]);
@@ -1542,7 +1550,7 @@ exports.deleteBranch = async (req, res) => {
         // branch from customers while it still has live kitchen tickets.
         const activeOrders = await Order.countDocuments({
             branch: id,
-            status: { $in: ['new', 'preparing', 'ready'] },
+            status: { $in: OPEN_ORDER_STATUSES },
             ...tenantFilter(req),
         });
         if (activeOrders > 0) {
@@ -1561,6 +1569,7 @@ exports.deleteBranch = async (req, res) => {
         if (!branch) {
             return res.status(404).json({ success: false, message: 'Branch not found' });
         }
+        invalidateBranchCache(branch.restaurant);
 
         // The branch's own Branch Admin(s) stay pinned to it — nulling
         // their branch would make them tenant-wide admins. Deactivate
@@ -1619,6 +1628,7 @@ exports.reactivateBranch = async (req, res) => {
         if (!branch) {
             return res.status(404).json({ success: false, message: 'Branch not found' });
         }
+        invalidateBranchCache(branch.restaurant);
         // Undo deleteBranch: its Branch Admin(s) were deactivated (kept pinned).
         await User.updateMany(
             { role: 'admin', isTenantOwner: { $ne: true }, branch: id, status: 'inactive', ...tenantFilter(req) },
@@ -1669,7 +1679,7 @@ exports.hardDeleteBranch = async (req, res) => {
         // and customer expectations — same reasoning as soft-disable.
         const activeOrders = await Order.countDocuments({
             branch: id,
-            status: { $in: ['new', 'preparing', 'ready'] },
+            status: { $in: OPEN_ORDER_STATUSES },
             ...tf,
         });
         if (activeOrders > 0) {
@@ -1727,6 +1737,7 @@ exports.hardDeleteBranch = async (req, res) => {
 
         // 5. Finally delete the branch row itself.
         await Branch.deleteOne({ _id: id, ...tf });
+        invalidateBranchCache(tenantId(req));
 
         const cleanup = {
             branchAdminDeleted: branchAdminDel.deletedCount || 0,

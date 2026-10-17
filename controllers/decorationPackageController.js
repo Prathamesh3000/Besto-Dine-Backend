@@ -3,7 +3,7 @@ const path = require('path');
 const DecorationPackage = require('../models/decorationPackage');
 const logger = require('../utils/logger');
 
-const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
 const { parseCsv } = require('../utils/csvParser');
 const { _resolveBulkTargetBranch: resolveBulkTargetBranch } = require('./bookingInfoController');
 const { sendServerError } = require('../utils/httpErrors');
@@ -14,12 +14,12 @@ const { sendServerError } = require('../utils/httpErrors');
 function decorationBranchFilter(req) {
     const mongoose = require('mongoose');
     const pinned = pinnedBranchId(req);
-    if (pinned) return { branch: pinned };
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
     // Tenant owner using the admin branch switcher passes ?branch=<id>.
     const raw = req?.query?.branch;
     if (raw === 'all') return {};
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
-    if (raw && mongoose.isValidObjectId(raw)) return { branch: raw };
+    if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
     if (req?.branch?._id) return { $or: [{ branch: null }, { branch: req.branch._id }] };
     return {};
 }

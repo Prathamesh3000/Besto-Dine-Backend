@@ -540,6 +540,75 @@ describe('GET /orders/kitchen and /orders/kitchen/completed', () => {
     });
 });
 
+// ── kitchen board safety cap (kitchenService.getKitchenOrders `?limit=`) ──
+// Desktop soak 2026-10-13: 282 open orders / 241 KB per poll, all rendered
+// by the KDS. Default 150, max 300, oldest-first so the kitchen keeps the
+// orders it must cook first; `meta` is additive to the response shape.
+describe('GET /orders/kitchen safety cap', () => {
+    let C;
+    let byAge = [];          // orderIds, oldest first
+    beforeAll(async () => {
+        C = await seedTenant({ label: 'oq-cap' });
+        const base = Date.now() - 160 * 60e3;
+        const docs = Array.from({ length: 160 }, (_, i) => ({
+            restaurant: C.restaurant._id, branch: C.branch._id, orderId: oid('CAP'), type: 'takeaway',
+            customerName: 'Walk-in', phone: '9000000000', status: i % 3 === 0 ? 'preparing' : 'new',
+            items: [{ menuItem: C.items.paneer._id, name: 'Paneer Tikka', price: 200, quantity: 1, prepStation: 'kitchen' }],
+            total: 200,
+        }));
+        const inserted = await Order.insertMany(docs);
+        // timestamps are set by mongoose on insert — spread createdAt one minute apart, oldest first
+        await Order.collection.bulkWrite(inserted.map((d, i) => ({
+            updateOne: { filter: { _id: d._id }, update: { $set: { createdAt: new Date(base + i * 60e3) } } },
+        })));
+        byAge = inserted.map((d) => d.orderId);
+    });
+
+    test('default: 150 of 160 returned, the oldest 150, meta.truncated=true, total=160', async () => {
+        const res = await ctx.api.as(C.users.chef).get('/orders/kitchen');
+        expect(res.status).toBe(200);
+        expect(res.body.orders).toHaveLength(150);
+        expect(res.body.meta).toEqual({ total: 160, returned: 150, limit: 150, truncated: true });
+        const ids = new Set(res.body.orders.map((o) => o.id));
+        for (const id of byAge.slice(0, 150)) expect(ids.has(id)).toBe(true);
+        for (const id of byAge.slice(150)) expect(ids.has(id)).toBe(false);
+        // existing shape untouched
+        expect(typeof res.body.completedToday).toBe('number');
+        expect(typeof res.body.serverTime).toBe('string');
+        expectNoSecrets(res.body);
+    });
+
+    test('?limit=20 → the 20 oldest, still truncated with the full total', async () => {
+        const res = await ctx.api.as(C.users.chef).get('/orders/kitchen?limit=20');
+        expect(res.status).toBe(200);
+        expect(res.body.orders).toHaveLength(20);
+        expect(res.body.meta).toEqual({ total: 160, returned: 20, limit: 20, truncated: true });
+        expect(new Set(res.body.orders.map((o) => o.id))).toEqual(new Set(byAge.slice(0, 20)));
+    });
+
+    test('?limit=1000 is clamped to 300 → all 160 come back, truncated=false', async () => {
+        const res = await ctx.api.as(C.users.chef).get('/orders/kitchen?limit=1000');
+        expect(res.status).toBe(200);
+        expect(res.body.orders).toHaveLength(160);
+        expect(res.body.meta).toEqual({ total: 160, returned: 160, limit: 300, truncated: false });
+    });
+
+    test('junk / zero limit falls back to the default 150', async () => {
+        for (const q of ['abc', '0', '-5']) {
+            // eslint-disable-next-line no-await-in-loop
+            const res = await ctx.api.as(C.users.chef).get(`/orders/kitchen?limit=${q}`);
+            expect(res.body.meta.limit).toBe(150);
+            expect(res.body.orders).toHaveLength(150);
+        }
+    });
+
+    test('other tenants are not in the count', async () => {
+        const res = await ctx.api.as(A.users.chef).get('/orders/kitchen');
+        expect(res.body.meta.total).toBeLessThan(100); // A's own handful of open orders, never C's 160
+        expect(res.body.meta.truncated).toBe(false);
+    });
+});
+
 describe('GET /orders/live ?floor and /orders/past ?dateRange presets', () => {
     test('floor filter keeps that area\'s tables plus takeaways', async () => {
         const Area = require(path.join(BACKEND, 'models/area'));

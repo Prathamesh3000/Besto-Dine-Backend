@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const Area = require('../models/area');
 const Branch = require('../models/branch');
 
-const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const listCache = require('../utils/listCache');
 const { devError } = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
@@ -31,15 +31,17 @@ function areaBranchFilter(req) {
     // STRICT scope — no null fallback — so flipping to "Main" doesn't
     // show every legacy tenant-null area. Customer flow (req.branch
     // header) keeps the permissive shared+branch view.
+    // Exception: branch:null areas belong to the Main branch, so a Main
+    // view includes them (utils/tenantScope.branchScopeClause).
     const pinned = pinnedBranchId(req);
     if (pinned) {
-        return { branch: pinned };
+        return branchScopeClause(req, pinned._id || pinned);
     }
     const raw = req?.query?.branch;
     if (raw === 'all') return null;
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
     if (raw && mongoose.isValidObjectId(raw)) {
-        return { branch: raw };
+        return branchScopeClause(req, raw);
     }
     if (req?.branch?._id) {
         return { $or: [{ branch: null }, { branch: req.branch._id }] };
@@ -93,7 +95,9 @@ const createArea = asyncHandler(async (req, res) => {
     });
 
     await area.save();
-    areasCache.invalidate(req);
+    // Every branch scope of this tenant: the owner's POST has no ?branch,
+    // so invalidate(req) left the Main view's cached list stale.
+    areasCache.invalidateTenant(tenantId(req));
     res.status(201).json({ success: true, message: 'Area created successfully', area });
 }, 'Error creating area');
 
@@ -101,7 +105,7 @@ const createArea = asyncHandler(async (req, res) => {
 // Area" or toggles a row off) and are read on every TablesDashboard
 // paint, every kitchen-room join, every customer scan — so a 60s cache
 // turns every-page-paint Mongo hits into ~once-a-minute. Writes call
-// `areasCache.invalidate(req)` to wipe the entry for that scope only.
+// `areasCache.invalidateTenant(...)` to wipe every branch scope of the tenant.
 const areasCache = listCache.create({
     name: 'areas',
     ttlMs: 60_000,
@@ -118,11 +122,13 @@ const areasCache = listCache.create({
 // at a branch see "shared + their branch".
 const getAreas = asyncHandler(async (req, res) => {
     const areas = await areasCache.get(req);
-    // Areas barely change. A 60s browser cache layered on top of the
-    // 60s server cache gives staff dashboards a free read on every
-    // tab switch within the window. `private` keeps it out of any
-    // shared CDN — branch-pinned admins see different lists.
-    res.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=300');
+    // Customer / guest reads (every table scan) get a 60s browser cache
+    // on top of the server cache. Staff must NOT: the admin refetches
+    // this list right after "Add area" and the browser replayed the
+    // previous (empty) response from disk for up to a minute. The
+    // global /api `no-store` applies to them.
+    const isStaff = !!(req.user && req.user.role !== 'customer');
+    if (!isStaff) res.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=300');
     res.status(200).json({ success: true, areas });
 }, 'Error fetching areas');
 
@@ -154,7 +160,9 @@ const updateArea = asyncHandler(async (req, res) => {
     if (isActive !== undefined) area.isActive = isActive;
 
     await area.save();
-    areasCache.invalidate(req);
+    // Every branch scope of this tenant: the owner's POST has no ?branch,
+    // so invalidate(req) left the Main view's cached list stale.
+    areasCache.invalidateTenant(tenantId(req));
     res.status(200).json({ success: true, message: 'Area updated successfully', area });
 }, 'Error updating area');
 
@@ -246,7 +254,9 @@ const deleteArea = asyncHandler(async (req, res) => {
 
     await Area.deleteOne({ _id: id, ...tf, ...bf });
 
-    areasCache.invalidate(req);
+    // Every branch scope of this tenant: the owner's POST has no ?branch,
+    // so invalidate(req) left the Main view's cached list stale.
+    areasCache.invalidateTenant(tenantId(req));
     res.status(200).json({
         success: true,
         message: tableIds.length

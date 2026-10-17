@@ -203,14 +203,37 @@ const staffAppGate = (req, res, next) => {
     if (!featureKey || !req.restaurant) return next();
     const path = req.path || '';
     if (STAFF_APP_EXEMPT_PREFIXES.some(p => path === p || path.startsWith(p + '/'))) return next();
-    if (hasFeature(req.restaurant, featureKey)) return next();
-    return lockedResponse(req, res, featureKey);
+    if (!hasFeature(req.restaurant, featureKey)) return lockedResponse(req, res, featureKey);
+    // Operations profile: the plan includes the app, but this restaurant
+    // has switched the role off (e.g. a self-service hotel with no
+    // waiters). Accounts are kept, just blocked — see utils/operationsProfile.
+    if (!roleInUse(req.restaurant, req.user.role)) return roleNotInUseResponse(res, req.user.role);
+    return next();
 };
+
+const ROLE_LABELS = { chef: 'kitchen screen', waiter: 'waiter app', captain: 'captain app' };
+
+/** Is this staff role in use under the tenant's operations profile? */
+function roleInUse(restaurant, role) {
+    if (!restaurant || !STAFF_APP_FEATURE_BY_ROLE[role]) return true;
+    const { resolveOperations } = require('../utils/operationsProfile');
+    return resolveOperations(restaurant).roles[role] !== false;
+}
+
+function roleNotInUseResponse(res, role) {
+    return res.status(403).json({
+        success: false,
+        code: 'ROLE_NOT_IN_USE',
+        role,
+        message: `Your restaurant doesn't use the ${ROLE_LABELS[role] || role}. Ask your manager if this is a mistake.`,
+    });
+}
 
 module.exports = {
     featureGate,
     featureGateAny,
     staffAppGate,
+    roleInUse,
     FEATURE_LABELS,
     STAFF_APP_FEATURE_BY_ROLE,
 };

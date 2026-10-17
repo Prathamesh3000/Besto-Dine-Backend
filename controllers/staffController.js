@@ -7,6 +7,7 @@ const Order = require('../models/order');
 const Branch = require('../models/branch');
 const Shift = require('../models/shift');
 const logger = require('../utils/logger');
+const loginAttempts = require('../utils/loginAttempts');
 const { revokeAllSessions } = require('./authController');
 
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
@@ -365,6 +366,7 @@ exports.addStaff = async (req, res) => {
     if (!['chef', 'waiter', 'captain', 'admin', 'manager'].includes(role)) {
       return res.status(400).json({ success: false, message: 'Invalid staff role' });
     }
+    if (!opsRoleInUse(req, role)) return res.status(400).json(roleNotInUseBody(role));
 
     // ── Privilege-escalation guard ───────────────────────────────────
     // Creating a `role: 'admin'` is a tenant-owner decision regardless
@@ -803,6 +805,11 @@ exports.updateStaff = async (req, res) => {
     if (role !== undefined && !['chef', 'waiter', 'captain', 'admin', 'manager'].includes(role)) {
       return res.status(400).json({ success: false, message: 'Invalid staff role' });
     }
+    // Moving someone INTO a role the restaurant doesn't use is refused;
+    // editing an existing waiter's name etc. (role unchanged) still works.
+    if (role !== undefined && role !== existing.role && !opsRoleInUse(req, role)) {
+      return res.status(400).json(roleNotInUseBody(role));
+    }
 
     const updateData = { name, email, mobile, role, staffId, avatar, permissions: permissionsToWrite, kitchenResponsibility };
 
@@ -1112,7 +1119,9 @@ exports.getStaffPerformance = async (req, res) => {
       // particular tend to place orders and hand off the table to a waiter
       // for serving, so 'served' alone undercounted them severely.
       const waiterObjectId = new (require('mongoose').Types.ObjectId)(id);
-      const handledStatuses = { $nin: ['cancelled'] };
+      // A pay-first order held until paid ('awaiting-payment') isn't
+      // handled work yet — it only counts once it is released.
+      const handledStatuses = { $nin: ['cancelled', 'awaiting-payment'] };
 
       const [
         totalHandled, todayHandled, weekHandled,
@@ -1242,10 +1251,63 @@ exports.resetStaffPassword = async (req, res) => {
     await staff.save();
     // Kill every existing session so the old password's logins die now.
     await revokeAllSessions(staff._id);
+    // A fresh password must be usable at once — drop any login lockout
+    // the old (forgotten) password accumulated.
+    await clearLoginLock(req, staff, 'reset-password');
 
     res.status(200).json({ success: true, tempPassword });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to reset password' });
+  }
+};
+
+/**
+ * Clear the per-account login lockout for `staff` (utils/loginAttempts.js)
+ * and log who did it. Best-effort: never throws out of the caller.
+ * Returns true when a counter / lock row actually existed.
+ */
+async function clearLoginLock(req, staff, via) {
+  const key = loginAttempts.accountKey({ user: staff });
+  try {
+    const existed = await loginAttempts.clear(key);
+    logger.info('auth.account.unlocked', {
+      accountKey: loginAttempts.maskKey(key),
+      staffId: String(staff._id),
+      actorId: String(req.user?._id || req.user?.id || ''),
+      actorRole: req.user?.role || '',
+      via,
+      hadLock: existed,
+      ip: req.ip,
+    });
+    return existed;
+  } catch (err) {
+    logger.error('auth.account.unlock-failed', { staffId: String(staff._id), error: err.message });
+    return false;
+  }
+}
+
+// POST /api/staff/:id/unlock-login — clear a staff member's login lockout
+// (10 failed passwords in 15 min, utils/loginAttempts.js) before it
+// expires on its own. Tenant-scoped (404 for another tenant's staff);
+// pinned callers may only unlock staff in their own branch.
+exports.unlockStaffLogin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const staff = await User.findOne({ _id: id, ...tenantFilter(req) }).select('email role restaurant branch');
+    if (!staff) return res.status(404).json({ success: false, message: 'Staff member not found' });
+
+    const branchGate = staffBranchGate(req, staff);
+    if (branchGate) return res.status(branchGate.status).json(branchGate.body);
+
+    const hadLock = await clearLoginLock(req, staff, 'unlock-login');
+    res.status(200).json({
+      success: true,
+      unlocked: hadLock,
+      message: hadLock ? 'Login unlocked. The staff member can sign in again now.' : 'This account was not locked.',
+    });
+  } catch (error) {
+    logger.error('unlockStaffLogin error', { error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to unlock login' });
   }
 };
 
@@ -1283,6 +1345,26 @@ exports.downloadStaffTemplate = (req, res) => {
 // platform-level and have no business being created from a per-tenant
 // admin CSV.
 const BULK_STAFF_ROLES = new Set(['admin', 'manager', 'captain', 'chef', 'waiter']);
+
+// ── Operations profile: roles the restaurant doesn't use ─────────────
+// A self-service restaurant (no waiters / captain / kitchen screen) can't
+// hire into those roles. Profile-only (utils/operationsProfile.profileFlow),
+// NOT plan-intersected: a plan without the waiter app could always create
+// waiter accounts, and a tenant that never set a profile must not change.
+function opsRoleInUse(req, role) {
+  if (!['waiter', 'captain', 'chef'].includes(role) || !req.restaurant) return true;
+  const { profileFlow } = require('../utils/operationsProfile');
+  return profileFlow(req.restaurant).roles[role] !== false;
+}
+function roleNotInUseBody(role) {
+  const label = { waiter: 'waiters', captain: 'captains', chef: 'a kitchen screen (chef)' }[role] || role;
+  return {
+    success: false,
+    code: 'ROLE_NOT_IN_USE',
+    role,
+    message: `Your restaurant is set up without ${label}. Contact BestoDine support to change how your restaurant operates.`,
+  };
+}
 
 // POST /api/staff/import
 // Body: multipart/form-data with:
@@ -1424,6 +1506,7 @@ exports.importStaffCsv = async (req, res) => {
         if (!BULK_STAFF_ROLES.has(roleRaw)) {
           throw new Error(`role must be one of: ${[...BULK_STAFF_ROLES].join(', ')}`);
         }
+        if (!opsRoleInUse(req, roleRaw)) throw new Error(roleNotInUseBody(roleRaw).message);
         if (roleRaw === 'admin' && req.user?.isTenantOwner !== true) {
           throw new Error('Only tenant owners can import Admin accounts');
         }

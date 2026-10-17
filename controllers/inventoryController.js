@@ -21,6 +21,11 @@ const ALLOWED_CATEGORIES = [
 ];
 const ALLOWED_UNITS = ['kg', 'g', 'L', 'mL', 'pcs', 'dozen', 'box', 'pack', 'bottle', 'can'];
 
+// Newest adjustmentHistory rows kept per item. Every atomic writer uses
+// `$push … $slice: -200` (the literal below, four times); the CSV import
+// trims in memory to the same number. Keep the two in step.
+const ADJUSTMENT_HISTORY_MAX = 200;
+
 // Stock quantities are rounded to 3 decimals on every write (see
 // models/inventory.js roundQty) so float drift never refuses real stock.
 const { roundQty } = Inventory;
@@ -789,6 +794,15 @@ exports.importItemsCsv = async (req, res) => {
                             adjustedBy: req.user._id,
                             date: new Date(),
                         });
+                        // Same cap as every `$push … $slice: -200` on this
+                        // array (adjustStock, deduct/restore, production,
+                        // purchase receipts). This was the one uncapped
+                        // writer: an item re-imported on every stock count
+                        // grew its history without limit. Keep the newest
+                        // 200, like the atomic writers do.
+                        if (existing.adjustmentHistory.length > ADJUSTMENT_HISTORY_MAX) {
+                            existing.adjustmentHistory.splice(0, existing.adjustmentHistory.length - ADJUSTMENT_HISTORY_MAX);
+                        }
                     }
                     await existing.save();
                     updated += 1;

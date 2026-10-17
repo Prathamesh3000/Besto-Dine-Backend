@@ -188,9 +188,41 @@ const orderSchema = new mongoose.Schema({
   // Statuses
   status: {
     type: String,
-    enum: ['new', 'preparing', 'ready', 'served', 'cancelled'],
+    // 'awaiting-payment' — a pay-first order that exists (so the counter
+    // can find it) but is HELD from the kitchen until it is paid. Only
+    // tenants whose operations profile sets payment.holdUntilPaid ever
+    // produce it (services/orderHoldService.js). Every kitchen / waiter
+    // list uses a $in whitelist of the other statuses, so a held order is
+    // invisible to them by default.
+    enum: ['awaiting-payment', 'new', 'preparing', 'ready', 'served', 'cancelled'],
     default: 'new'
   },
+  // Hold bookkeeping (status 'awaiting-payment' only).
+  //   holdReason        — how the customer said they'd pay first
+  //   holdReleaseStatus — the status the order takes when released
+  //                       ('new' for kitchen work, 'ready' for counter-only)
+  //   holdExpiresAt     — after this an unpaid hold is cancelled
+  //                       (utils/heldOrderSweeper.js)
+  //   releasedAt        — when payment released it to the kitchen
+  holdReason: { type: String, enum: ['counterCash', 'online', 'wallet', null], default: undefined },
+  holdReleaseStatus: { type: String, enum: ['new', 'ready', null], default: undefined },
+  holdExpiresAt: { type: Date },
+  //   onlinePaymentFailedAt — Razorpay reported payment.failed while the
+  //                       order was held with holdReason 'online'; the
+  //                       sweeper may cancel it after holdExpiresAt once
+  //                       reconciliation finds no capture
+  onlinePaymentFailedAt: { type: Date },
+  releasedAt: { type: Date },
+  // How THIS dine-in round pays, decided once at creation from the
+  // operations profile (orderCreateService.resolveOperationsGate):
+  //   'payFirst' — paid before the kitchen (held or prepaid checkout)
+  //   'payAfter' — the table bill is settled after the meal
+  // Only set for customer dine-in orders under a profile; a tenant whose
+  // profile lets the customer choose ('either') gets both kinds on one
+  // table. Unset (every order before this field, staff / POS orders,
+  // tenants without a profile) → the tenant's dine-in mode decides
+  // (utils/operationsProfile.orderIsPayFirst).
+  paymentChannel: { type: String, enum: ['payFirst', 'payAfter'], default: undefined },
 
   // ── Cancellation audit ─────────────────────────────────────────
   // Populated when status transitions to 'cancelled'. Separates
@@ -211,6 +243,7 @@ const orderSchema = new mongoose.Schema({
       'kitchen-issue',     // kitchen couldn't fulfill
       'admin-void',        // generic admin override
       'auto-sweeper',      // empty-order sweeper cleanup
+      'payment-timeout',   // held pay-first order never paid (heldOrderSweeper)
       'other',
     ],
     default: null,

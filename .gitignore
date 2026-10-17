@@ -4,3 +4,10 @@ uploads/
 logs/
 *.log
 backups/
+
+# Staging environment (scripts/staging-db.js + .env.staging — holds a JWT secret)
+.env.staging
+.staging-db/
+
+# Jest coverage output
+coverage/

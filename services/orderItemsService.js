@@ -122,6 +122,36 @@ const isSettled = (order) => SETTLED_PAYMENT_STATUSES.has(order?.paymentStatus);
 // logged-in owner, or — for an ownerless guest order — hold the scan
 // session that placed it (same rule as cancel / payment). Anonymous
 // callers without a scan token get 401, everyone else 403.
+/**
+ * Operations profile: in a pay-first restaurant every dine-in order is
+ * paid before it is created, so a customer "repeat" (which places an
+ * order with no payment step) is refused — the customer adds the items
+ * to the cart and pays. A restaurant that switched "add more items" off
+ * refuses it outright. Staff repeats are unaffected.
+ */
+function assertRepeatAllowedByOps(req, sourceOrder) {
+  if (!req.restaurant || sourceOrder.type !== 'dine-in') return;
+  if (req.user && req.user.role !== 'customer') return;
+  const { resolveOperations, orderIsPayFirst } = require('../utils/operationsProfile');
+  const ops = resolveOperations(req.restaurant);
+  if (!ops.customerApp.appendToOrder) {
+    throw httpError(403, {
+      success: false,
+      code: 'APPEND_DISABLED',
+      message: 'Adding items to an order is not available here. Please place a new order.',
+    });
+  }
+  // Decided from the source round itself ('either' tenants mix both
+  // kinds); tenant mode is the fallback for orders without a channel.
+  if (orderIsPayFirst(sourceOrder, ops)) {
+    throw httpError(409, {
+      success: false,
+      code: 'REPEAT_REQUIRES_PAYMENT',
+      message: 'This restaurant takes payment before cooking. Add the items to your cart and pay to order again.',
+    });
+  }
+}
+
 function assertCanRepeat(req, sourceOrder) {
   const access = orderAccessForCaller(req, sourceOrder);
   if (access.allowed) return;
@@ -176,6 +206,7 @@ async function repeatOrderItem(req) {
 
   const sourceOrder = await Order.findOne({ _id: orderId, ...tenantFilter(req) });
   if (!sourceOrder) throw httpError(404, { success: false, message: 'Source order not found' });
+  assertRepeatAllowedByOps(req, sourceOrder);
 
   // Ownership check — staff, the owner, or the guest's own scan session.
   assertCanRepeat(req, sourceOrder);
@@ -680,6 +711,7 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
 async function repeatOrderAllItems(req) {
   const tf = tenantFilter(req);
   const sourceOrder = await loadRepeatSource(req, tf);
+  assertRepeatAllowedByOps(req, sourceOrder);
 
   // Optional `selections` body lets the customer trim / re-quantify
   // the source items before placing the repeat:

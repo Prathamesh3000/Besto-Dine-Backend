@@ -113,22 +113,16 @@ function analyticsBranchFilter(req) {
     // dashboard aggregation silently returned 0 rows for tenant owners
     // who passed `?branch=<id>` from the admin switcher.
     const pinned = pinnedBranchId(req);
-    if (pinned) {
-        const id = pinned._id || pinned;
-        return { branch: id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id)) };
-    }
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
 
     const raw = req?.query?.branch;
     if (raw === 'all') return {};                     // explicit "show all"
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
-    if (raw && mongoose.isValidObjectId(raw)) return { branch: new mongoose.Types.ObjectId(String(raw)) };
+    if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
 
     // No explicit query — fall back to the staff branch pin from
     // Phase 6 step 5. Tenant-level admins see everything (no filter).
-    if (req?.branch?._id) {
-        const id = req.branch._id;
-        return { branch: id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id)) };
-    }
+    if (req?.branch?._id) return branchScopeClause(req, req.branch._id);
     return {};
 }
 
@@ -145,6 +139,23 @@ function analyticsBranchFilter(req) {
  *   - Non-pinned (tenant owner)  → respect ?branch=<id|all|tenant-only>
  *   - No query, no pin            → {} (everything in tenant)
  */
+/**
+ * Records stored with branch:null belong to the tenant's Main branch
+ * (req.mainBranchId, stamped by middlewares/tenantContext). A view scoped
+ * to the Main branch therefore also includes the null records; a view of
+ * any other branch stays strict, so legacy / branch-less records never
+ * leak into a sub-branch.
+ *
+ * Returns a $match-safe clause (real ObjectIds — aggregation pipelines do
+ * not auto-cast strings).
+ */
+function branchScopeClause(req, branchId) {
+    const id = branchId instanceof mongoose.Types.ObjectId ? branchId : new mongoose.Types.ObjectId(String(branchId));
+    const main = req?.mainBranchId;
+    if (main && String(main) === String(id)) return { branch: { $in: [id, null] } };
+    return { branch: id };
+}
+
 function strictBranchFilter(req) {
     // Same ObjectId-casting concern as analyticsBranchFilter — this
     // helper is sometimes consumed by aggregation pipelines (Tip
@@ -152,20 +163,14 @@ function strictBranchFilter(req) {
     // casting doesn't apply. Returning a real ObjectId keeps both
     // .find() and .aggregate({ $match }) call sites correct.
     const pinned = pinnedBranchId(req);
-    if (pinned) {
-        const id = pinned._id || pinned;
-        return { branch: id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id)) };
-    }
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
 
     const raw = req?.query?.branch;
     if (raw === 'all') return {};
     if (raw === 'tenant-only' || raw === 'none' || raw === 'shared') return { branch: null };
-    if (raw && mongoose.isValidObjectId(raw)) return { branch: new mongoose.Types.ObjectId(String(raw)) };
+    if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
 
-    if (req?.branch?._id) {
-        const id = req.branch._id;
-        return { branch: id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id)) };
-    }
+    if (req?.branch?._id) return branchScopeClause(req, req.branch._id);
     return {};
 }
 
@@ -174,6 +179,7 @@ module.exports = {
     tenantId,
     analyticsBranchFilter,
     strictBranchFilter,
+    branchScopeClause,
     isBranchPinned,
     pinnedBranchId,
 };

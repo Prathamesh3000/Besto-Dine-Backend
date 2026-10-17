@@ -37,12 +37,16 @@ router.post('/login',
 // There was previously no customer reset path at all; the login page's
 // "Forgot password?" link showed a toast and did nothing.
 //
-// IP-level limiter on top of the per-account throttle in the handler:
-// the handler's limit is keyed on a real account, so it does nothing
-// against someone spraying addresses that don't exist.
+// IP-level limiter on top of the per-account throttle in the handler
+// (3 / 15 min per account): the handler's limit is keyed on a real
+// account, so it does nothing against someone spraying addresses that
+// don't exist. 30 / 15 min per IP — a restaurant's staff share one
+// public IP, and the old cap of 5 blocked the 6th colleague's reset
+// (LOGIN_THROTTLING_PROPOSAL.md). Every reply is a generic 200, so
+// skipSuccessfulRequests cannot be used here: all requests count.
 const forgotPasswordLimiter = makeLimiter({ name: 'auth-forgot',
     windowMs: 15 * 60 * 1000,
-    max: 5,
+    max: require('../utils/authLimiters').FORGOT_IP_LIMIT,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, message: 'Too many reset requests. Please try again in 15 minutes.' },

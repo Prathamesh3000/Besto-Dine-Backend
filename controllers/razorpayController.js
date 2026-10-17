@@ -151,25 +151,51 @@ async function freeTableIfReady(order) {
 // settlement on a sibling failure.
 async function settleSiblingDineInRounds(order, paymentMethod) {
     if (!order || !order.table || order.type !== 'dine-in') return;
+    // Pay-first: every round pays for itself (there is no aggregated table
+    // bill), so this capture never covers another round. Decided per
+    // ROUND (utils/operationsProfile.orderIsPayFirst): the order's recorded
+    // channel first — an 'either' tenant mixes both kinds on one table —
+    // then the tenant's dine-in mode for orders without one. Skip when the
+    // paid order was held or is pay-first; skip pay-first siblings below.
+    if (order.holdReason) return;
+    const { orderIsPayFirst } = require('../utils/operationsProfile');
+    let ops = null;
+    try {
+        const { loadOps } = require('../services/orderHoldService');
+        ops = await loadOps(order.restaurant);
+    } catch (err) {
+        // A failed profile lookup must not change how a pay-after tenant
+        // settles: fall through to today's default (aggregated table
+        // bill → settle the siblings) exactly as before the ops profile.
+        logger.warn('settleSiblingDineInRounds: operations profile lookup failed — continuing with the default (pay-after) behaviour', { error: err.message, orderId: order.orderId });
+    }
+    if (orderIsPayFirst(order, ops)) return;
     try {
         const tf = order.restaurant ? { restaurant: order.restaurant } : {};
         const siblings = await Order.find({
             table: order.table,
             _id: { $ne: order._id },
+            // 'awaiting-payment' (held pay-first rounds) deliberately
+            // excluded: the customer's table bill doesn't include them
+            // (orderQueryService), so this capture doesn't cover them —
+            // each is paid and released on its own (orderHoldService).
             status: { $in: ['new', 'preparing', 'ready', 'served'] },
             paymentStatus: { $ne: 'Paid' },
             ...tf,
         });
+        let settled = 0;
         for (const sib of siblings) {
+            if (orderIsPayFirst(sib, ops)) continue;   // pays for itself
             sib.paymentStatus = 'Paid';
             sib.paymentMethod = paymentMethod || order.paymentMethod || 'online';
             sib.amountPaid = 0; // covered by the combined capture on `order`
             if (!sib.paidAt) sib.paidAt = new Date();
             await sib.save();
+            settled += 1;
             try { await createTipForPaidOrder(sib, sib.restaurant || order.restaurant); } catch { /* tip best-effort */ }
         }
-        if (siblings.length) {
-            logger.info(`Settled ${siblings.length} sibling dine-in round(s) with ${order.orderId} on table ${order.table}`);
+        if (settled) {
+            logger.info(`Settled ${settled} sibling dine-in round(s) with ${order.orderId} on table ${order.table}`);
         }
     } catch (err) {
         logger.warn('Failed to settle sibling dine-in rounds:', err.message);
@@ -229,6 +255,18 @@ async function settleSplitSiblings(order, paymentMethod) {
                 { returnDocument: 'after' }
             );
             if (!updated) continue;
+            // A split doc still held from the kitchen until paid (pay-first,
+            // services/orderHoldService.js) is paid now — release it the
+            // one supported way so it reaches the kitchen / KOT / stock.
+            // Usually releaseHeldOrder(primary) already did; idempotent.
+            if (updated.status === 'awaiting-payment') {
+                try {
+                    const { releaseHeldOrder } = require('../services/orderHoldService');
+                    await releaseHeldOrder(updated);
+                } catch (err) {
+                    logger.warn(`Release of held split order ${updated.orderId} failed: ${err.message}`);
+                }
+            }
             try { await createTipForPaidOrder(updated, updated.restaurant || order.restaurant); } catch { /* tip best-effort */ }
         }
         logger.info(`Settled ${splits.length} linked split order(s) with ${order.orderId}`);
@@ -262,12 +300,39 @@ async function markOrderPaidAtomically(order, { paymentId, razorpayOrderId, capt
     const update = { $set: set };
     // Keep the settling checkout in the order's checkout history (4a).
     if (razorpayOrderId) update.$addToSet = { razorpayOrderIds: razorpayOrderId };
-    return Order.findOneAndUpdate(
+    const paid = await Order.findOneAndUpdate(
         { _id: order._id, paymentStatus: { $nin: ['Paid', 'Refunded'] } },
         update,
         { returnDocument: 'after' }
     );
+    // A pay-first order held from the kitchen until its payment was
+    // confirmed (operations profile) goes to the kitchen now. Verify,
+    // webhook and reconciliation all settle through here.
+    if (paid && paid.status === 'awaiting-payment') {
+        const { releaseHeldOrder } = require('../services/orderHoldService');
+        return (await releaseHeldOrder(paid)) || paid;
+    }
+    // The order was cancelled before the gateway confirmed the capture
+    // (e.g. a held pay-first 'online' order cancelled by the customer or
+    // the hold-expiry sweep). The money is real, so the payment stays
+    // recorded (Paid) — but it must not become a silent Paid+cancelled
+    // order: queue a refund request exactly like cancelling a paid order
+    // does. Callers check paidAfterCancel and skip the sale side effects
+    // (loyalty, tip, sibling settlement, table release).
+    if (paid && paid.status === 'cancelled') {
+        try {
+            const { queueRefundRequestOnCancel } = require('../services/orderLifecycleService');
+            await queueRefundRequestOnCancel(paid, 'Payment captured after the order was cancelled');
+        } catch (err) {
+            logger.error('Refund request for a payment on a cancelled order failed', { orderId: paid.orderId, error: err.message });
+        }
+        paid.paidAfterCancel = true;   // in-memory flag only (not in the schema)
+    }
+    return paid;
 }
+
+// Response / log text when a capture landed on an already-cancelled order.
+const PAID_AFTER_CANCEL_MESSAGE = 'This order was cancelled before your payment was confirmed. A refund has been requested and will be processed by the restaurant.';
 
 // ─── Razorpay instance ──────────────────────────────────────────────────────
 const razorpay = new Razorpay({
@@ -749,6 +814,17 @@ exports.verifyPayment = async (req, res) => {
         }
         order = paidOrder;
 
+        // Captured after the order was cancelled: payment recorded and a
+        // refund request queued (markOrderPaidAtomically) — not a sale.
+        if (order.paidAfterCancel) {
+            return res.status(409).json({
+                success: false,
+                code: 'ORDER_CANCELLED_REFUND_REQUESTED',
+                refundRequested: true,
+                message: PAID_AFTER_CANCEL_MESSAGE,
+            });
+        }
+
         // ── Side effects — best effort; the order is already settled ─────
         try {
             await awardLoyaltyPoints(order);
@@ -1154,6 +1230,15 @@ exports.handleWebhook = async (req, res) => {
                 });
                 return res.status(200).json({ status: 'ok' });
             }
+            // Captured after the order was cancelled: recorded + refund
+            // request queued (markOrderPaidAtomically); no sale side effects.
+            if (paidOrder.paidAfterCancel) {
+                logger.warn('Webhook: capture on a cancelled order — refund request queued', {
+                    paymentId: payment.id,
+                    orderId: paidOrder.orderId,
+                });
+                return res.status(200).json({ status: 'ok' });
+            }
 
             await awardLoyaltyPoints(paidOrder);
 
@@ -1188,6 +1273,16 @@ exports.handleWebhook = async (req, res) => {
                 errorCode: payment.error_code || null,
                 errorDescription: payment.error_description || null,
             });
+            // A pay-first order held from the kitchen on an 'online'
+            // promise (operations profile) now has a 15-minute retry
+            // window before the sweeper may cancel it. No-op for every
+            // other order (never held).
+            try {
+                const { noteOnlinePaymentFailed } = require('../services/orderHoldService');
+                await noteOnlinePaymentFailed(order);
+            } catch (holdErr) {
+                logger.warn(`Webhook: could not stamp payment failure on held order ${order.orderId}: ${holdErr.message}`);
+            }
         } else if (event === 'refund.processed') {
             const refundEntity = parsed.payload?.refund?.entity || null;
             // The refund's own amount — payload.payment.entity.amount is the
@@ -2305,6 +2400,11 @@ async function settleReconciledCapture(order, captured) {
     if (!paidOrder) {
         return { status: 'already_settled' };
     }
+    // Captured after the order was cancelled: recorded + refund request
+    // queued (markOrderPaidAtomically); no sale side effects.
+    if (paidOrder.paidAfterCancel) {
+        return { status: 'cancelled_refund_requested', amount: paidOrder.amountPaid };
+    }
     await awardLoyaltyPoints(paidOrder);
     await settleSplitSiblings(paidOrder, 'online');
     // Settled → free the dine-in table (no-op while another order on it
@@ -2405,3 +2505,26 @@ exports.runScheduledReconciliation = async () => {
         logger.error('Scheduled reconciliation error:', { error: err.message });
     }
 };
+
+/**
+ * Held-order sweeper seam (services/orderHoldService.cancelExpiredHolds):
+ * before an ONLINE hold is cancelled, look for a capture on any checkout
+ * opened for the order and, if there is one, settle it exactly as
+ * reconciliation does (claim → Paid → releaseHeldOrder). Returns
+ * { status: 'none' } when Razorpay knows no captured payment, otherwise
+ * settleReconciledCapture's outcome ('recovered', 'already_settled',
+ * 'underpaid', 'payment_used_elsewhere', 'cancelled_refund_requested').
+ * Throws when the gateway cannot be reached — the caller keeps the hold.
+ */
+exports.recoverCapturedPaymentForOrder = async (order) => {
+    if (!order) return { status: 'none' };
+    if (!orderCheckoutIds(order).length) return { status: 'none' };
+    const payments = await fetchOrderCheckoutPayments(order);
+    const captured = payments.items?.find(p => p.status === 'captured');
+    if (!captured) return { status: 'none' };
+    return settleReconciledCapture(order, captured);
+};
+
+// Test seam: sibling settlement helpers (heldOrderAudit.test.js).
+exports._settleSplitSiblings = settleSplitSiblings;
+exports._settleSiblingDineInRounds = settleSiblingDineInRounds;

@@ -9,7 +9,7 @@ const logger = require('../utils/logger');
 const { parseCsv } = require('../utils/csvParser');
 const { pickDishImage, isDeadImage } = require('../utils/dishImagePicker');
 
-const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
 
 // File-based master template for the combo bulk-import flow. Same
 // pattern as the Halls / Packages / Decorations / Menu Item templates
@@ -26,8 +26,10 @@ const COMBO_TEMPLATE_PATH = path.join(__dirname, '..', 'data', 'combo-master-tem
  *   - Tenant owner (no pin)        → unfiltered (sees everything).
  */
 function comboBranchFilter(req) {
+    // Main-branch views also include shared (branch:null) combos — they are
+    // Main's (utils/tenantScope.branchScopeClause). Other branches strict.
     const pinned = pinnedBranchId(req);
-    if (pinned) return { branch: pinned };
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
     // Tenant owner using the admin branch switcher passes ?branch=<id>.
     // Default is STRICT (only that branch's combos) so each branch can
     // run its own promo lineup. When the caller passes `branchScope=auto`
@@ -42,7 +44,7 @@ function comboBranchFilter(req) {
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
     if (raw && mongoose.isValidObjectId(raw)) {
         if (scope === 'auto') return { $or: [{ branch: null }, { branch: raw }] };
-        return { branch: raw };
+        return branchScopeClause(req, raw);
     }
     if (req?.branch?._id) return { $or: [{ branch: null }, { branch: req.branch._id }] };
     return {};

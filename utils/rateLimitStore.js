@@ -118,10 +118,18 @@ class ResilientRedisStore {
  * @param {object} options express-rate-limit options, plus optional
  *   `name` — unique per limiter; becomes the Redis key prefix `rl:<name>:`.
  */
+let warnedMemoryInProduction = false;
+
 function makeLimiter(options = {}) {
     const { name, ...rlOptions } = options;
     const redisClient = rlOptions.store ? null : getClient();
-    if (!redisClient) return rateLimit(rlOptions);
+    if (!redisClient) {
+        if (process.env.NODE_ENV === 'production' && !warnedMemoryInProduction) {
+            warnedMemoryInProduction = true;
+            logger.warn('rate-limit store is in-memory in production — per-IP limits reset on restart and are per-instance. Set REDIS_URL. (The per-account login lockout lives in MongoDB `login_attempts` and is shared regardless.)');
+        }
+        return rateLimit(rlOptions);
+    }
     seq += 1;
     const id = name || `anon${seq}-${rlOptions.windowMs || 60000}-${rlOptions.limit ?? rlOptions.max ?? 5}`;
     if (!name) logger.warn(`rate-limit: limiter created without a name — using Redis prefix "rl:${id}:". Pass { name } for stable keys.`);

@@ -65,11 +65,12 @@ exports.getAllCustomers = asyncHandler(async (req, res) => {
             { $addFields: {
                 wallet: { $arrayElemAt: ['$wallet', 0] },
                 orderCount: { $size: '$orders' },
-                // Lifetime value counts real (non-cancelled) orders only.
+                // Lifetime value counts real orders only: not cancelled, and not a
+                // pay-first order still held until paid ('awaiting-payment').
                 totalSpent: { $sum: { $map: {
                     input: '$orders',
                     as: 'o',
-                    in: { $cond: [{ $eq: ['$$o.status', 'cancelled'] }, 0, { $ifNull: ['$$o.total', 0] }] },
+                    in: { $cond: [{ $in: ['$$o.status', ['cancelled', 'awaiting-payment']] }, 0, { $ifNull: ['$$o.total', 0] }] },
                 } } },
                 lastOrderDate: { $max: '$orders.createdAt' },
             }},
@@ -282,8 +283,9 @@ exports.getCustomerDetail = asyncHandler(async (req, res) => {
         .slice(0, 10)
         .map(([name, count]) => ({ name, count }));
 
-    // Lifetime value / average exclude cancelled orders.
-    const spendOrders = orders.filter(o => o.status !== 'cancelled');
+    // Lifetime value / average exclude cancelled orders and pay-first
+    // orders still held until paid ('awaiting-payment').
+    const spendOrders = orders.filter(o => o.status !== 'cancelled' && o.status !== 'awaiting-payment');
     const totalSpent = spendOrders.reduce((sum, o) => sum + (o.total || 0), 0);
     const completedBookings = advanceBookings.filter(b => b.status === 'Completed').length;
 

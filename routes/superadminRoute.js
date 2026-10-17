@@ -14,6 +14,7 @@ const {
 } = require('../middlewares/authMiddleware');
 
 const ctrl = require('../controllers/superadminController');
+const opsCtrl = require('../controllers/operationsController');
 const blog = require('../controllers/blogController');
 // getTenantFallbackStats removed — strict mode is default since Phase 3
 // step 5 and the counter is always zero in normal operation.
@@ -198,6 +199,13 @@ router.post('/restaurants/:id/addons', superAdminFull, validate([
     body('key').isString().notEmpty().withMessage('Add-on key is required'),
 ]), ctrl.addRestaurantAddon);
 router.delete('/restaurants/:id/addons/:addonId', superAdminFull, validate([restaurantId]), ctrl.cancelRestaurantAddon);
+
+// Operations profile — HOW the restaurant runs (OPERATIONS_CONTROL_PANEL_DESIGN.md §4).
+// Reading is open to every super admin; preview and save need full access.
+router.get('/operations/presets', opsCtrl.getPresets);
+router.get('/restaurants/:id/operations', validate([restaurantId]), opsCtrl.getRestaurantOperations);
+router.post('/restaurants/:id/operations/preview', superAdminFull, validate([restaurantId]), opsCtrl.previewRestaurantOperations);
+router.put('/restaurants/:id/operations', superAdminFull, validate([restaurantId]), opsCtrl.updateRestaurantOperations);
 
 // Phase 7.2 — tenant backups (create / list / download / delete)
 router.post('/restaurants/:id/backup',              superAdminFull, validate([restaurantId]), backup.createBackup);

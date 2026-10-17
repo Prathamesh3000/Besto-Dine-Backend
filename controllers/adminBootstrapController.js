@@ -4,7 +4,7 @@ const { exposeSeats } = require('../utils/tableSeats');
 const Area = require('../models/area');
 const Reservation = require('../models/reservation');
 const User = require('../models/user');
-const { tenantFilter, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantFilter, strictBranchFilter, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const { resolveSettingsForRequest } = require('./settingsController');
 const logger = require('../utils/logger');
 
@@ -20,14 +20,14 @@ const logger = require('../utils/logger');
 // Customer flow still gets the permissive shared+branch view.
 function areaBranchFilter(req) {
     const pinned = pinnedBranchId(req);
-    if (pinned) return { branch: pinned };
+    if (pinned) return branchScopeClause(req, pinned._id || pinned);
 
     // Tenant owner using the switcher → `?branch=<id>` narrows to that
     // branch. `?branch=all` or unset = unfiltered (sees everything).
     const raw = req?.query?.branch;
     if (raw === 'all') return null;
     if (raw === 'tenant-only' || raw === 'none') return { branch: null };
-    if (raw && mongoose.isValidObjectId(raw)) return { branch: raw };
+    if (raw && mongoose.isValidObjectId(raw)) return branchScopeClause(req, raw);
 
     if (req?.branch?._id) return { $or: [{ branch: null }, { branch: req.branch._id }] };
     return null;
