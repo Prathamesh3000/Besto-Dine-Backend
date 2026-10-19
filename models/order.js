@@ -207,7 +207,22 @@ const orderSchema = new mongoose.Schema({
   holdReason: { type: String, enum: ['counterCash', 'online', 'wallet', null], default: undefined },
   holdReleaseStatus: { type: String, enum: ['new', 'ready', null], default: undefined },
   holdExpiresAt: { type: Date },
+  //   onlinePaymentFailedAt — Razorpay reported payment.failed while the
+  //                       order was held with holdReason 'online'; the
+  //                       sweeper may cancel it after holdExpiresAt once
+  //                       reconciliation finds no capture
+  onlinePaymentFailedAt: { type: Date },
   releasedAt: { type: Date },
+  // How THIS dine-in round pays, decided once at creation from the
+  // operations profile (orderCreateService.resolveOperationsGate):
+  //   'payFirst' — paid before the kitchen (held or prepaid checkout)
+  //   'payAfter' — the table bill is settled after the meal
+  // Only set for customer dine-in orders under a profile; a tenant whose
+  // profile lets the customer choose ('either') gets both kinds on one
+  // table. Unset (every order before this field, staff / POS orders,
+  // tenants without a profile) → the tenant's dine-in mode decides
+  // (utils/operationsProfile.orderIsPayFirst).
+  paymentChannel: { type: String, enum: ['payFirst', 'payAfter'], default: undefined },
 
   // ── Cancellation audit ─────────────────────────────────────────
   // Populated when status transitions to 'cancelled'. Separates

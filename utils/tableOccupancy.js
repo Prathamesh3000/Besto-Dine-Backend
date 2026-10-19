@@ -124,17 +124,21 @@ const UNSETTLED_ORDER_MATCH = {
     paymentStatus: { $nin: ['Paid', 'Refunded'] },
 };
 
-// Pay-first restaurants (operations profile): every round is paid up
-// front, so "paid" says nothing about whether the party is done. A round
-// still waiting for payment or in the kitchen keeps the table; it frees
-// when the kitchen finishes (Ready → served) — design §5.3.
-const PAY_FIRST_UNSETTLED_MATCH = {
+// Pay-first rounds (operations profile): paid up front, so "paid" says
+// nothing about whether the party is done. Such a round still waiting
+// for payment or in the kitchen keeps the table; it frees when the
+// kitchen finishes (Ready → served) — design §5.3. Decided per round
+// (utils/operationsProfile.orderIsPayFirst / payFirstOrderMatch): on an
+// 'either' tenant a pay-first and a pay-after round can share the table.
+// A payFirst tenant's rounds carry no channel or 'payFirst' → same rule
+// as before for every one of them.
+const payFirstUnsettledMatch = (payFirstRoundMatch) => ({
     status: { $ne: 'cancelled' },
     $or: [
         { paymentStatus: { $nin: ['Paid', 'Refunded'] } },
-        { status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready'] } },
+        { status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready'] }, ...payFirstRoundMatch },
     ],
-};
+});
 
 async function unsettledMatchFor(restaurantId) {
     if (!restaurantId) return UNSETTLED_ORDER_MATCH;
@@ -146,10 +150,8 @@ async function unsettledMatchFor(restaurantId) {
         const r = await Restaurant.findById(restaurantId)
             .select('subscription featureOverrides addons operations').lean();
         if (!r?.operations) return UNSETTLED_ORDER_MATCH;   // today's rule
-        const { resolveOperations } = require('./operationsProfile');
-        return resolveOperations(r).payment.dineIn === 'payFirst'
-            ? PAY_FIRST_UNSETTLED_MATCH
-            : UNSETTLED_ORDER_MATCH;
+        const { resolveOperations, payFirstOrderMatch } = require('./operationsProfile');
+        return payFirstUnsettledMatch(payFirstOrderMatch(resolveOperations(r)));
     } catch {
         return UNSETTLED_ORDER_MATCH;
     }

@@ -36,6 +36,8 @@ const TODAY = {
     },
     customerApp: { callWaiter: true, requestBill: true, appendToOrder: true, tips: true },
     tables: { useTables: true, assignWaiters: true, mergeTables: true },
+    // Informational only (design §0.4 q3): kitchen printer with the chef module.
+    printing: { kotAt: 'kitchen' },
 };
 
 describe('operationsProfile — defaults equal today', () => {
@@ -144,7 +146,8 @@ describe('operationsProfile — modules drive the flow (design §0.3)', () => {
         expect(f.payment.dineIn).toBe('payAfter');
         expect(f.payment.holdUntilPaid).toBe(false);
         expect(f.payment.methods.counterCash).toBe(true);
-        expect(f.tables.useTables).toBe(false);
+        // useTables:false (token numbers) is not implemented yet — stays on (B12 guard)
+        expect(f.tables.useTables).toBe(true);
     });
 
     test('advanced fine-tune wins over derived values', () => {
@@ -255,7 +258,7 @@ describe('operationsProfile — normalise rejects bad input', () => {
         const p = normaliseProfile({ modules: { chef: false } });
         expect(p.modules).toEqual({ qrOrdering: true, waiter: true, captain: true, chef: false, customerPayment: true });
         expect(p.preset).toBe('custom');
-        expect(p.answers).toEqual({ dineInPayment: null, counterCash: null, useTables: null });
+        expect(p.answers).toEqual({ dineInPayment: null, counterCash: null, useTables: null, kotPrinter: null });
     });
 
     test('null / undefined → the default profile', () => {
@@ -398,5 +401,92 @@ describe('operationsProfile — review fixes', () => {
             advanced: { 'payment.holdUntilPaid': false },
         });
         expect(validateProfile(p).errors.join(' ')).toMatch(/hold unpaid orders/);
+    });
+});
+
+describe('operationsProfile — ops-panel review fixes (B16, B12, B17)', () => {
+    const { USE_TABLES_UNSUPPORTED_WARNING, KOT_PRINTER_OPTIONS } = require('../utils/operationsProfile');
+
+    test('B16: QR ordering off AND staff ordering off is rejected — nobody could order', () => {
+        const p = normaliseProfile({ modules: { qrOrdering: false }, advanced: { 'orderFlow.staffOrder': false } });
+        const { errors } = validateProfile(p);
+        expect(errors.some(e => e.startsWith('orderFlow.staffOrder:'))).toBe(true);
+        // either one alone is fine
+        expect(validateProfile(normaliseProfile({ modules: { qrOrdering: false } })).errors).toEqual([]);
+        expect(validateProfile(normaliseProfile({ advanced: { 'orderFlow.staffOrder': false } })).errors).toEqual([]);
+    });
+
+    test('B12: useTables:false is not supported yet → normalised to true with a warning, save still valid', () => {
+        const warnings = [];
+        const p = normaliseProfile({ answers: { useTables: false } }, { warnings });
+        expect(p.answers.useTables).toBe(true);
+        expect(warnings).toEqual([USE_TABLES_UNSUPPORTED_WARNING]);
+        expect(warnings[0]).toMatch(/token-number mode is not available yet/);
+        expect(validateProfile(p).errors).toEqual([]);
+        expect(deriveFlow(p).tables.useTables).toBe(true);
+        // no collector → still normalised, no throw
+        expect(normaliseProfile({ answers: { useTables: false } }).answers.useTables).toBe(true);
+        // the kioskOnly preset (useTables:false) resolves with tables on
+        expect(resolveOperations(tenant(FULL_PLAN, { operations: profileFromPreset('kioskOnly') })).tables.useTables).toBe(true);
+        // a stored profile written before the rule (raw false) still resolves to tables on
+        expect(deriveFlow({ ...DEFAULT_PROFILE, answers: { ...DEFAULT_PROFILE.answers, useTables: false } }).tables.useTables).toBe(true);
+    });
+
+    test('B17: printer question → answers.kotPrinter → printing.kotAt (informational, default = today)', () => {
+        expect(KOT_PRINTER_OPTIONS).toEqual(['kitchen', 'counter', 'none']);
+        expect(DEFAULT_PROFILE.answers.kotPrinter).toBeNull();
+        // default profile (chef on) → kitchen printer; no chef → counter
+        expect(deriveFlow(normaliseProfile(null)).printing).toEqual({ kotAt: 'kitchen' });
+        expect(deriveFlow(profileFromPreset('hotelPayFirstSelfOrder')).printing).toEqual({ kotAt: 'counter' });
+        expect(deriveFlow(profileFromPreset('cafeCounterPayFirst')).printing).toEqual({ kotAt: 'kitchen' });
+        // the answer wins
+        for (const v of KOT_PRINTER_OPTIONS) {
+            expect(deriveFlow(normaliseProfile({ answers: { kotPrinter: v } })).printing.kotAt).toBe(v);
+        }
+        expect(resolveOperations(tenant(FULL_PLAN, { operations: { answers: { kotPrinter: 'none' } } })).printing.kotAt).toBe('none');
+        // bad values are rejected; the customer-safe subset does not carry it
+        expect(() => normaliseProfile({ answers: { kotPrinter: 'bluetooth' } })).toThrow(/answers.kotPrinter must be one of/);
+        expect(publicOperationsOf(tenant()).printing).toBeUndefined();
+    });
+});
+
+describe('operationsProfile — orderIsPayFirst / payFirstOrderMatch (per-round pay-first)', () => {
+    const { orderIsPayFirst, payFirstOrderMatch } = require('../utils/operationsProfile');
+    const opsOf = (profile) => resolveOperations(tenant(FULL_PLAN, profile ? { operations: profile } : {}));
+    const payFirstOps = opsOf(profileFromPreset('cafeCounterPayFirst'));
+    const eitherOps = opsOf({ ...profileFromPreset('cafeCounterPayFirst'), answers: { dineInPayment: 'either' } });
+    const noProfileOps = opsOf(null);
+
+    test('the recorded channel wins over the tenant mode', () => {
+        expect(orderIsPayFirst({ paymentChannel: 'payFirst' }, eitherOps)).toBe(true);
+        expect(orderIsPayFirst({ paymentChannel: 'payFirst' }, noProfileOps)).toBe(true);
+        expect(orderIsPayFirst({ paymentChannel: 'payFirst' }, null)).toBe(true);
+        expect(orderIsPayFirst({ paymentChannel: 'payAfter' }, payFirstOps)).toBe(false);
+        expect(orderIsPayFirst({ paymentChannel: 'payAfter' }, eitherOps)).toBe(false);
+    });
+
+    test('no channel recorded → the tenant mode decides (orders before the field keep today\'s behaviour)', () => {
+        expect(payFirstOps.payment.dineIn).toBe('payFirst');
+        expect(orderIsPayFirst({}, payFirstOps)).toBe(true);
+        expect(orderIsPayFirst({ paymentChannel: undefined }, payFirstOps)).toBe(true);
+        expect(eitherOps.payment.dineIn).toBe('either');
+        expect(orderIsPayFirst({}, eitherOps)).toBe(false);
+    });
+
+    test('no profile and no channel → false; a missing order → false', () => {
+        expect(noProfileOps.payment.dineIn).toBe('payAfter');
+        expect(orderIsPayFirst({}, noProfileOps)).toBe(false);
+        expect(orderIsPayFirst({}, null)).toBe(false);
+        expect(orderIsPayFirst({}, undefined)).toBe(false);
+        expect(orderIsPayFirst(null, payFirstOps)).toBe(false);
+    });
+
+    test('payFirstOrderMatch mirrors the helper as a Mongo match', () => {
+        // payFirst tenant: recorded pay-first OR nothing recorded
+        expect(payFirstOrderMatch(payFirstOps)).toEqual({ paymentChannel: { $ne: 'payAfter' } });
+        // either / payAfter / no profile: only a recorded pay-first round
+        expect(payFirstOrderMatch(eitherOps)).toEqual({ paymentChannel: 'payFirst' });
+        expect(payFirstOrderMatch(noProfileOps)).toEqual({ paymentChannel: 'payFirst' });
+        expect(payFirstOrderMatch(null)).toEqual({ paymentChannel: 'payFirst' });
     });
 });

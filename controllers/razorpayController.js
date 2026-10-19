@@ -152,18 +152,24 @@ async function freeTableIfReady(order) {
 async function settleSiblingDineInRounds(order, paymentMethod) {
     if (!order || !order.table || order.type !== 'dine-in') return;
     // Pay-first: every round pays for itself (there is no aggregated table
-    // bill), so this capture never covers another round. Skip when the
-    // paid order was a held pay-first order or the tenant's operations
-    // profile says dine-in is pay-first.
+    // bill), so this capture never covers another round. Decided per
+    // ROUND (utils/operationsProfile.orderIsPayFirst): the order's recorded
+    // channel first — an 'either' tenant mixes both kinds on one table —
+    // then the tenant's dine-in mode for orders without one. Skip when the
+    // paid order was held or is pay-first; skip pay-first siblings below.
     if (order.holdReason) return;
+    const { orderIsPayFirst } = require('../utils/operationsProfile');
+    let ops = null;
     try {
         const { loadOps } = require('../services/orderHoldService');
-        const ops = await loadOps(order.restaurant);
-        if (ops?.payment?.dineIn === 'payFirst') return;
+        ops = await loadOps(order.restaurant);
     } catch (err) {
-        logger.warn('settleSiblingDineInRounds: operations profile lookup failed — skipping sibling settlement', { error: err.message });
-        return;
+        // A failed profile lookup must not change how a pay-after tenant
+        // settles: fall through to today's default (aggregated table
+        // bill → settle the siblings) exactly as before the ops profile.
+        logger.warn('settleSiblingDineInRounds: operations profile lookup failed — continuing with the default (pay-after) behaviour', { error: err.message, orderId: order.orderId });
     }
+    if (orderIsPayFirst(order, ops)) return;
     try {
         const tf = order.restaurant ? { restaurant: order.restaurant } : {};
         const siblings = await Order.find({
@@ -177,16 +183,19 @@ async function settleSiblingDineInRounds(order, paymentMethod) {
             paymentStatus: { $ne: 'Paid' },
             ...tf,
         });
+        let settled = 0;
         for (const sib of siblings) {
+            if (orderIsPayFirst(sib, ops)) continue;   // pays for itself
             sib.paymentStatus = 'Paid';
             sib.paymentMethod = paymentMethod || order.paymentMethod || 'online';
             sib.amountPaid = 0; // covered by the combined capture on `order`
             if (!sib.paidAt) sib.paidAt = new Date();
             await sib.save();
+            settled += 1;
             try { await createTipForPaidOrder(sib, sib.restaurant || order.restaurant); } catch { /* tip best-effort */ }
         }
-        if (siblings.length) {
-            logger.info(`Settled ${siblings.length} sibling dine-in round(s) with ${order.orderId} on table ${order.table}`);
+        if (settled) {
+            logger.info(`Settled ${settled} sibling dine-in round(s) with ${order.orderId} on table ${order.table}`);
         }
     } catch (err) {
         logger.warn('Failed to settle sibling dine-in rounds:', err.message);
@@ -1264,6 +1273,16 @@ exports.handleWebhook = async (req, res) => {
                 errorCode: payment.error_code || null,
                 errorDescription: payment.error_description || null,
             });
+            // A pay-first order held from the kitchen on an 'online'
+            // promise (operations profile) now has a 15-minute retry
+            // window before the sweeper may cancel it. No-op for every
+            // other order (never held).
+            try {
+                const { noteOnlinePaymentFailed } = require('../services/orderHoldService');
+                await noteOnlinePaymentFailed(order);
+            } catch (holdErr) {
+                logger.warn(`Webhook: could not stamp payment failure on held order ${order.orderId}: ${holdErr.message}`);
+            }
         } else if (event === 'refund.processed') {
             const refundEntity = parsed.payload?.refund?.entity || null;
             // The refund's own amount — payload.payment.entity.amount is the
@@ -2485,6 +2504,25 @@ exports.runScheduledReconciliation = async () => {
     } catch (err) {
         logger.error('Scheduled reconciliation error:', { error: err.message });
     }
+};
+
+/**
+ * Held-order sweeper seam (services/orderHoldService.cancelExpiredHolds):
+ * before an ONLINE hold is cancelled, look for a capture on any checkout
+ * opened for the order and, if there is one, settle it exactly as
+ * reconciliation does (claim → Paid → releaseHeldOrder). Returns
+ * { status: 'none' } when Razorpay knows no captured payment, otherwise
+ * settleReconciledCapture's outcome ('recovered', 'already_settled',
+ * 'underpaid', 'payment_used_elsewhere', 'cancelled_refund_requested').
+ * Throws when the gateway cannot be reached — the caller keeps the hold.
+ */
+exports.recoverCapturedPaymentForOrder = async (order) => {
+    if (!order) return { status: 'none' };
+    if (!orderCheckoutIds(order).length) return { status: 'none' };
+    const payments = await fetchOrderCheckoutPayments(order);
+    const captured = payments.items?.find(p => p.status === 'captured');
+    if (!captured) return { status: 'none' };
+    return settleReconciledCapture(order, captured);
 };
 
 // Test seam: sibling settlement helpers (heldOrderAudit.test.js).

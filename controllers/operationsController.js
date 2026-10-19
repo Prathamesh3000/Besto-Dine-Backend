@@ -10,6 +10,14 @@
  *
  * All rules live in utils/operationsProfile; this file only loads, saves,
  * audits and reports.
+ *
+ * Save concurrency (PUT): body `{ operations, expectedUpdatedAt }` where
+ * expectedUpdatedAt is the `data.updatedAt` the panel got from GET (null
+ * when the restaurant had no profile). Mismatch → 409
+ * `{ success:false, code:'OPERATIONS_STALE', message, data:<GET payload> }`;
+ * the panel shows the current profile and lets the operator re-apply.
+ * Omitting expectedUpdatedAt keeps the old unconditional save.
+ * Every 200 / 409 body carries `data.updatedAt` to use on the next PUT.
  */
 const mongoose = require('mongoose');
 const Restaurant = require('../models/restaurant');
@@ -72,12 +80,26 @@ const QUESTIONS = [
         ],
     },
     {
+        key: 'kotPrinter',
+        label: 'Where do KOTs / bills print?',
+        help: 'For onboarding only — printers are set up in the restaurant\'s Settings → Printers. This answer does not change printing yet. With no printer, KOTs show on the admin screen.',
+        informational: true,
+        options: [
+            { value: null, label: 'Decide from the modules (kitchen printer with the chef module, counter printer without)' },
+            { value: 'kitchen', label: 'Kitchen printer' },
+            { value: 'counter', label: 'Counter printer' },
+            { value: 'none', label: 'No printer — KOTs show on the admin screen' },
+        ],
+    },
+    {
         key: 'useTables',
         label: 'Does the restaurant use table numbers?',
         options: [
             { value: null, label: 'Yes (default)' },
             { value: true, label: 'Yes' },
-            { value: false, label: 'No — token numbers instead' },
+            // Not implemented yet: saving `false` is accepted but normalised
+            // back to true with a warning (utils/operationsProfile).
+            { value: false, label: 'No — token numbers instead', disabled: true, note: 'Token-number mode is not available yet' },
         ],
     },
 ];
@@ -98,6 +120,9 @@ function buildPayload(restaurant) {
         profile,
         isDefault,
         ...(corrupt ? { corrupt: true } : {}),
+        // Concurrency token for PUT (send it back as `expectedUpdatedAt`);
+        // null while the restaurant has no profile yet.
+        updatedAt: storedUpdatedAtIso(restaurant),
         resolved: resolveOperations(restaurant),
         validation: validateProfile(profile),
     };
@@ -117,7 +142,12 @@ async function loadRestaurant(req, res) {
     return restaurant;
 }
 
-/** Parse body.operations; sends 400 and returns null on bad input. */
+/**
+ * Parse body.operations; sends 400 and returns null on bad input.
+ * Returns { candidate, normaliseWarnings } — the warnings are adjustments
+ * made while normalising (e.g. useTables:false kept on) that the response
+ * must show alongside validateProfile's warnings.
+ */
 function parseCandidate(req, res) {
     if (!req.body || typeof req.body !== 'object' || req.body.operations === undefined) {
         res.status(400).json({ success: false, message: 'operations is required' });
@@ -125,8 +155,9 @@ function parseCandidate(req, res) {
     }
     // updatedAt / updatedBy are server-owned
     const { updatedAt, updatedBy, ...input } = req.body.operations || {};
+    const normaliseWarnings = [];
     try {
-        return normaliseProfile(input);
+        return { candidate: normaliseProfile(input, { warnings: normaliseWarnings }), normaliseWarnings };
     } catch (err) {
         if (err instanceof OperationsProfileError) {
             res.status(400).json({ success: false, code: 'INVALID_OPERATIONS', message: err.message, errors: err.errors });
@@ -134,6 +165,43 @@ function parseCandidate(req, res) {
         }
         throw err;
     }
+}
+
+const uniq = (arr) => [...new Set(arr)];
+
+/** Stored profile's updatedAt as an ISO string, or null when there is no profile / no stamp. */
+function storedUpdatedAtIso(restaurant) {
+    const v = restaurant?.operations?.updatedAt;
+    if (!v) return null;
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Optimistic concurrency (design §10): the panel sends back the
+ * `expectedUpdatedAt` it loaded (profile.updatedAt from GET; null when the
+ * restaurant had no profile yet). Omitted → no check (older clients).
+ * Returns { check: false } | { check: true, stale: boolean, expected }.
+ */
+function concurrencyCheck(req, restaurant) {
+    if (!req.body || !('expectedUpdatedAt' in req.body)) return { check: false };
+    const raw = req.body.expectedUpdatedAt;
+    let expected = null;
+    if (raw !== null && raw !== undefined && raw !== '') {
+        const d = new Date(raw);
+        if (Number.isNaN(d.getTime())) return { check: true, invalid: true };
+        expected = d.toISOString();
+    }
+    return { check: true, expected, stale: expected !== storedUpdatedAtIso(restaurant) };
+}
+
+function staleResponse(res, restaurant) {
+    return res.status(409).json({
+        success: false,
+        code: 'OPERATIONS_STALE',
+        message: 'This operations profile was changed by someone else since you loaded it. Review the current profile and apply your changes again.',
+        data: buildPayload(restaurant),
+    });
 }
 
 /**
@@ -212,9 +280,11 @@ exports.previewRestaurantOperations = async (req, res) => {
     try {
         const restaurant = await loadRestaurant(req, res);
         if (!restaurant) return;
-        const candidate = parseCandidate(req, res);
-        if (!candidate) return;
-        const { errors, warnings } = validateProfile(candidate);
+        const parsed = parseCandidate(req, res);
+        if (!parsed) return;
+        const { candidate, normaliseWarnings } = parsed;
+        const { errors, warnings: validationWarnings } = validateProfile(candidate);
+        const warnings = uniq([...normaliseWarnings, ...validationWarnings]);
         const { after, impact } = await buildImpact(restaurant, candidate);
         return res.status(200).json({
             success: true,
@@ -231,21 +301,42 @@ exports.updateRestaurantOperations = async (req, res) => {
     try {
         const restaurant = await loadRestaurant(req, res);
         if (!restaurant) return;
-        const candidate = parseCandidate(req, res);
-        if (!candidate) return;
+        const parsed = parseCandidate(req, res);
+        if (!parsed) return;
+        const { candidate, normaliseWarnings } = parsed;
 
-        const { errors, warnings } = validateProfile(candidate);
+        const { errors, warnings: validationWarnings } = validateProfile(candidate);
+        const warnings = uniq([...normaliseWarnings, ...validationWarnings]);
         if (errors.length) {
             return res.status(400).json({
                 success: false, code: 'INVALID_OPERATIONS', message: errors.join('; '), errors, warnings,
             });
         }
 
+        // Optimistic concurrency: the panel must have loaded the version
+        // it is overwriting (expectedUpdatedAt). See concurrencyCheck.
+        const cc = concurrencyCheck(req, restaurant);
+        if (cc.check && cc.invalid) {
+            return res.status(400).json({ success: false, code: 'INVALID_OPERATIONS', message: 'expectedUpdatedAt must be a date or null', errors: ['expectedUpdatedAt must be a date or null'] });
+        }
+        if (cc.check && cc.stale) return staleResponse(res, restaurant);
+
         const { impact } = await buildImpact(restaurant, candidate);
         const beforeStored = restaurant.operations || null;
         const toSave = { ...candidate, updatedAt: new Date(), updatedBy: req.user?._id || null };
 
-        await Restaurant.updateOne({ _id: restaurant._id }, { $set: { operations: toSave } });
+        // The write itself is pinned on the stamp we compared against, so
+        // two saves racing past the check above cannot both win.
+        const pin = cc.check
+            ? (cc.expected
+                ? { 'operations.updatedAt': new Date(cc.expected) }
+                : { 'operations.updatedAt': { $exists: false } })
+            : {};
+        const write = await Restaurant.updateOne({ _id: restaurant._id, ...pin }, { $set: { operations: toSave } });
+        if (cc.check && !(write.matchedCount ?? write.n ?? 1)) {
+            const fresh = await Restaurant.findById(restaurant._id).select(RESTAURANT_FIELDS).lean();
+            return staleResponse(res, fresh || restaurant);
+        }
 
         await recordAudit(req, {
             action: 'restaurant.operations.update',
@@ -256,11 +347,16 @@ exports.updateRestaurantOperations = async (req, res) => {
         });
 
         // Open staff apps refetch /auth/me; customer apps pick the change up
-        // on their next menu-bootstrap fetch.
+        // on their next menu-bootstrap fetch. Tenant-wide: every staff role
+        // (admin, manager, waiter, captain, kitchen) in every branch room.
         try {
-            const { getIO, emitToStaff } = require('../utils/socket');
+            const { getIO, emitToTenantStaff } = require('../utils/socket');
             const io = getIO();
-            emitToStaff(io, null, EVENTS.TENANT_OPERATIONS_UPDATED, { restaurant: String(restaurant._id) });
+            await emitToTenantStaff(io, restaurant._id, EVENTS.TENANT_OPERATIONS_UPDATED, {
+                restaurant: String(restaurant._id),
+                updatedAt: toSave.updatedAt.toISOString(),
+                preset: candidate.preset,
+            });
         } catch (sockErr) {
             logger.warn('operations update: socket notify failed: ' + sockErr.message);
         }

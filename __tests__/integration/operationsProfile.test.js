@@ -221,3 +221,171 @@ describe('Super Admin API — /superadmin/restaurants/:id/operations', () => {
         expect((await ctx.api.as(T.users.waiter, T).get('/settings/operations')).status).toBe(403);
     });
 });
+
+// ── Ops-panel review fixes: A10 (migration null), A11 (409 + live refresh), B12, B17 ──
+describe('review fixes — Super Admin save concurrency (A11)', () => {
+    const base = () => `/superadmin/restaurants/${T.restaurant._id}/operations`;
+    const hotel = () => profileFromPreset('hotelPayFirstSelfOrder');
+    const cafe = () => profileFromPreset('cafeCounterPayFirst');
+
+    test('no expectedUpdatedAt (older client) → saves as before', async () => {
+        const res = await ctx.api.as(saFull).put(base()).send({ operations: hotel() });
+        expect(res.status).toBe(200);
+    });
+
+    test('expectedUpdatedAt null on an unset profile → saves; the response carries the new updatedAt', async () => {
+        const res = await ctx.api.as(saFull).put(base()).send({ operations: hotel(), expectedUpdatedAt: null });
+        expect(res.status).toBe(200);
+        expect(res.body.data.profile.updatedAt).toBeTruthy();
+        expect(res.body.data.updatedAt).toBe(new Date(res.body.data.profile.updatedAt).toISOString());
+    });
+
+    test('stale expectedUpdatedAt → 409 OPERATIONS_STALE with the current profile; nothing written', async () => {
+        const first = await ctx.api.as(saFull).put(base()).send({ operations: hotel(), expectedUpdatedAt: null });
+        expect(first.status).toBe(200);
+        const loadedAt = first.body.data.updatedAt;
+
+        // somebody else saves in between
+        const other = await ctx.api.as(saFull).put(base()).send({ operations: cafe(), expectedUpdatedAt: loadedAt });
+        expect(other.status).toBe(200);
+        expect(other.body.data.updatedAt).not.toBe(loadedAt);
+
+        // our save, based on the first load → stale
+        const stale = await ctx.api.as(saFull).put(base()).send({ operations: hotel(), expectedUpdatedAt: loadedAt });
+        expect(stale.status).toBe(409);
+        expect(stale.body.success).toBe(false);
+        expect(stale.body.code).toBe('OPERATIONS_STALE');
+        expect(stale.body.data.profile.preset).toBe('cafeCounterPayFirst');
+        expect(stale.body.data.updatedAt).toBe(other.body.data.updatedAt);
+        expect(stale.body.data.resolved.roles.chef).toBe(true);
+        expect((await Restaurant.findById(T.restaurant._id).lean()).operations.preset).toBe('cafeCounterPayFirst');
+
+        // null ("I loaded no profile") is also stale once a profile exists
+        const nul = await ctx.api.as(saFull).put(base()).send({ operations: hotel(), expectedUpdatedAt: null });
+        expect(nul.status).toBe(409);
+
+        // retry with the current stamp succeeds
+        const retry = await ctx.api.as(saFull).put(base()).send({ operations: hotel(), expectedUpdatedAt: other.body.data.updatedAt });
+        expect(retry.status).toBe(200);
+        expect(retry.body.data.profile.preset).toBe('hotelPayFirstSelfOrder');
+    });
+
+    test('garbage expectedUpdatedAt → 400', async () => {
+        const res = await ctx.api.as(saFull).put(base()).send({ operations: hotel(), expectedUpdatedAt: 'yesterday-ish' });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('INVALID_OPERATIONS');
+    });
+
+    test('a save tells every staff role in every branch room (tenant:operations-updated)', async () => {
+        const { io: connectClient } = require('socket.io-client');
+        const Branch = require(path.join(BACKEND, 'models/branch'));
+        const { defaultPermissionsForRole } = require(path.join(BACKEND, 'utils/staffDefaults'));
+        const B2 = await Branch.create({ restaurant: T.restaurant._id, name: 'Annex', slug: `annex-${Date.now()}`, isActive: true });
+        const captainB2 = await createUser({
+            name: 'cap b2', email: `cap.b2.${Date.now()}@staff.test`, role: 'captain',
+            restaurant: T.restaurant._id, branch: B2._id, permissions: defaultPermissionsForRole('captain'),
+        });
+        const connect = (token) => new Promise((resolve, reject) => {
+            const s = connectClient(ctx.baseUrl, { auth: { token }, transports: ['websocket'], reconnection: false, forceNew: true, timeout: 5000 });
+            const events = [];
+            s.onAny((event, payload) => events.push({ event, payload }));
+            s.on('connect', () => resolve({ s, events }));
+            s.on('connect_error', reject);
+        });
+        const listeners = await Promise.all([
+            connect(T.users.admin.token), connect(T.users.chef.token), connect(T.users.waiter.token),
+            connect(T.users.captain.token), connect(captainB2.token),
+        ]);
+        try {
+            const res = await ctx.api.as(saFull).put(base()).send({ operations: profileFromPreset('fullService') });
+            expect(res.status).toBe(200);
+            const got = (events) => new Promise((resolve, reject) => {
+                const t0 = Date.now();
+                const tick = () => {
+                    const hit = events.find((e) => e.event === 'tenant:operations-updated');
+                    if (hit) return resolve(hit);
+                    if (Date.now() - t0 > 4000) return reject(new Error(`not received; got ${events.map((e) => e.event)}`));
+                    return setTimeout(tick, 25);
+                };
+                tick();
+            });
+            for (const { events } of listeners) {
+                const hit = await got(events);
+                expect(hit.payload).toMatchObject({ restaurant: String(T.restaurant._id), preset: 'fullService' });
+                expect(hit.payload.updatedAt).toBeTruthy();
+            }
+        } finally {
+            for (const { s } of listeners) s.close();
+        }
+    });
+});
+
+describe('review fixes — migration, useTables guard, printer question (A10, B12, B17)', () => {
+    const base = () => `/superadmin/restaurants/${T.restaurant._id}/operations`;
+    const silent = () => {};
+
+    test('A10: a restaurant stored with operations: null gets the default and is counted as written', async () => {
+        const N = await seedTenant({ label: 'opsnull' });
+        await Restaurant.updateOne({ _id: N.restaurant._id }, { $set: { operations: null } });
+        expect((await Restaurant.findById(N.restaurant._id).lean()).operations).toBeNull();
+
+        const dry = await applyOperationsDefaults({ Restaurant }, { dryRun: true, log: silent });
+        expect((await Restaurant.findById(N.restaurant._id).lean()).operations).toBeNull();
+
+        const real = await applyOperationsDefaults({ Restaurant }, { log: silent });
+        expect(real.written).toBe(dry.written);
+        expect(real.raced).toBe(0);
+        const n = (await Restaurant.findById(N.restaurant._id).lean()).operations;
+        expect(n).toMatchObject({ preset: DEFAULT_PROFILE.preset, modules: DEFAULT_PROFILE.modules });
+
+        const again = await applyOperationsDefaults({ Restaurant }, { log: silent });
+        expect(again.written).toBe(0);
+    });
+
+    test('B12: useTables:false saves with tables kept on and a warning in preview AND save', async () => {
+        const body = { operations: { modules: { waiter: false, captain: false }, answers: { counterCash: true, useTables: false } } };
+        const prev = await ctx.api.as(saFull).post(`${base()}/preview`).send(body);
+        expect(prev.status).toBe(200);
+        expect(prev.body.data.errors).toEqual([]);
+        expect(prev.body.data.warnings.join(' | ')).toMatch(/tables\.useTables: token-number mode is not available yet/);
+        expect(prev.body.data.profile.answers.useTables).toBe(true);
+
+        const save = await ctx.api.as(saFull).put(base()).send(body);
+        expect(save.status).toBe(200);
+        expect(save.body.data.warnings.join(' | ')).toMatch(/token-number mode is not available yet/);
+        const stored = (await Restaurant.findById(T.restaurant._id).lean()).operations;
+        expect(stored.answers.useTables).toBe(true);
+        expect(save.body.data.resolved.tables.useTables).toBe(true);
+    });
+
+    test('B16: QR ordering off + staff ordering off is rejected on save', async () => {
+        const res = await ctx.api.as(saFull).put(base()).send({ operations: {
+            modules: { qrOrdering: false }, advanced: { 'orderFlow.staffOrder': false },
+        } });
+        expect(res.status).toBe(400);
+        expect(res.body.errors.join(' ')).toMatch(/orderFlow\.staffOrder/);
+    });
+
+    test('B17: the presets catalogue carries the printer question; the answer is stored and resolved, nothing else changes', async () => {
+        const cat = await ctx.api.as(saSupport).get('/superadmin/operations/presets');
+        const q = cat.body.data.questions.find((x) => x.key === 'kotPrinter');
+        expect(q).toBeTruthy();
+        expect(q.informational).toBe(true);
+        expect(q.options.map((o) => o.value)).toEqual([null, 'kitchen', 'counter', 'none']);
+        expect(cat.body.data.questions.map((x) => x.key)).toEqual(['dineInPayment', 'counterCash', 'kotPrinter', 'useTables']);
+        const useTables = cat.body.data.questions.find((x) => x.key === 'useTables');
+        expect(useTables.options.find((o) => o.value === false).disabled).toBe(true);
+
+        const res = await ctx.api.as(saFull).put(base()).send({ operations: { answers: { kotPrinter: 'none' } } });
+        expect(res.status).toBe(200);
+        expect(res.body.data.resolved.printing).toEqual({ kotAt: 'none' });
+        expect(res.body.data.resolved.payment.dineIn).toBe('payAfter');
+        expect(res.body.data.resolved.roles).toEqual({ waiter: true, captain: true, chef: true });
+        const me = await ctx.api.as(T.users.admin, T).get('/auth/me');
+        expect(me.body.user.tenant.operations.printing.kotAt).toBe('none');
+
+        // default: kitchen with the chef module, counter without
+        const d = await ctx.api.as(saFull).post(`${base()}/preview`).send({ operations: profileFromPreset('hotelPayFirstSelfOrder') });
+        expect(d.body.data.resolved.printing.kotAt).toBe('counter');
+    });
+});

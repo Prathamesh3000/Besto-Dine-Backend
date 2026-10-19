@@ -623,6 +623,58 @@ exports.emitToCaptain = (ioInstance, branchId, event, payload) =>
     emitToRoles(ioInstance, ['captain'], branchId, event, payload);
 
 /**
+ * Every staff room of ONE tenant, for every role (admin, waiter, kitchen,
+ * captain, manager): the tenant-level room, the "unbranched" room and one
+ * room per branch id given. Pure — used by emitToTenantStaff and tests.
+ */
+function tenantStaffRooms(restaurantId, branchIds = []) {
+    const rid = toId(restaurantId);
+    if (!rid || !isObjectId(rid)) return [];
+    const out = new Set();
+    for (const role of rooms.ROOM_ROLES) {
+        out.add(tenantRoom(rid, role));
+        out.add(tenantRoom(rid, role, rooms.UNBRANCHED));
+        for (const b of branchIds) {
+            const bid = toId(b);
+            if (bid && isObjectId(bid)) out.add(tenantRoom(rid, role, bid));
+        }
+    }
+    out.delete(null);
+    return [...out];
+}
+exports.tenantStaffRooms = tenantStaffRooms;
+
+/**
+ * Tenant-wide staff broadcast (e.g. tenant:operations-updated): reaches
+ * every staff role — admin, manager, waiter, captain AND kitchen — whether
+ * the socket is unpinned (tenant-level room), pinned to a branch (each of
+ * the tenant's active branches) or listening unbranched. emitToStaff()
+ * with branch null misses captains and every branch-pinned socket.
+ *
+ * Async because the branch list is looked up; the branch lookup failing
+ * still emits to the tenant-level + unbranched rooms. Never throws.
+ */
+exports.emitToTenantStaff = async (ioInstance, restaurantId, event, payload) => {
+    if (!ioInstance) return [];
+    const rid = toId(restaurantId);
+    if (!rid || !isObjectId(rid)) {
+        logger.warn('socket emit dropped: tenant unresolved', { event });
+        return [];
+    }
+    let branchIds = [];
+    try {
+        const Branch = require('../models/branch');
+        const list = await Branch.find({ restaurant: rid, isActive: true }).select('_id').lean();
+        branchIds = (list || []).map((b) => String(b._id));
+    } catch (err) {
+        logger.warn('emitToTenantStaff: branch lookup failed — tenant-level rooms only', { event, error: err?.message });
+    }
+    const targets = tenantStaffRooms(rid, branchIds);
+    if (targets.length) ioInstance.to(targets).emit(event, payload);
+    return targets;
+};
+
+/**
  * BUG #24 — public menu change ping for one tenant. Payload should carry
  * only public info ({ itemIds, branch, reason }).
  */

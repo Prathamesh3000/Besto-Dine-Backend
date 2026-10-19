@@ -269,11 +269,32 @@ describe('attachTenant — X-Branch-Id resolution', () => {
         expect(String(req.branch._id)).toBe(String(A_SUB));
     });
 
-    test('own branch that is inactive → 404 BRANCH_NOT_FOUND', async () => {
-        const { res } = await run(makeReq({ user: ownerA(), headers: { 'x-branch-id': String(A_INACTIVE) } }));
+    // 2026-10-16: a deactivated branch of the caller's OWN tenant stays
+    // readable for the tenant owner / manager (historical orders and
+    // reports from the switcher); writes to it are refused with 409.
+    // Full matrix: __tests__/tenantContextBranchCache.test.js.
+    test('own branch that is inactive → owner GET passes with req.branch set, owner POST → 409 BRANCH_INACTIVE', async () => {
+        const read = await run(makeReq({ user: ownerA(), headers: { 'x-branch-id': String(A_INACTIVE) } }));
+        expect(read.next).toHaveBeenCalled();
+        expect(String(read.req.branch._id)).toBe(String(A_INACTIVE));
+        // The hot-path query is unchanged (active branches only); the
+        // inactive fallback is a second, tenant-scoped lookup.
+        expect(mockBranch.findOne).toHaveBeenCalledWith({ _id: String(A_INACTIVE), restaurant: A_ID, isActive: true });
+        expect(mockBranch.findOne).toHaveBeenCalledWith({ _id: String(A_INACTIVE), restaurant: A_ID });
 
-        expect(res.statusCode).toBe(404);
-        expect(res.body.code).toBe('BRANCH_NOT_FOUND');
+        const write = await run(makeReq({ method: 'POST', user: ownerA(), headers: { 'x-branch-id': String(A_INACTIVE) } }));
+        expect(write.next).not.toHaveBeenCalled();
+        expect(write.res.statusCode).toBe(409);
+        expect(write.res.body.code).toBe('BRANCH_INACTIVE');
+    });
+
+    test('own branch that is inactive → still 404 BRANCH_NOT_FOUND for pinned-less non-admin staff and guests', async () => {
+        const chef = await run(makeReq({ user: ownerA({ role: 'chef' }), headers: { 'x-branch-id': String(A_INACTIVE) } }));
+        expect(chef.res.statusCode).toBe(404);
+        expect(chef.res.body.code).toBe('BRANCH_NOT_FOUND');
+        const guest = await run(makeReq({ headers: { 'x-restaurant-slug': 'tenant-a', 'x-branch-id': String(A_INACTIVE) } }));
+        expect(guest.res.statusCode).toBe(404);
+        expect(guest.res.body.code).toBe('BRANCH_NOT_FOUND');
     });
 
     test.each([

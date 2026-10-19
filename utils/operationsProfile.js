@@ -18,7 +18,7 @@
  *     version: 1,
  *     preset: 'fullService' | 'hotelPayFirstSelfOrder' | 'cafeCounterPayFirst' | 'kioskOnly' | 'custom',
  *     modules: { qrOrdering, waiter, captain, chef, customerPayment },
- *     answers: { dineInPayment, counterCash, useTables },   // null = derive
+ *     answers: { dineInPayment, counterCash, useTables, kotPrinter },   // null = derive
  *     advanced: { 'orderFlow.servedStep': false, ... },     // dot-path fine-tune
  *     updatedAt, updatedBy,
  *   }
@@ -77,7 +77,17 @@ const ALL_MODULES_ON = Object.freeze({
     qrOrdering: true, waiter: true, captain: true, chef: true, customerPayment: true,
 });
 
-const EMPTY_ANSWERS = Object.freeze({ dineInPayment: null, counterCash: null, useTables: null });
+// Where KOTs / bills print (design §0.4 question 3). INFORMATIONAL for
+// onboarding only: printers are configured in Settings → Printers and
+// nothing in the print path reads this yet. null = derive from modules.
+const KOT_PRINTER_OPTIONS = ['kitchen', 'counter', 'none'];
+
+const EMPTY_ANSWERS = Object.freeze({ dineInPayment: null, counterCash: null, useTables: null, kotPrinter: null });
+
+// tables.useTables:false ("token numbers instead of tables") is offered
+// by the preset catalogue but the order path still requires a table, so a
+// profile asking for it is normalised back to true with this warning.
+const USE_TABLES_UNSUPPORTED_WARNING = 'tables.useTables: token-number mode is not available yet — table numbers stay on';
 
 /** Today's behaviour: every module in use, nothing answered, nothing fine-tuned. */
 const DEFAULT_PROFILE = Object.freeze({
@@ -150,8 +160,12 @@ function clampExpiry(n) {
  * Fill defaults and check types. Throws OperationsProfileError listing
  * every problem. Accepts partial input; unknown keys are rejected so a
  * typo in the Super Admin form cannot silently do nothing.
+ *
+ * `opts.warnings` (array) collects non-blocking adjustments made while
+ * normalising (e.g. useTables:false → true, not supported yet) so the
+ * save / preview response can show them.
  */
-function normaliseProfile(input) {
+function normaliseProfile(input, { warnings } = {}) {
     if (input == null) return clone(DEFAULT_PROFILE);
     if (!isPlainObject(input)) throw new OperationsProfileError(['operations must be an object']);
 
@@ -183,10 +197,19 @@ function normaliseProfile(input) {
             for (const [k, v] of Object.entries(input.answers)) {
                 if (!(k in EMPTY_ANSWERS)) { errors.push(`unknown answer "${k}"`); continue; }
                 if (v == null) continue;
-                if (k === 'dineInPayment' && !PAYMENT_MODES.includes(v)) {
-                    errors.push(`answers.dineInPayment must be one of ${PAYMENT_MODES.join(', ')}`);
-                } else if (k !== 'dineInPayment' && typeof v !== 'boolean') {
+                if (k === 'dineInPayment') {
+                    if (!PAYMENT_MODES.includes(v)) errors.push(`answers.dineInPayment must be one of ${PAYMENT_MODES.join(', ')}`);
+                    else answers[k] = v;
+                } else if (k === 'kotPrinter') {
+                    if (!KOT_PRINTER_OPTIONS.includes(v)) errors.push(`answers.kotPrinter must be one of ${KOT_PRINTER_OPTIONS.join(', ')}`);
+                    else answers[k] = v;
+                } else if (typeof v !== 'boolean') {
                     errors.push(`answers.${k} must be true or false`);
+                } else if (k === 'useTables' && v === false) {
+                    // Not implemented yet (orderCreateService still requires a
+                    // table): keep tables on, tell the Super Admin, save anyway.
+                    answers[k] = true;
+                    if (Array.isArray(warnings)) warnings.push(USE_TABLES_UNSUPPORTED_WARNING);
                 } else answers[k] = v;
             }
         }
@@ -271,9 +294,19 @@ function deriveFlow(profile) {
             tips: floorStaff,
         },
         tables: {
-            useTables: a.useTables == null ? true : a.useTables,
+            // Token-number mode (useTables:false) is not implemented yet —
+            // normaliseProfile already coerces it to true; this guards a
+            // stored profile written before that rule existed.
+            useTables: true,
             assignWaiters: floorStaff,
             mergeTables: true,
+        },
+        // Informational (onboarding): where KOTs / bills print. Nothing in
+        // the print path reads this yet (printers: Settings → Printers).
+        // Default = today's set-up — a kitchen printer when the kitchen
+        // screen / chef module is in use, the counter printer otherwise.
+        printing: {
+            kotAt: a.kotPrinter || (m.chef ? 'kitchen' : 'counter'),
         },
     };
 
@@ -308,6 +341,12 @@ function validateProfile(profile) {
     }
     if (flow.orderFlow.servedStep && !floorStaff) {
         errors.push('the "served" step is on but there is no waiter or captain to mark orders served');
+    }
+    if (!flow.orderFlow.customerSelfOrder && !flow.orderFlow.staffOrder) {
+        errors.push('orderFlow.staffOrder: staff ordering cannot be off while QR ordering is also off — nobody could place an order (turn on QR ordering or leave staff ordering on)');
+    }
+    if (profile.answers?.useTables === false) {
+        warnings.push(USE_TABLES_UNSUPPORTED_WARNING);
     }
     if (flow.customerApp.callWaiter && !floorStaff) {
         warnings.push('"Call waiter" is on but there is no waiter or captain to answer it');
@@ -419,6 +458,35 @@ function publicOperationsOf(restaurant, opts = {}) {
     };
 }
 
+/**
+ * Does THIS order follow the pay-first rules (every round pays for
+ * itself; a paid round still cooking keeps its table; no aggregated
+ * table bill)? Decided from the order first, the tenant second:
+ *   - order.paymentChannel 'payFirst' → yes, 'payAfter' → no (recorded at
+ *     creation — the only way to tell the two kinds apart on an 'either'
+ *     tenant's table);
+ *   - no channel recorded (orders before the field, staff / POS orders)
+ *     → the tenant's resolved dine-in mode, exactly as before.
+ * `ops` is a RESOLVED profile (resolveOperations / loadOps) or null. No
+ * profile and no channel → false (today's pay-after behaviour).
+ */
+function orderIsPayFirst(order, ops) {
+    if (!order) return false;
+    if (order.paymentChannel === 'payFirst') return true;
+    if (order.paymentChannel === 'payAfter') return false;
+    return ops?.payment?.dineIn === 'payFirst';
+}
+
+/**
+ * Mongo match for the orders orderIsPayFirst() would say yes to, for the
+ * same resolved `ops`. Spread into an Order query.
+ */
+function payFirstOrderMatch(ops) {
+    return ops?.payment?.dineIn === 'payFirst'
+        ? { paymentChannel: { $ne: 'payAfter' } }   // recorded pay-first OR nothing recorded
+        : { paymentChannel: 'payFirst' };
+}
+
 const ROLE_LABELS = { waiter: 'Waiter app', captain: 'Captain app', chef: 'Kitchen screen (chef app)' };
 const PAY_LABELS = { payFirst: 'pay first', payAfter: 'pay after the meal', either: 'customer chooses' };
 const CUSTOMER_APP_LABELS = {
@@ -526,6 +594,8 @@ module.exports = {
     PRESET_KEYS,
     PRESETS,
     ADVANCED_PATHS,
+    KOT_PRINTER_OPTIONS,
+    USE_TABLES_UNSUPPORTED_WARNING,
     DEFAULT_PROFILE,
     HOLD_EXPIRY_DEFAULT,
     OperationsProfileError,
@@ -538,4 +608,6 @@ module.exports = {
     profileFlow,
     diffImpact,
     getPath,
+    orderIsPayFirst,
+    payFirstOrderMatch,
 };
