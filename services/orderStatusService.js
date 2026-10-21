@@ -27,7 +27,7 @@ const {
 } = require('../utils/orderLifecycle');
 const { httpError, reply } = require('./orderErrors');
 const { emitOrderEvent } = require('./orderHelpers');
-const { notifyStatusTransition, emitStatusUpdateEvents, notify } = require('./orderNotifications');
+const { notifyStatusTransition, emitStatusUpdateEvents, emitOrderEventWithPolicy, notify } = require('./orderNotifications');
 const { recordPaidOrderLedger } = require('./orderPaymentService');
 
 // Optionally extract the calling user from token (for chef assignment).
@@ -527,7 +527,8 @@ async function updateOrderStatus(req) {
     const { resolveOperations } = require('../utils/operationsProfile');
     if (readyCompletesOrder(order, resolveOperations(req.restaurant))) {
       const { completeWithoutKitchen } = require('./orderHoldService');
-      order = await completeWithoutKitchen(order);
+      // The branch-resolved profile decides what the customer rooms hear.
+      order = await completeWithoutKitchen(order, { ops: resolveOperations(req.restaurant, { branchId: order.branch || null }) });
     }
   }
 
@@ -696,8 +697,13 @@ async function pickupOrder(req) {
   // (The table-freed event comes from releaseTableIfSettled, only when
   // it actually freed the table.) Include servedAt in the payload so the customer tracking timeline
   // can update its "Served" step optimistically without a refetch.
+  // Completion reaches the customer even with tracking off (§12.3) — as
+  // 'completed' then; staff rooms always get the real payload. Tracking on
+  // (the default) → exactly the emitOrderEvent of before.
   try {
-    emitOrderEvent(
+    const { resolveOperations } = require('../utils/operationsProfile');
+    const ops = req.restaurant ? resolveOperations(req.restaurant, { branchId: order.branch || null }) : null;
+    emitOrderEventWithPolicy(
       'order:updated',
       {
         orderId: order.orderId,
@@ -705,7 +711,9 @@ async function pickupOrder(req) {
         paymentStatus: order.paymentStatus,
         servedAt: order.servedAt,
       },
-      order
+      order,
+      ops,
+      'served'
     );
   } catch { /* socket not critical */ }
 

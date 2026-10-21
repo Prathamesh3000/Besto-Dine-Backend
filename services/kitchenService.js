@@ -238,7 +238,7 @@ async function getCompletedKitchenOrders(req) {
 
   const [orders, total] = await Promise.all([
     Order.find(query)
-      .select('orderId type status total items table customerName createdAt updatedAt servedAt preparationStartedAt preparationCompletedAt')
+      .select('orderId type status total items table tokenNumber customerName createdAt updatedAt servedAt preparationStartedAt preparationCompletedAt')
       .populate({ path: 'table', select: 'name area', populate: { path: 'area', select: 'name' } })
       .sort({ servedAt: -1, updatedAt: -1 })
       .limit(limit)

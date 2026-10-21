@@ -156,6 +156,40 @@ describe('GET /public/restaurants/:slug/landing', () => {
         expect((await landing(A.slug, '?branch=b-only')).body.code).toBe('BRANCH_NOT_FOUND');
     });
 
+    test('operations: the public blob is in the payload — tenant default on /<slug>, the branch override on ?branch= (design §12)', async () => {
+        const { normaliseProfile } = require(path.join(BACKEND, 'utils/operationsProfile'));
+        // No profile yet → the defaults (tables on), same as the app assumes.
+        let d = (await landing(B.slug)).body.data;
+        expect(d.operations).toMatchObject({ tables: { useTables: true }, orderFlow: { customerTracking: true } });
+        expect(Object.keys(d.operations).sort()).toEqual(['customerApp', 'orderFlow', 'payment', 'serviceModel', 'tables']);
+
+        // Token mode on the tenant; a branch that keeps its tables.
+        const kiosk = await Branch.create({ restaurant: B.restaurant._id, name: 'Tables Annex', slug: 'tables-annex', isActive: true, sortOrder: 2 });
+        await Restaurant.updateOne({ _id: B.restaurant._id }, {
+            $set: {
+                operations: normaliseProfile({ answers: { useTables: false } }),
+                operationsByBranch: [{ branch: kiosk._id, overrides: { answers: { useTables: true } }, updatedAt: new Date() }],
+            },
+        });
+        d = (await landing(B.slug)).body.data;                           // plain link → Main → tenant profile
+        expect(d.operations.tables.useTables).toBe(false);
+        d = (await landing(B.slug, '?branch=main')).body.data;
+        expect(d.operations.tables.useTables).toBe(false);
+        d = (await landing(B.slug, '?branch=tables-annex')).body.data;  // branch link → its override
+        expect(d.operations.tables.useTables).toBe(true);
+        expect(d.branch.slug).toBe('tables-annex');
+
+        // The disabled-landing payload carries it too.
+        await Settings.updateOne({ restaurant: B.restaurant._id, branch: null }, { $set: { 'landingPage.enabled': false } });
+        d = (await landing(B.slug)).body.data;
+        expect(d.landing.enabled).toBe(false);
+        expect(d.operations.tables.useTables).toBe(false);
+        // Nothing internal rides along with the blob.
+        expect(JSON.stringify(d)).not.toContain('operationsByBranch');
+        await Settings.updateOne({ restaurant: B.restaurant._id, branch: null }, { $set: { 'landingPage.enabled': true } });
+        await Restaurant.updateOne({ _id: B.restaurant._id }, { $unset: { operations: 1, operationsByBranch: 1 } });
+    });
+
     test('a stale tenant header does not change which restaurant is served', async () => {
         const res = await ctx.api.guest(B).get(`/public/restaurants/${A.slug}/landing`);
         expect(res.status).toBe(200);

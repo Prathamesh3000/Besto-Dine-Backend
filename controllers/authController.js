@@ -442,19 +442,49 @@ const assertTenantNotLocked = async (user) => {
  * feature unlocked).
  */
 const { effectiveFeatures, activeAddonKeys } = require('../utils/featureAccess');
-const { resolveOperations } = require('../utils/operationsProfile');
+const { resolveOperations, branchIdOf } = require('../utils/operationsProfile');
 const ALL_FEATURE_KEYS = [...require('../models/subscriptionPlan').FEATURE_KEYS, 'revenueAnalytics'];
 
-const buildAuthResponse = async (user) => {
+/**
+ * The branch whose operations profile a staff member's /auth/me should
+ * carry (design §12.1): the pinned branch, else the branch the client
+ * selected (`?branch=<id>` / `X-Branch-Id`, verified to be an ACTIVE
+ * branch of the user's tenant), else Main (slug 'main', else the oldest
+ * active branch). Returns a string id or null. Only looked up when the
+ * tenant has at least one branch override — otherwise the answer cannot
+ * change the result, and no profile / no override must stay byte for
+ * byte today's behaviour (and today's query count).
+ */
+async function effectiveOperationsBranch(user, r, selected) {
+    const pinned = branchIdOf(user.branch);
+    if (pinned) return pinned;
+    if (!Array.isArray(r.operationsByBranch) || !r.operationsByBranch.length) return null;
+    const Branch = require('../models/branch');
+    const sel = branchIdOf(selected);
+    if (sel && /^[0-9a-fA-F]{24}$/.test(sel)) {
+        const b = await Branch.findOne({ _id: sel, restaurant: r._id, isActive: true }).select('_id').lean();
+        if (b) return String(b._id);
+    }
+    const main = await Branch.findOne({ restaurant: r._id, isActive: true, slug: 'main' }).select('_id').lean()
+        || await Branch.findOne({ restaurant: r._id, isActive: true }).sort({ createdAt: 1 }).select('_id').lean();
+    return main ? String(main._id) : null;
+}
+
+/**
+ * `opts.branchId` — the branch the client selected (admin switcher), used
+ * only for unpinned staff; see effectiveOperationsBranch.
+ */
+const buildAuthResponse = async (user, { branchId: selectedBranch = null } = {}) => {
     const payload = buildUserPayload(user);
 
     if (!user?.restaurant) return payload;
 
     try {
         const r = await Restaurant.findById(user.restaurant)
-            .select('name slug status subscription featureOverrides addons operations')
+            .select('name slug status subscription featureOverrides addons operations operationsByBranch')
             .lean();
         if (!r) return payload;
+        const opsBranch = await effectiveOperationsBranch(user, r, selectedBranch);
 
         payload.tenant = {
             _id: r._id,
@@ -474,8 +504,10 @@ const buildAuthResponse = async (user) => {
             limits: r.subscription?.limits || {},
             featureOverrides: r.featureOverrides || {},
             // HOW the tenant runs (roles in use, order flow, payment
-            // timing), already intersected with plan access.
-            operations: resolveOperations(r, { branchId: user.branch || null }),
+            // timing), already intersected with plan access, resolved for
+            // the staff member's effective branch (§12.1).
+            operations: resolveOperations(r, { branchId: opsBranch }),
+            operationsBranch: opsBranch,
         };
     } catch (err) {
         logger.warn('buildAuthResponse: failed to load tenant for user ' + user._id + ': ' + err.message);
@@ -841,9 +873,12 @@ exports.getMe = async (req, res) => {
         const tenantLock = await assertTenantNotLocked(user);
         if (tenantLock) return res.status(tenantLock.status).json(tenantLock.body);
 
+        // Admin branch switcher: an unpinned staff member may ask for the
+        // operations profile of the branch they are viewing (§12.1).
+        const selectedBranch = req.headers['x-branch-id'] || req.query?.branch || null;
         return res.status(200).json({
             success: true,
-            user: await buildAuthResponse(user),
+            user: await buildAuthResponse(user, { branchId: typeof selectedBranch === 'string' ? selectedBranch : null }),
         });
     } catch (err) {
         logger.error('GetMe error:', { error: err.message });

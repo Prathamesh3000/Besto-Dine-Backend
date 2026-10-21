@@ -21,6 +21,8 @@
 // tenant id, and the server auto-joins sockets from their authenticated
 // identity so clients can't pick rooms for another tenant.
 
+const { guestAccessMatches } = require('./guestAccess');
+
 const OBJECT_ID_RE = /^[a-f0-9]{24}$/i;
 const ROOM_ROLES = ['admin', 'waiter', 'kitchen', 'captain', 'manager'];
 const STAFF_ROLES = new Set(['admin', 'manager', 'captain', 'waiter', 'chef']);
@@ -148,8 +150,12 @@ function roleMayListen(socketRole, roomRole) {
  * @param {object} data  socket.data ({ userId, role, restaurant, branchId, scan })
  * @param {string} room
  * @param {object} deps  { getBranchTenant(branchId) → Promise<rid|null>,
- *                         findOrder(orderId) → Promise<{user,table,scanSessionId,restaurant,branch}|null>,
+ *                         findOrder(orderId) → Promise<{user,table,scanSessionId,guestAccess,restaurant,branch}|null>,
  *                         warn?(msg, meta) }
+ *
+ * `data.guestAccess` (the raw token a token-mode guest sent with the join,
+ * utils/guestAccess.js) opens exactly the `order:<id>` room of the order
+ * it was issued for, while it is valid.
  * @returns {Promise<boolean>}
  */
 async function canJoinWith(data, room, deps = {}) {
@@ -232,6 +238,8 @@ async function canJoinWith(data, room, deps = {}) {
         ) {
             return true;
         }
+        // Table-less guest counter order (token mode): its own access token.
+        if (data.guestAccess && guestAccessMatches(order, data.guestAccess)) return true;
         return false;
     }
 

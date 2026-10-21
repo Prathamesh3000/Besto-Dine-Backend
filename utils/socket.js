@@ -288,12 +288,15 @@ function guardServer(server) {
 async function findOrderForJoin(orderId) {
     const Order = require('../models/order');
     return Order.findOne({ orderId: String(orderId) })
-        .select('user table scanSessionId restaurant branch')
+        .select('user table scanSessionId guestAccess restaurant branch')
         .lean();
 }
 
-async function canJoin(socket, room) {
-    return canJoinWith(socket.data, room, {
+// `guestAccess`: the raw guest access token a token-mode guest sent with
+// the join (`{ room, guestAccess }`); it opens only that order's room.
+async function canJoin(socket, room, guestAccess = null) {
+    const data = guestAccess ? { ...socket.data, guestAccess } : socket.data;
+    return canJoinWith(data, room, {
         getBranchTenant,
         findOrder: findOrderForJoin,
         warn: (msg, meta) => logger.warn(msg, meta),
@@ -564,9 +567,16 @@ exports.init = (server, allowedOrigins) => {
 
         // Clients may still ask for per-resource rooms (order:<id>,
         // table:<id>, t:<rid>:menu, explicit tenant rooms for admins).
-        socket.on('join', async (room) => {
+        // A join is the room name, or `{ room, guestAccess }` for a
+        // table-less guest order (utils/guestAccess.js).
+        socket.on('join', async (payload) => {
             try {
-                if (await canJoin(socket, room)) socket.join(room);
+                const room = typeof payload === 'string' ? payload : payload?.room;
+                if (typeof room !== 'string' || !room) return;
+                const guestAccess = payload && typeof payload === 'object' && typeof payload.guestAccess === 'string'
+                    ? payload.guestAccess
+                    : null;
+                if (await canJoin(socket, room, guestAccess)) socket.join(room);
             } catch (err) {
                 logger.warn('Socket join failed:', err.message);
             }

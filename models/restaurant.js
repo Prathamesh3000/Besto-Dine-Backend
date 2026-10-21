@@ -298,6 +298,22 @@ const restaurantSchema = new mongoose.Schema({
     // allows (featureAccess stays the "may" layer).
     operations: { type: Object, default: undefined },
 
+    // Per-branch operations overrides (design §12.1). `overrides` is a
+    // PARTIAL stored profile (same shape as `operations`: preset /
+    // modules / answers / advanced) deep-merged over the tenant profile
+    // by utils/operationsProfile.resolveOperations(r, { branchId }).
+    // No entry for a branch → the tenant profile, exactly as before.
+    // Written only by the Super Admin (operationsController).
+    operationsByBranch: {
+        type: [{
+            _id: false,
+            branch:    { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', required: true },
+            overrides: { type: mongoose.Schema.Types.Mixed, default: {} },
+            updatedAt: { type: Date },
+        }],
+        default: [],
+    },
+
     // ─── Phase 7.3 — Custom domains ────────────────────────────────────
     // Optional vanity hostname (e.g. order.joescafe.com). When the
     // frontend's origin matches this domain, attachTenant resolves the

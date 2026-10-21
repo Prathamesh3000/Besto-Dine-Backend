@@ -19,7 +19,9 @@ const { resolveLoyaltySettings } = require('../utils/paymentDefaults');
 const { httpError, reply } = require('./orderErrors');
 const { emitOrderEvent, runAfterResponse } = require('./orderHelpers');
 const { orderAccessForCaller } = require('./orderAccess');
-const { notifyCounterPaymentRequested, notifyPaymentConfirmed } = require('./orderNotifications');
+const {
+  notifyCounterPaymentRequested, notifyPaymentConfirmed, emitOrderEventWithPolicy, customerOpsFor,
+} = require('./orderNotifications');
 
 // updateOrderStatus: an order just became Paid and has an owner — award
 // loyalty points, write the points + payment ledger rows and send the
@@ -517,10 +519,15 @@ async function finalizeCustomerPaidOrder(req, updatedOrder, tf) {
     await notifyPaymentConfirmed({
       order: updatedOrder, restaurant: updatedOrder.restaurant, earnedPoints, includePointsRow: false,
     });
-    emitOrderEvent(
+    // Payment event: the customer rooms always hear it, but with the
+    // kitchen status collapsed when the branch has tracking off (§12.3).
+    // Tracking on (the default) → exactly the emitOrderEvent of before.
+    emitOrderEventWithPolicy(
       'order:updated',
       { orderId: updatedOrder.orderId, status: updatedOrder.status, paymentStatus: updatedOrder.paymentStatus },
-      updatedOrder
+      updatedOrder,
+      await customerOpsFor(updatedOrder),
+      undefined,
     );
   });
 }

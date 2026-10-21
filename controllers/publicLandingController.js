@@ -27,6 +27,7 @@ const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
 const { applyBranchPrice } = require('../utils/priceResolver');
 const { computeOpenNow, defaultOperatingHours, isValidTimeZone, DEFAULT_TZ } = require('../utils/openingHours');
 const { normalizeLandingPage, MAX_FEATURED_ITEMS } = require('../utils/landingPage');
+const { publicOperationsOf } = require('../utils/operationsProfile');
 
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,59}$/;
 const ITEM_SELECT = 'name description images basePrice finalPrice offerPercentage offerExpiryDate vegType branchPrices';
@@ -166,7 +167,7 @@ exports.getRestaurantLanding = async (req, res) => {
 
         // AUDIT-EXEMPT: public tenant resolution by URL slug — this IS the tenant lookup.
         const restaurant = await Restaurant.findOne({ slug })
-            .select('name slug city logo status timezone contactPhone address branding.primaryColor subscription.features featureOverrides addons')
+            .select('name slug city logo status timezone contactPhone address branding.primaryColor subscription.features featureOverrides addons operations operationsByBranch')
             .lean();
         if (!restaurant) {
             return notFound(res, 'RESTAURANT_NOT_FOUND', 'Restaurant not found');
@@ -208,6 +209,13 @@ exports.getRestaurantLanding = async (req, res) => {
             landing.accentColor = restaurant.branding.primaryColor;
         }
         const features = publicFeaturesOf(restaurant);
+        // How the restaurant runs (customer-safe subset, design §12): the
+        // plain /<slug> link needs it to spot token-number mode before any
+        // branch bootstrap. Resolved for the branch in the URL, else Main,
+        // so a per-branch override (§12.1) is honoured. A tenant without a
+        // profile gets the defaults — the same values the app assumes.
+        const mainBranch = branches.find((b) => b.slug === 'main') || null;
+        const operations = publicOperationsOf(restaurant, { branchId: (branch || mainBranch)?._id || null });
 
         const contact = {
             phone: str(branch?.contactPhone || general.contactNumber || restaurant.contactPhone),
@@ -276,6 +284,7 @@ exports.getRestaurantLanding = async (req, res) => {
                     branches: [],
                     actions,
                     features,
+                    operations,
                 },
             });
         }
@@ -316,6 +325,7 @@ exports.getRestaurantLanding = async (req, res) => {
                 })),
                 actions,
                 features,
+                operations,
             },
         });
     } catch (err) {

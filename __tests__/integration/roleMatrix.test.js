@@ -363,6 +363,8 @@ const EXPECTED = [
     ['GET', '/superadmin/restaurants/:id/operations', SA_ANY],
     ['POST', '/superadmin/restaurants/:id/operations/preview', SA_FULL],
     ['PUT', '/superadmin/restaurants/:id/operations', SA_FULL],
+    ['PUT', '/superadmin/restaurants/:id/operations/branches/:branchId', SA_FULL],
+    ['DELETE', '/superadmin/restaurants/:id/operations/branches/:branchId', SA_FULL],
     ['POST', '/superadmin/restaurants/:id/backup', SA_FULL],
     ['GET', '/superadmin/restaurants/:id/backups', SA_ANY],
     ['GET', '/superadmin/restaurants/:id/backups/:filename', SA_ANY],

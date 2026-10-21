@@ -18,6 +18,28 @@ const {
   formatOrderDetail,
   formatMyOrder,
 } = require('./orderFormatters');
+const { resolveOperations } = require('../utils/operationsProfile');
+const { applyCustomerTrackingPolicy } = require('../utils/customerTrackingPolicy');
+const { guestAccessFromReq, guestAccessMatches } = require('../utils/guestAccess');
+
+// ─── Customer tracking policy (design §12.3) ─────────────────────────
+// Customer / guest / kiosk reads of an order go through
+// applyCustomerTrackingPolicy with the profile resolved for the order's
+// branch: tenants with `orderFlow.customerTracking:false` get a collapsed
+// status + `trackingDisabled:true` and no kitchen fields. Staff callers
+// and tenants with tracking on (the default) get the payload untouched.
+const STAFF_ROLES = new Set(['admin', 'manager', 'captain', 'waiter', 'chef', 'superadmin']);
+const isStaffCaller = (req) => Boolean(req.user && STAFF_ROLES.has(req.user.role));
+
+function customerOpsFor(req, order) {
+  try {
+    const branch = order && order.branch ? (order.branch._id || order.branch) : null;
+    return resolveOperations(req.restaurant || null, { branchId: branch });
+  } catch {
+    return null;        // a broken profile never hides an order — fail open
+  }
+}
+const forCustomer = (req, order, payload) => applyCustomerTrackingPolicy(payload, customerOpsFor(req, order));
 
 // ─── Kiosk order tracking ────────────────────────────────────────────
 // Lightweight, polling-friendly endpoint that returns just the fields
@@ -28,6 +50,40 @@ const {
 //
 // Returns 404 (not 401/403) on token failures so a guessed orderId
 // can't be confirmed via timing.
+//
+// A token-mode GUEST counter order (no table, no scan session) may poll
+// the same endpoint with its guest access token (X-Guest-Access /
+// ?guestAccess=, utils/guestAccess.js) instead of a kiosk token; the
+// order is looked up in the request's tenant and the same slim view is
+// returned. Every failure is the same 404.
+function trackingView(order) {
+  return {
+    orderId: order.orderId,
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    type: order.type,
+    total: order.total,
+    pickupLocation: order.pickupLocation,
+    tokenNumber: order.tokenNumber || null,
+    createdAt: order.createdAt,
+    preparationStartedAt: order.preparationStartedAt || null,
+    preparationCompletedAt: order.preparationCompletedAt || null,
+    cancelledAt: order.cancelledAt || null,
+  };
+}
+
+async function trackGuestAccessOrder(req, orderId, guestToken) {
+  const requestTenant = tenantId(req);
+  if (!requestTenant) {
+    throw httpError(404, { success: false, message: 'Order not found' });
+  }
+  const order = await Order.findOne({ orderId, restaurant: requestTenant }).lean();
+  if (!order || !guestAccessMatches(order, guestToken)) {
+    throw httpError(404, { success: false, message: 'Order not found' });
+  }
+  return reply(200, { success: true, order: forCustomer(req, order, trackingView(order)) });
+}
+
 async function trackKioskOrder(req) {
   const { orderId } = req.params;
   if (!orderId) {
@@ -37,6 +93,8 @@ async function trackKioskOrder(req) {
   const rawHeader = req.headers['x-kiosk-token'] || req.headers['authorization'] || '';
   const token = String(rawHeader).replace(/^Bearer\s+/i, '').trim();
   if (!token) {
+    const guestToken = guestAccessFromReq(req);
+    if (guestToken) return trackGuestAccessOrder(req, orderId, guestToken);
     throw httpError(404, { success: false, message: 'Order not found' });
   }
 
@@ -73,21 +131,7 @@ async function trackKioskOrder(req) {
     throw httpError(404, { success: false, message: 'Order not found' });
   }
 
-  return reply(200, {
-    success: true,
-    order: {
-      orderId: order.orderId,
-      status: order.status,
-      paymentStatus: order.paymentStatus,
-      type: order.type,
-      total: order.total,
-      pickupLocation: order.pickupLocation,
-      createdAt: order.createdAt,
-      preparationStartedAt: order.preparationStartedAt || null,
-      preparationCompletedAt: order.preparationCompletedAt || null,
-      cancelledAt: order.cancelledAt || null,
-    },
-  });
+  return reply(200, { success: true, order: forCustomer(req, order, trackingView(order)) });
 }
 
 async function getLiveOrders(req) {
@@ -379,7 +423,7 @@ async function getRefunds(req) {
 
   const [orders, total] = await Promise.all([
     Order.find(finalQuery)
-      .select('orderId status paymentStatus paymentMethod total amountPaid refundedAmount razorpayPaymentId customerName phone type user branch createdAt updatedAt note')
+      .select('orderId status paymentStatus paymentMethod total amountPaid refundedAmount razorpayPaymentId customerName phone type user branch tokenNumber createdAt updatedAt note')
       .populate('user', 'name email mobile')
       .populate('branch', 'name slug')
       .sort({ updatedAt: -1 })
@@ -505,6 +549,9 @@ async function getActiveOrdersListByTable(req) {
     .sort({ createdAt: 1 })
     .lean();
 
+  if (isGuestOrCustomer) {
+    return reply(200, { success: true, orders: orders.map((o) => forCustomer(req, o, o)) });
+  }
   return reply(200, { success: true, orders });
 }
 
@@ -570,7 +617,7 @@ async function getActiveOrderByTable(req) {
     throw httpError(403, { success: false, message: 'Not authorized to view this order' });
   }
 
-  return reply(200, { success: true, order });
+  return reply(200, { success: true, order: isGuestOrCustomer ? forCustomer(req, order, order) : order });
 }
 
 // Get single order by ID (for customer tracking)
@@ -613,6 +660,11 @@ async function getOrderById(req) {
   //      whose sessionId matches the order's `scanSessionId` stamped
   //      at creation. Mirrors the socket-room CRIT-12 gate, so HTTP
   //      and WebSocket access rules agree.
+  //   4. Guest of a token-mode counter order (no table, no scan
+  //      session) — must present the order's own guest access token
+  //      (X-Guest-Access / ?guestAccess=, issued once by createOrder,
+  //      24 h; utils/guestAccess.js). The socket room accepts the same
+  //      token.
   //
   // Orders created before CRIT-12 shipped have `scanSessionId = null`
   // and are therefore unreachable to the guest path — the privacy-safe
@@ -664,12 +716,21 @@ async function getOrderById(req) {
     }
   }
 
+  // Fallback — guest access token of a table-less counter order. Only an
+  // order that was issued one can be opened this way, only with its own
+  // token, and only while it is valid (expired → denied like any other).
+  if (!authorized && !branchBlocked && order.guestAccess && order.guestAccess.tokenHash) {
+    const guestToken = guestAccessFromReq(req);
+    if (guestToken && guestAccessMatches(order, guestToken)) authorized = true;
+  }
+
   if (!authorized) {
     logger.warn('getOrderById: unauthorized access blocked', {
       orderId: order.orderId,
       callerRole: caller?.role || 'guest',
       callerId: caller?.id || null,
       hasScanToken: Boolean(req.headers['x-scan-token']),
+      hasGuestAccess: Boolean(guestAccessFromReq(req)),
     });
     // 404 (not 403) so the response doesn't confirm existence of an
     // order whose id the caller guessed. Matches the socket-room gate
@@ -679,7 +740,9 @@ async function getOrderById(req) {
 
   const formatted = formatOrderDetail(order);
 
-  return reply(200, { success: true, order: formatted });
+  // Staff see the real kitchen status; customers / guests get the
+  // tracking policy of the order's branch (§12.3).
+  return reply(200, { success: true, order: isStaffCaller(req) ? formatted : forCustomer(req, order, formatted) });
 }
 
 // Get orders for the logged-in customer
@@ -706,7 +769,9 @@ async function getMyOrders(req) {
     Order.countDocuments(scope)
   ]);
 
-  const formattedOrders = orders.map(formatMyOrder);
+  // Per order, not per request: a customer's history can span branches
+  // and §12.1 lets a branch override the tenant profile.
+  const formattedOrders = orders.map((o) => forCustomer(req, o, formatMyOrder(o)));
 
   return reply(200, { success: true, orders: formattedOrders, pagination: { page, limit, total: totalCount, pages: Math.ceil(totalCount / limit) } });
 }

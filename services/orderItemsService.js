@@ -33,6 +33,21 @@ const {
 const { scanSessionFromReq, orderAccessForCaller } = require('./orderAccess');
 const pricing = require('./orderPricingService');
 const { notifyCounterOrderReady } = require('./orderNotifications');
+const { nextTokenNumber, tokenModeFor, tablesDisabledError } = require('../utils/orderToken');
+
+// Token-number mode (operations profile tables.useTables:false, design
+// §12.2): a repeat that creates a NEW dine-in order gets a token like
+// createOrder does. One token per repeat call — the counter and kitchen
+// docs of a mixed repeat share it — allocated lazily so a repeat that
+// only appends to an open order consumes no number.
+function tokenAllocator(req, sourceOrder, tokenMode) {
+  let pending = null;
+  return () => {
+    if (!tokenMode || sourceOrder.type !== 'dine-in') return Promise.resolve(undefined);
+    if (!pending) pending = nextTokenNumber(tenantId(req), sourceOrder.branch || null, new Date());
+    return pending;
+  };
+}
 
 // Persist a counter-side Order document for the bottled / packaged /
 // no-prep portion of a cart. Saved with status='ready' from the start
@@ -57,6 +72,7 @@ async function persistCounterSideOrder({
   paymentMethod,
   note,
   bare = false,
+  tokenNumber,
 }) {
   if (!Array.isArray(items) || items.length === 0) return null;
   const counterOrderIdValue = type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
@@ -68,6 +84,8 @@ async function persistCounterSideOrder({
       user: user || null,
       type,
       table: tableId || null,
+      // Token-number mode: a table-less dine-in repeat is collected by token.
+      tokenNumber: tokenNumber || undefined,
       customerName: customerName || 'Guest',
       phone: phone || '',
       items,
@@ -164,8 +182,11 @@ function assertCanRepeat(req, sourceOrder) {
 // A dine-in order must have a table (createOrder's TABLE_REQUIRED rule).
 // A past bill detached from its table (a later party ordered there) can't
 // spawn a table-less "ghost" dine-in order. Kiosk "Eat Here" orders are
-// table-less by design.
-function assertRepeatHasTable(sourceOrder, tableId) {
+// table-less by design, and so is every dine-in order of a restaurant in
+// token-number mode (`tokenMode`; a token order itself carries
+// tokenNumber) — those are collected by token, not at a table.
+function assertRepeatHasTable(sourceOrder, tableId, tokenMode = false) {
+  if (tokenMode || sourceOrder.tokenNumber) return;
   if (sourceOrder.type === 'dine-in' && !tableId && sourceOrder.source !== 'kiosk') {
     throw httpError(400, {
       success: false,
@@ -214,11 +235,17 @@ async function repeatOrderItem(req) {
   const itemToRepeat = sourceOrder.items.id(itemId);
   if (!itemToRepeat) throw httpError(404, { success: false, message: 'Item not found in order' });
 
+  // Token-number mode: no tables — a new order from this repeat is a
+  // table-less token order, whatever table the source may once have had.
+  const tokenMode = tokenModeFor(req);
+  const repeatTable = tokenMode && sourceOrder.type === 'dine-in' ? null : sourceOrder.table;
+  const tokenFor = tokenAllocator(req, sourceOrder, tokenMode);
+
   // A repeat is a new order on the source table — refuse it once the
   // admin has deleted / disabled that table, or when the bill was
   // detached from its table (TABLE_REQUIRED).
-  assertRepeatHasTable(sourceOrder, sourceOrder.table);
-  if (sourceOrder.type === 'dine-in' && sourceOrder.table) {
+  assertRepeatHasTable(sourceOrder, repeatTable, tokenMode);
+  if (sourceOrder.type === 'dine-in' && repeatTable) {
     const srcTable = await Table.findOne({ _id: sourceOrder.table, ...tenantFilter(req) })
       .select('isDeleted isActive status').lean();
     const unavailable = tableUnavailableError(srcTable);
@@ -254,7 +281,8 @@ async function repeatOrderItem(req) {
     const counterDoc = await persistCounterSideOrder({
       req,
       type: sourceOrder.type,
-      tableId: sourceOrder.table,
+      tableId: repeatTable,
+      tokenNumber: await tokenFor(),
       branchId: sourceOrder.branch,
       user: sourceOrder.user,
       customerName: sourceOrder.customerName,
@@ -344,7 +372,8 @@ async function repeatOrderItem(req) {
     restaurant: tenantId(req),
     user: sourceOrder.user,
     type: sourceOrder.type,
-    table: sourceOrder.table,
+    table: repeatTable,
+    tokenNumber: await tokenFor(),
     customerName: sourceOrder.customerName,
     phone: sourceOrder.phone,
     items: [itemForKitchen],
@@ -403,7 +432,14 @@ async function loadRepeatSource(req, tf) {
 }
 
 // Resolve the table (and branch) the repeat should land on + capacity.
-async function resolveRepeatTarget(req, sourceOrder, tf, targetTableId) {
+async function resolveRepeatTarget(req, sourceOrder, tf, targetTableId, tokenMode = false) {
+  // Token-number mode: there are no tables to land on. A target table is
+  // a stale client (400 TABLES_DISABLED); otherwise the repeat is a
+  // table-less token order — no table availability / seat checks.
+  if (tokenMode && sourceOrder.type === 'dine-in') {
+    if (targetTableId) throw httpError(400, tablesDisabledError());
+    return { resolvedTargetTable: null, resolvedTargetBranch: sourceOrder.branch };
+  }
   // Resolve the table the new order should land on. For dine-in:
   // prefer the customer's current table; resolve merge-leader so the
   // unique-active-order-per-table index targets the canonical group
@@ -492,13 +528,14 @@ function buildRepeatItems(sourceOrder, selections) {
 }
 
 // Counter side of a repeat — always a fresh ready order.
-async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf, bare = false }) {
+async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf, bare = false, tokenFor }) {
   let counterSideOrder = null;
   if (repeatCounter.length > 0) {
     counterSideOrder = await persistCounterSideOrder({
       req,
       type: sourceOrder.type,
       tableId: sourceOrder.type === 'dine-in' ? resolvedTargetTable : null,
+      tokenNumber: tokenFor ? await tokenFor() : undefined,
       branchId: resolvedTargetBranch,
       user: sourceOrder.user,
       customerName: sourceOrder.customerName,
@@ -643,7 +680,7 @@ async function appendRepeatToActiveOrder(req, { target, sourceOrder, repeatKitch
 }
 
 // Kitchen side: create a fresh order for the repeated items.
-async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf }) {
+async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf, tokenFor }) {
   // Source closed and no active order on the target table → create a fresh kitchen-side order.
   const newOrderId = sourceOrder.type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
   const newOrder = new Order({
@@ -653,6 +690,7 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
     user: sourceOrder.user,
     type: sourceOrder.type,
     table: resolvedTargetTable,
+    tokenNumber: tokenFor ? await tokenFor() : undefined,
     customerName: sourceOrder.customerName,
     phone: sourceOrder.phone,
     items: repeatKitchen,
@@ -731,7 +769,11 @@ async function repeatOrderAllItems(req) {
   // "✓ Paid" instead of the freshly-placed "Pay Bill" button.
   const { selections, targetTableId } = req.body || {};
 
-  const { resolvedTargetTable, resolvedTargetBranch } = await resolveRepeatTarget(req, sourceOrder, tf, targetTableId);
+  // Token-number mode: no target table; a new order from this repeat is
+  // a token order (one token shared by its counter / kitchen docs).
+  const tokenMode = tokenModeFor(req);
+  const tokenFor = tokenAllocator(req, sourceOrder, tokenMode);
+  const { resolvedTargetTable, resolvedTargetBranch } = await resolveRepeatTarget(req, sourceOrder, tf, targetTableId, tokenMode);
   const itemsToCopy = buildRepeatItems(sourceOrder, selections);
 
   // Mixed-cart split — partition the repeated items into counter
@@ -757,7 +799,7 @@ async function repeatOrderAllItems(req) {
   // counter doc at its bare subtotal, kitchen doc carries the tax lines.
   const counterBare = repeatKitchen.length > 0 && !kitchenTarget;
   const counterSideOrder = await persistRepeatCounterSide(req, {
-    sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf, bare: counterBare,
+    sourceOrder, repeatCounter, resolvedTargetTable, resolvedTargetBranch, tf, bare: counterBare, tokenFor,
   });
 
   // Counter-only repeat → done. Skip the kitchen-side append/create
@@ -782,7 +824,7 @@ async function repeatOrderAllItems(req) {
     return appendRepeatToActiveOrder(req, { target: kitchenTarget, sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder });
   }
 
-  return createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf });
+  return createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf, tokenFor });
 }
 
 // ── Append items (waiter / captain) ─────────────────────────────────

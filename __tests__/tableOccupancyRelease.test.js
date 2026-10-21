@@ -145,6 +145,13 @@ describe('releaseTableIfSettled', () => {
 
     test('takeaway / no table / unknown table → no-op', async () => {
         expect(await releaseTableIfSettled({ _id: 'o1', table: null }, { restaurant: R })).toEqual({ freedIds: [], repointedTo: null });
+        // Token-number mode: a dine-in order with a token and no table
+        // touches no table at all (no lookup, no update, no emit).
+        const token = { _id: 'o2', type: 'dine-in', tokenNumber: 'T-007', restaurant: R, status: 'served', paymentStatus: 'Paid' };
+        expect(await releaseTableIfSettled(token, { restaurant: R })).toEqual({ freedIds: [], repointedTo: null });
+        expect(mockTableFindOne).not.toHaveBeenCalled();
+        expect(mockTableUpdateMany).not.toHaveBeenCalled();
+        expect(mockEmitToStaff).not.toHaveBeenCalled();
         expect(await releaseTableIfSettled(null)).toEqual({ freedIds: [], repointedTo: null });
         mockTableFindOne.mockResolvedValue(null);
         expect(await releaseTableIfSettled({ _id: 'o1', table: 'gone' }, { restaurant: R })).toEqual({ freedIds: [], repointedTo: null });

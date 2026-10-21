@@ -415,8 +415,17 @@ function broadcastPaymentEvent(order, title, description) {
             paymentStatus: order.paymentStatus
         };
         emitToStaff(io, branchId, EVENTS.ORDER_UPDATED, { ...payload, restaurant });
-        if (order.user) io.to(String(order.user)).emit(EVENTS.ORDER_UPDATED, payload);
-        if (order.orderId) io.to(`order:${order.orderId}`).emit(EVENTS.ORDER_UPDATED, payload);
+        // Customer rooms: a payment event always reaches them, but with the
+        // kitchen status collapsed when the order's branch has customer
+        // tracking off (§12.3). Tracking on (the default) → the same
+        // payload as before. The profile read is async and best-effort.
+        const { customerOpsFor } = require('../services/orderNotifications');
+        const { customerEventPayload } = require('../utils/customerTrackingPolicy');
+        customerOpsFor(order).then((ops) => {
+            const customerPayload = customerEventPayload(payload, ops);
+            if (order.user) io.to(String(order.user)).emit(EVENTS.ORDER_UPDATED, customerPayload);
+            if (order.orderId) io.to(`order:${order.orderId}`).emit(EVENTS.ORDER_UPDATED, customerPayload);
+        }).catch((err) => logger.warn('Socket.io customer broadcast failed:', { error: err?.message }));
     } catch (socketError) {
         logger.warn('Socket.io broadcast failed:', { error: socketError.message });
     }

@@ -41,9 +41,9 @@ const STRANGER = '64b000000000000000000002';
 
 const scanToken = (payload, opts = { expiresIn: '1h' }) =>
     jwt.sign({ typ: 'scan', restaurantId: TENANT, tableId: 't1', ...payload }, SECRET, opts);
-const req = ({ user = null, token, query } = {}) => ({
+const req = ({ user = null, token, query, guestAccess } = {}) => ({
     user,
-    headers: token ? { 'x-scan-token': token } : {},
+    headers: { ...(token ? { 'x-scan-token': token } : {}), ...(guestAccess ? { 'x-guest-access': guestAccess } : {}) },
     query: query || {},
 });
 const ownedOrder = { user: OWNER, restaurant: TENANT, scanSessionId: 'sess-1' };
@@ -93,6 +93,42 @@ describe('orderAccessForCaller matrix', () => {
         const cust = { _id: STRANGER, role: 'customer' };
         expect(orderAccessForCaller(req({ user: cust }), guestOrder).allowed).toBe(false);
         expect(orderAccessForCaller(req({ user: cust, token: scanToken({ sessionId: 'sess-1' }) }), guestOrder).allowed).toBe(true);
+    });
+
+    describe('guest access token (token-mode counter order, no scan session)', () => {
+        const { issueGuestAccess } = require('../utils/guestAccess');
+        const issued = issueGuestAccess();
+        const counterOrder = {
+            user: null, restaurant: TENANT, scanSessionId: null,
+            guestAccess: { tokenHash: issued.tokenHash, expiresAt: issued.expiresAt },
+        };
+
+        test("the order's own token (header or query) allows the guest; a logged-in customer holding it too", () => {
+            expect(orderAccessForCaller(req({ guestAccess: issued.token }), counterOrder)).toEqual({ allowed: true, isStaff: false });
+            expect(orderAccessForCaller(req({ query: { guestAccess: issued.token } }), counterOrder).allowed).toBe(true);
+            expect(orderAccessForCaller(req({ user: { _id: STRANGER, role: 'customer' }, guestAccess: issued.token }), counterOrder).allowed).toBe(true);
+        });
+
+        test("no token → SCAN_TOKEN_REQUIRED as before; another order's token → GUEST_ACCESS_INVALID; expired → GUEST_ACCESS_EXPIRED", () => {
+            expect(orderAccessForCaller(req(), counterOrder)).toEqual({ allowed: false, isStaff: false, reason: 'SCAN_TOKEN_REQUIRED' });
+            const other = issueGuestAccess();
+            expect(orderAccessForCaller(req({ guestAccess: other.token }), counterOrder))
+                .toEqual({ allowed: false, isStaff: false, reason: 'GUEST_ACCESS_INVALID' });
+            const expired = { ...counterOrder, guestAccess: { tokenHash: issued.tokenHash, expiresAt: new Date(Date.now() - 1000) } };
+            expect(orderAccessForCaller(req({ guestAccess: issued.token }), expired))
+                .toEqual({ allowed: false, isStaff: false, reason: 'GUEST_ACCESS_EXPIRED' });
+        });
+
+        test('a guest access token never unlocks an owned order or a table order without one', () => {
+            expect(orderAccessForCaller(req({ guestAccess: issued.token }), ownedOrder).allowed).toBe(false);
+            expect(orderAccessForCaller(req({ guestAccess: issued.token }), guestOrder))
+                .toEqual({ allowed: false, isStaff: false, reason: 'SCAN_TOKEN_REQUIRED' });
+        });
+
+        test('a scan token still works on a table order that also carries guest access; a bad guest token does not block it', () => {
+            const both = { ...guestOrder, guestAccess: counterOrder.guestAccess };
+            expect(orderAccessForCaller(req({ token: scanToken({ sessionId: 'sess-1' }), guestAccess: 'A'.repeat(32) }), both).allowed).toBe(true);
+        });
     });
 
     test('a token with no restaurantId is accepted on session match alone (legacy tokens)', () => {

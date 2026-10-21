@@ -86,11 +86,29 @@ const orderSchema = new mongoose.Schema({
   phone: { type: String },
   table: { type: mongoose.Schema.Types.ObjectId, ref: 'Table' },
 
+  // Token-number mode (operations profile tables.useTables:false,
+  // OPERATIONS_CONTROL_PANEL_DESIGN.md §12.2): a dine-in order placed
+  // without a table carries the per-branch, per-day token the customer
+  // collects by ("T-042"; utils/orderToken.js). Unset for every order
+  // with a table and for takeaway / kiosk orders (they keep their ids).
+  tokenNumber: { type: String, default: undefined },
+
   // CRIT-12 — per-QR-scan session id copied from the guest's scanToken
   // at order create time. The socket `order:<id>` room gate compares
   // this against the diner's current scanToken.sessionId so a new
   // scanToken at the same physical table cannot read past orders.
   scanSessionId: { type: String, default: null, index: true },
+
+  // Guest access for a table-less (token-mode) guest order: no scan
+  // session exists, so createOrder mints a random token, keeps only its
+  // SHA-256 here and returns the raw token once (utils/guestAccess.js).
+  // Presented back as X-Guest-Access / ?guestAccess= on detail / tracking
+  // / pay reads and the order socket room. Expires 24 h after creation.
+  // Unset for every other order.
+  guestAccess: {
+    tokenHash: { type: String, default: undefined },
+    expiresAt: { type: Date, default: undefined },
+  },
 
   // Takeaway-specific
   pickupTime: { type: String },  // e.g. "02:30 PM"
@@ -399,6 +417,13 @@ orderSchema.index({ razorpayOrderIds: 1 }, { sparse: true });
 orderSchema.index(
     { restaurant: 1, table: 1, status: 1 },
     { name: 'orders_by_table_status' }
+);
+
+// Token-number mode: "which order is token T-042 today?" (token board /
+// counter lookup). Partial — only table-less token orders carry the field.
+orderSchema.index(
+    { restaurant: 1, tokenNumber: 1, createdAt: -1 },
+    { name: 'orders_by_token', partialFilterExpression: { tokenNumber: { $type: 'string' } } }
 );
 
 // Idempotency: per-tenant uniqueness on the client-supplied key. Sparse
