@@ -35,6 +35,12 @@ const createReservation = async (req, res) => {
             }
         }
 
+        // Operations profile: token-number mode (tables.useTables:false) —
+        // there are no table numbers to hold a reservation on.
+        if (require('../utils/orderToken').tokenModeFor(req)) {
+            return res.status(400).json(require('../utils/orderToken').tablesDisabledError());
+        }
+
         // Check if table exists (scoped to tenant)
         const tf = tenantFilter(req);
         const table = await Table.findOne({ _id: selectedTable, ...tf });

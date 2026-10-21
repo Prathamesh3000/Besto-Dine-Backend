@@ -245,6 +245,10 @@ async function liveSeatsOfOtherParties(groupIds, tf) {
 //     ordered yet; see seatsOfOtherParties) → the table stays occupied
 //     and nothing is emitted.
 //
+// An order without a table — takeaway, kiosk, or a token-number-mode
+// dine-in order (operations profile tables.useTables:false, carries
+// `tokenNumber`) — is a no-op: nothing is read or written.
+//
 // `orderOrTableId` is an order (doc or lean object carrying `table`) or a
 // table id. `tenantFilterObj` scopes every query; when empty, the
 // restaurant from opts / the order is used instead (webhooks and

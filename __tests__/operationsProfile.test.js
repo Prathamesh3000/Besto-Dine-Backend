@@ -146,8 +146,8 @@ describe('operationsProfile — modules drive the flow (design §0.3)', () => {
         expect(f.payment.dineIn).toBe('payAfter');
         expect(f.payment.holdUntilPaid).toBe(false);
         expect(f.payment.methods.counterCash).toBe(true);
-        // useTables:false (token numbers) is not implemented yet — stays on (B12 guard)
-        expect(f.tables.useTables).toBe(true);
+        // useTables:false = token-number mode (§12.2) flows through as answered
+        expect(f.tables.useTables).toBe(false);
     });
 
     test('advanced fine-tune wins over derived values', () => {
@@ -405,7 +405,7 @@ describe('operationsProfile — review fixes', () => {
 });
 
 describe('operationsProfile — ops-panel review fixes (B16, B12, B17)', () => {
-    const { USE_TABLES_UNSUPPORTED_WARNING, KOT_PRINTER_OPTIONS } = require('../utils/operationsProfile');
+    const { KOT_PRINTER_OPTIONS } = require('../utils/operationsProfile');
 
     test('B16: QR ordering off AND staff ordering off is rejected — nobody could order', () => {
         const p = normaliseProfile({ modules: { qrOrdering: false }, advanced: { 'orderFlow.staffOrder': false } });
@@ -416,20 +416,25 @@ describe('operationsProfile — ops-panel review fixes (B16, B12, B17)', () => {
         expect(validateProfile(normaliseProfile({ advanced: { 'orderFlow.staffOrder': false } })).errors).toEqual([]);
     });
 
-    test('B12: useTables:false is not supported yet → normalised to true with a warning, save still valid', () => {
+    test('B12 (lifted, §12.2): useTables:false is kept as answered — no coercion, no warning; it flows to resolved and public blobs', () => {
         const warnings = [];
         const p = normaliseProfile({ answers: { useTables: false } }, { warnings });
-        expect(p.answers.useTables).toBe(true);
-        expect(warnings).toEqual([USE_TABLES_UNSUPPORTED_WARNING]);
-        expect(warnings[0]).toMatch(/token-number mode is not available yet/);
-        expect(validateProfile(p).errors).toEqual([]);
-        expect(deriveFlow(p).tables.useTables).toBe(true);
-        // no collector → still normalised, no throw
-        expect(normaliseProfile({ answers: { useTables: false } }).answers.useTables).toBe(true);
-        // the kioskOnly preset (useTables:false) resolves with tables on
-        expect(resolveOperations(tenant(FULL_PLAN, { operations: profileFromPreset('kioskOnly') })).tables.useTables).toBe(true);
-        // a stored profile written before the rule (raw false) still resolves to tables on
-        expect(deriveFlow({ ...DEFAULT_PROFILE, answers: { ...DEFAULT_PROFILE.answers, useTables: false } }).tables.useTables).toBe(true);
+        expect(p.answers.useTables).toBe(false);
+        expect(warnings).toEqual([]);
+        const v = validateProfile(p);
+        expect(v.errors).toEqual([]);
+        expect(v.warnings.join(' ')).not.toMatch(/token-number/);
+        expect(deriveFlow(p).tables.useTables).toBe(false);
+        // the kioskOnly preset (useTables:false) now resolves with tables OFF
+        const r = resolveOperations(tenant(FULL_PLAN, { operations: profileFromPreset('kioskOnly') }));
+        expect(r.tables.useTables).toBe(false);
+        expect(publicOperationsOf(tenant(FULL_PLAN, { operations: profileFromPreset('kioskOnly') })).tables.useTables).toBe(false);
+        // null / unanswered = tables on (today); true stays true
+        expect(deriveFlow(normaliseProfile(null)).tables.useTables).toBe(true);
+        expect(deriveFlow(normaliseProfile({ answers: { useTables: true } })).tables.useTables).toBe(true);
+        // the fine-tune path exists too
+        expect(deriveFlow(normaliseProfile({ advanced: { 'tables.useTables': false } })).tables.useTables).toBe(false);
+        expect(require('../utils/operationsProfile').USE_TABLES_UNSUPPORTED_WARNING).toBeUndefined();
     });
 
     test('B17: printer question → answers.kotPrinter → printing.kotAt (informational, default = today)', () => {
@@ -488,5 +493,163 @@ describe('operationsProfile — orderIsPayFirst / payFirstOrderMatch (per-round 
         expect(payFirstOrderMatch(eitherOps)).toEqual({ paymentChannel: 'payFirst' });
         expect(payFirstOrderMatch(noProfileOps)).toEqual({ paymentChannel: 'payFirst' });
         expect(payFirstOrderMatch(null)).toEqual({ paymentChannel: 'payFirst' });
+    });
+});
+
+describe('operationsProfile — per-branch overrides (design §12.1)', () => {
+    const {
+        normaliseOverrides, mergeProfileOverrides, branchOverrideEntry, storedProfileFor,
+        profileFlow, requestBranchId, resolveOperationsForRequest, branchIdOf,
+    } = require('../utils/operationsProfile');
+    const A = '64b000000000000000000aaa';
+    const B = '64b000000000000000000bbb';
+    const withBranches = (operations, entries, features = FULL_PLAN) => tenant(features, {
+        operations,
+        operationsByBranch: entries.map(([branch, overrides]) => ({ branch, overrides, updatedAt: new Date('2026-10-19T00:00:00Z') })),
+    });
+
+    test('no override: resolving for a branch is byte-identical to the tenant resolve (today)', () => {
+        for (const ops of [undefined, null, profileFromPreset('cafeCounterPayFirst'), { modules: { chef: false } }]) {
+            const r = tenant(FULL_PLAN, ops === undefined ? {} : { operations: ops });
+            const plain = JSON.stringify(resolveOperations(r));
+            expect(JSON.stringify(resolveOperations(r, { branchId: A }))).toBe(plain);
+            expect(JSON.stringify(resolveOperations(r, A))).toBe(plain);
+            expect(JSON.stringify(resolveOperations({ ...r, operationsByBranch: [] }, { branchId: A }))).toBe(plain);
+            expect(JSON.stringify(publicOperationsOf(r, { branchId: A }))).toBe(JSON.stringify(publicOperationsOf(r)));
+            expect(JSON.stringify(profileFlow(r, { branchId: A }))).toBe(JSON.stringify(profileFlow(r)));
+        }
+        // an override for ANOTHER branch changes nothing for this one or for the tenant
+        const r = withBranches(null, [[B, { modules: { waiter: false, captain: false } }]]);
+        expect(resolveOperations(r, { branchId: A })).toEqual({ ...TODAY, version: 1, preset: 'fullService', modules: DEFAULT_PROFILE.modules, channels: { dineIn: true, takeaway: true, kiosk: true }, planBlocks: [] });
+        expect(resolveOperations(r)).toEqual(resolveOperations(r, { branchId: A }));
+    });
+
+    test('precedence: override > tenant > default, section by section', () => {
+        const tenantOps = { preset: 'custom', modules: { chef: false }, answers: { counterCash: true }, advanced: { 'customerApp.tips': false } };
+        const r = withBranches(tenantOps, [[B, {
+            modules: { waiter: false, captain: false },          // override wins
+            answers: { dineInPayment: 'payFirst' },              // added; counterCash stays from tenant
+            advanced: { 'payment.holdExpiryMinutes': 30 },       // added; tips:false stays from tenant
+        }]]);
+        const b = resolveOperations(r, { branchId: B });
+        expect(b.modules).toEqual({ qrOrdering: true, waiter: false, captain: false, chef: false, customerPayment: true });
+        expect(b.roles).toEqual({ waiter: false, captain: false, chef: false });
+        expect(b.payment.dineIn).toBe('payFirst');
+        expect(b.payment.methods.counterCash).toBe(true);          // tenant answer kept
+        expect(b.payment.holdExpiryMinutes).toBe(30);
+        expect(b.customerApp.tips).toBe(false);                    // tenant advanced kept
+        expect(b.preset).toBe('custom');
+        // the tenant itself is untouched
+        const t = resolveOperations(r);
+        expect(t.roles).toEqual({ waiter: true, captain: true, chef: false });
+        expect(t.payment.dineIn).toBe('payAfter');
+        // override preset replaces the tenant preset
+        expect(resolveOperations(withBranches(tenantOps, [[B, { preset: 'kioskOnly' }]]), B).preset).toBe('kioskOnly');
+        // null in an override answer means "back to derive"
+        const back = withBranches({ answers: { dineInPayment: 'payFirst', counterCash: true } }, [[B, { answers: { dineInPayment: null } }]]);
+        expect(resolveOperations(back).payment.dineIn).toBe('payFirst');
+        expect(resolveOperations(back, B).payment.dineIn).toBe('payAfter');
+    });
+
+    test('plan intersection still applies after the merge (an override cannot grant)', () => {
+        const r = withBranches({ modules: { waiter: false, captain: false } }, [[B, { modules: { waiter: true, captain: true } }]],
+            { ...FULL_PLAN, waiterDashboard: false });
+        const b = resolveOperations(r, B);
+        expect(b.modules.waiter).toBe(true);
+        expect(b.roles.waiter).toBe(false);
+        expect(b.planBlocks.map(x => x.module)).toEqual(expect.arrayContaining(['waiter', 'captain']));
+    });
+
+    test('normaliseOverrides keeps only keys of the profile shape; unknown keys and undefined are dropped', () => {
+        expect(normaliseOverrides({
+            preset: 'custom',
+            modules: { waiter: false, cashier: true, chef: undefined },
+            answers: { useTables: false, bogus: 1 },
+            advanced: { 'customerApp.tips': false, 'nope.nope': true },
+            version: 9, updatedAt: 'x', junk: { a: 1 },
+        })).toEqual({
+            preset: 'custom',
+            modules: { waiter: false },
+            answers: { useTables: false },
+            advanced: { 'customerApp.tips': false },
+        });
+        for (const bad of [null, undefined, 'x', 1, [], { junk: 1 }, { modules: 'no' }, { modules: {} }]) {
+            expect(normaliseOverrides(bad)).toEqual({});
+        }
+        // unknown override keys do not reach normaliseProfile, so a stray key never corrupts the branch
+        const r = withBranches(null, [[B, { modules: { waiter: false, captain: false }, junk: 1, answers: { bogus: true } }]]);
+        expect(resolveOperations(r, B).roles.waiter).toBe(false);
+        // an override with a WRONG TYPE is corrupt → that branch falls back to the tenant profile, never throws
+        const corrupt = withBranches({ modules: { chef: false } }, [[B, { modules: { waiter: 'yes' } }]]);
+        expect(resolveOperations(corrupt, B)).toEqual(resolveOperations(corrupt));
+        expect(resolveOperations(corrupt, B).roles.chef).toBe(false);
+    });
+
+    test('mergeProfileOverrides / storedProfileFor / branchOverrideEntry work on the stored shape', () => {
+        const stored = { preset: 'custom', modules: { chef: false }, answers: { counterCash: true }, updatedAt: 'stamp' };
+        expect(mergeProfileOverrides(stored, { modules: { waiter: false }, junk: 1 })).toEqual({
+            preset: 'custom', modules: { chef: false, waiter: false }, answers: { counterCash: true }, updatedAt: 'stamp',
+        });
+        expect(mergeProfileOverrides(stored, {})).toBe(stored);
+        expect(mergeProfileOverrides(null, {})).toBeNull();
+        expect(mergeProfileOverrides(null, { modules: { waiter: false } })).toEqual({ modules: { waiter: false } });
+        expect(mergeProfileOverrides(stored, { answers: { counterCash: null } }).answers).toEqual({ counterCash: null });
+
+        const r = withBranches(stored, [[B, { modules: { waiter: false } }]]);
+        expect(branchOverrideEntry(r, B).overrides).toEqual({ modules: { waiter: false } });
+        expect(branchOverrideEntry(r, { branchId: B })).toBeTruthy();
+        expect(branchOverrideEntry(r, { _id: B })).toBeTruthy();                    // populated branch doc
+        expect(branchOverrideEntry(r, A)).toBeNull();
+        expect(branchOverrideEntry(r, null)).toBeNull();
+        expect(branchOverrideEntry({ operations: stored }, B)).toBeNull();           // field not loaded → no override
+        expect(storedProfileFor(r, A)).toBe(stored);
+        expect(storedProfileFor(r, B).modules).toEqual({ chef: false, waiter: false });
+        // entries whose branch is a populated doc
+        const pop = { operations: null, operationsByBranch: [{ branch: { _id: B, name: 'Annex' }, overrides: { modules: { chef: false } } }] };
+        expect(resolveOperations(pop, B).roles.chef).toBe(false);
+    });
+
+    test('useTables passes through per branch (token mode for one branch only)', () => {
+        const r = withBranches(null, [[B, { answers: { useTables: false } }]]);
+        expect(resolveOperations(r).tables.useTables).toBe(true);
+        expect(resolveOperations(r, A).tables.useTables).toBe(true);
+        expect(resolveOperations(r, B).tables.useTables).toBe(false);
+        expect(publicOperationsOf(r, { branchId: B }).tables.useTables).toBe(false);
+        expect(profileFlow(r, { branchId: B }).tables.useTables).toBe(false);
+    });
+
+    test('branchIdOf / requestBranchId / resolveOperationsForRequest', () => {
+        expect(branchIdOf(null)).toBeNull();
+        expect(branchIdOf(undefined)).toBeNull();
+        expect(branchIdOf({})).toBeNull();
+        expect(branchIdOf({ branchId: null })).toBeNull();
+        expect(branchIdOf(B)).toBe(B);
+        expect(branchIdOf({ branchId: B })).toBe(B);
+        expect(branchIdOf({ _id: B, name: 'x' })).toBe(B);
+        expect(branchIdOf({ toHexString: () => B })).toBe(B);
+
+        expect(requestBranchId(null)).toBeNull();
+        expect(requestBranchId({})).toBeNull();
+        expect(requestBranchId({ branch: { _id: B }, query: { branch: A }, mainBranchId: A })).toBe(B);   // pinned wins
+        expect(requestBranchId({ branch: null, query: { branch: A }, mainBranchId: B })).toBe(A);         // ?branch next
+        expect(requestBranchId({ branch: null, query: { branch: 'all' }, mainBranchId: B })).toBe(B);     // keyword skipped → Main
+        expect(requestBranchId({ branch: null, query: {}, mainBranchId: null })).toBeNull();
+
+        const r = withBranches(null, [[B, { modules: { waiter: false, captain: false } }]]);
+        expect(resolveOperationsForRequest({ restaurant: r, branch: { _id: B } }).payment.dineIn).toBe('payFirst');
+        expect(resolveOperationsForRequest({ restaurant: r, branch: null, mainBranchId: A }).payment.dineIn).toBe('payAfter');
+        expect(resolveOperationsForRequest({ restaurant: r }).payment.dineIn).toBe('payAfter');
+        expect(resolveOperationsForRequest({})).toEqual(resolveOperations(null));
+        expect(resolveOperationsForRequest(null)).toEqual(resolveOperations(null));
+    });
+
+    test('resolve does not mutate the stored tenant profile or the override', () => {
+        const ops = profileFromPreset('cafeCounterPayFirst');
+        const ov = { modules: { chef: false } };
+        const r = withBranches(ops, [[B, ov]]);
+        const before = JSON.stringify([ops, ov]);
+        resolveOperations(r, B);
+        resolveOperations(r);
+        expect(JSON.stringify([ops, ov])).toBe(before);
     });
 });

@@ -34,6 +34,8 @@ const {
 const pricing = require('./orderPricingService');
 const { claimPayment, releaseClaim } = require('../utils/paymentClaim');
 const { buildCreateOrderNotificationTasks } = require('./orderNotifications');
+const { nextTokenNumber, isTokenMode, resolveRequestOps } = require('../utils/orderToken');
+const { issueGuestAccess } = require('../utils/guestAccess');
 
 // Channels we accept on createOrder. Kept narrow so a tampered client
 // can't claim arbitrary strings; anything outside this set is rejected
@@ -128,7 +130,10 @@ async function checkIdempotency(req, rawIdempotencyKey) {
 }
 
 // ── Phase: channel + request-shape validation ───────────────────────
-function validateOrderShape(req) {
+// `tokenMode` (operations profile tables.useTables:false, design §12.2):
+// the restaurant has no table numbers, so a dine-in order without a
+// table is the normal case and gets a token number instead.
+function validateOrderShape(req, { tokenMode = false } = {}) {
   const { type, tableId, items, total, pickupLocation, branch: legacyBranchParam, source: rawSource, delivery: deliveryReq } = req.body;
   // Resolve source. Trust an explicit valid value; otherwise infer
   // from the caller's identity so dashboards still get an accurate
@@ -244,7 +249,9 @@ function validateOrderShape(req) {
       message: 'Kiosk orders cannot be assigned to a table.',
     });
   }
-  if (type === 'dine-in' && !tableId && resolvedSource !== 'kiosk') {
+  // Token-number mode is the other exemption: no tables at all, the
+  // order is collected by token (utils/orderToken.js).
+  if (type === 'dine-in' && !tableId && resolvedSource !== 'kiosk' && !tokenMode) {
     throw httpError(400, {
       success: false,
       code: 'TABLE_REQUIRED',
@@ -255,7 +262,7 @@ function validateOrderShape(req) {
 }
 
 // ── Phase: customer / waiter attribution + dine-in role gate ────────
-function resolveAttribution(req) {
+function resolveAttribution(req, { tokenMode = false } = {}) {
   const { type, userId, tableId } = req.body;
   // Customer attribution.
   //
@@ -265,7 +272,14 @@ function resolveAttribution(req) {
   // guest orders stay unlinked.
   void userId;
   const validUserId = (req.user && req.user.role === 'customer' && req.user._id) ? req.user._id : null;
-  const validTableId = isValidObjectId(tableId) ? tableId : null;
+  let validTableId = isValidObjectId(tableId) ? tableId : null;
+  // Token-number mode: the restaurant has no tables, so a tableId a stale
+  // client still sends (an old table QR) is ignored — the order is a
+  // table-less token order like every other one here, never an error.
+  if (tokenMode && validTableId && type === 'dine-in') {
+    logger.info(`Token mode: ignoring tableId ${validTableId} on a dine-in order (tables.useTables is off)`);
+    validTableId = null;
+  }
   // Waiter attribution (drives tips routing + per-staff reports).
   //
   // Bug #17 — the body `waiterId` is ignored (it let any client route
@@ -353,9 +367,28 @@ function normaliseContactFields(req) {
 //
 // Returns the scan session id (CRIT-12 — stamped on the order for
 // socket-room gating) or null.
-function verifyDineInScan(req, { type, isKioskOrder, validTableId }) {
+function verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode = false }) {
   let scanSessionId = null;
-  const needsScanToken = (!req.user || req.user.role === 'customer') && type === 'dine-in' && !isKioskOrder;
+  const isCustomerCaller = !req.user || req.user.role === 'customer';
+  // Token-number mode: there is no table to prove — the customer came in
+  // through the branch's counter QR (no scan token) and collects by
+  // token. A scan token that IS present (an old table QR) still lends
+  // its session id so the guest can follow their order; a bad or
+  // mismatched one is simply ignored.
+  if (tokenMode && isCustomerCaller && type === 'dine-in' && !isKioskOrder) {
+    const scanToken = req.headers['x-scan-token'];
+    if (scanToken) {
+      try {
+        const decoded = verifyTypedToken(scanToken, TOKEN_TYPES.SCAN);
+        const currentTenant = tenantId(req);
+        if (!currentTenant || !decoded.restaurantId || String(decoded.restaurantId) === String(currentTenant)) {
+          scanSessionId = decoded.sessionId || null;
+        }
+      } catch { /* optional in token mode */ }
+    }
+    return scanSessionId;
+  }
+  const needsScanToken = isCustomerCaller && type === 'dine-in' && !isKioskOrder;
   if (needsScanToken) {
     if (!validTableId) {
       throw httpError(400, { success: false, message: 'Dine-in orders require a table.' });
@@ -484,7 +517,7 @@ async function resolvePricingBranch(req, type, resolvedTableId) {
 }
 
 // ── Phase: branch assignment + table availability / capacity ────────
-async function resolvePlacement(req, { type, resolvedTableId, scanSessionId, branchId, isKioskOrder, validWaiterId }) {
+async function resolvePlacement(req, { type, resolvedTableId, scanSessionId, branchId, isKioskOrder, validWaiterId, tokenMode = false }) {
   // Phase 6 step 4 — branch assignment rules.
   //
   //   dine-in : inherit from the table's branch (authoritative — the
@@ -565,6 +598,14 @@ async function resolvePlacement(req, { type, resolvedTableId, scanSessionId, bra
   // a table, so this only kicks in for the rare guest path.
   if (!inheritedBranchId && type === 'dine-in' && req.branch?._id && !req.user?.role?.match(/admin|waiter|captain|chef|manager/)) {
     inheritedBranchId = req.branch._id;
+  }
+  // Token-number mode (no table to inherit from): a staff counter order
+  // belongs to the branch the staff member is working at — their active
+  // branch (X-Branch-Id), else the tenant's main branch — so the token
+  // counter and the branch-pinned dashboards agree on where it is.
+  // Tenants with tables never reach this (a table is required above).
+  if (!inheritedBranchId && tokenMode && type === 'dine-in' && !resolvedTableId && !isKioskOrder) {
+    inheritedBranchId = req.branch?._id || req.mainBranchId || null;
   }
 
   // Kiosk fallback — a self-service kiosk is a physical device at a
@@ -1130,10 +1171,12 @@ async function occupyTableForNewOrder(req, savedOrder, type, resolvedTableId) {
 // `hold` is null (send to the kitchen as today) or the reason the order
 // must wait in 'awaiting-payment' until it is paid. Staff / POS orders
 // and kiosk orders are never held or blocked here.
-function resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid }) {
+// `ops` may be passed in when the caller already resolved the profile
+// (createOrder resolves it once, up front, for the token-mode decision);
+// otherwise it is resolved here for the caller's branch.
+function resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid, ops: knownOps = null }) {
   if (!req.restaurant) return { ops: null, hold: null };
-  const { resolveOperations } = require('../utils/operationsProfile');
-  const ops = resolveOperations(req.restaurant);
+  const ops = knownOps || resolveRequestOps(req);
   // Rules below only bite for a restaurant that has an operations
   // profile; every other tenant keeps today's behaviour exactly.
   const hasProfile = !!req.restaurant.operations;
@@ -1237,17 +1280,33 @@ async function createOrder(req) {
   const { clientIdempotencyKey, replay } = await checkIdempotency(req, rawIdempotencyKey);
   if (replay) return replay;
 
-  const { resolvedSource, resolvedPickupLocation, wantsDelivery, cleanDeliveryAddress } = validateOrderShape(req);
+  // How this restaurant runs (operations profile, resolved once for the
+  // caller's branch; null without a tenant). Token-number mode
+  // (tables.useTables:false, design §12.2) changes the dine-in table
+  // rules below; a tenant with tables — every tenant without a profile —
+  // takes exactly the path it always did.
+  const ops = req.restaurant ? resolveRequestOps(req) : null;
+  const tokenMode = !!req.restaurant?.operations && isTokenMode(ops);
+
+  const { resolvedSource, resolvedPickupLocation, wantsDelivery, cleanDeliveryAddress } = validateOrderShape(req, { tokenMode });
   // Shape / role gate for a staff discount up front (the ≤ total check
   // runs once the authoritative bill is known, below).
   resolveManualDiscount(req);
-  const attribution = resolveAttribution(req);
+  const attribution = resolveAttribution(req, { tokenMode });
   const { validUserId, validTableId } = attribution;
   const { cleanCustomerName, cleanPhone } = normaliseContactFields(req);
 
   const isKioskOrder = resolvedSource === 'kiosk';
-  const scanSessionId = verifyDineInScan(req, { type, isKioskOrder, validTableId });
+  const scanSessionId = verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode });
   const resolvedTableId = await resolveLeaderTable(req, type, validTableId);
+  // A table-less dine-in order in token mode: collected by token number.
+  const wantsToken = tokenMode && type === 'dine-in' && !isKioskOrder && !resolvedTableId;
+  // A GUEST counter order has no scan session to prove itself with later
+  // (no table was scanned), so it gets a one-off access token instead:
+  // the hash goes on the order, the raw token only into this response
+  // (utils/guestAccess.js). Logged-in customers own their orders and
+  // staff have their roles — neither needs one.
+  const guestAccess = wantsToken && !req.user && !scanSessionId ? issueGuestAccess() : null;
 
   // Generate Order ID — structured, human-readable.
   // Kiosk-originated orders get their own KSK prefix (regardless of
@@ -1314,12 +1373,12 @@ async function createOrder(req) {
   const prepaid = await verifyPrepaidCheckout(req, {
     orderId, validUserId, authoritativeTotal, authoritativeWalletPaid,
   });
-  const { ops, hold, paymentChannel } = resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid });
+  const { hold, paymentChannel } = resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid, ops });
 
   const enrichedItems = pricing.enrichCartItems(items, menuById);
 
   const { inheritedBranchId, resolvedAreaId, resolvedTableName, validWaiterId } = await resolvePlacement(req, {
-    type, resolvedTableId, scanSessionId, branchId, isKioskOrder, validWaiterId: attribution.validWaiterId,
+    type, resolvedTableId, scanSessionId, branchId, isKioskOrder, validWaiterId: attribution.validWaiterId, tokenMode,
   });
   await preflightStockCheck(req, enrichedItems, inheritedBranchId);
   await detachStalePaidBill(req, type, resolvedTableId, ops);
@@ -1337,6 +1396,23 @@ async function createOrder(req) {
   if (paymentChannel) {
     primaryDocData.paymentChannel = paymentChannel;
     if (counterDocData) counterDocData.paymentChannel = paymentChannel;
+  }
+  // Token-number mode: one token per visit — a mixed cart's two docs
+  // share it, so the customer collects everything under "T-042".
+  // Allocated before the write (a failed save skips a number, which is
+  // harmless); everything else about the order is unchanged — pay-first
+  // holds, kitchen work, notifications and KOTs all run as they would.
+  if (wantsToken) {
+    const tokenNumber = await nextTokenNumber(tenantId(req), inheritedBranchId || null, new Date());
+    primaryDocData.tokenNumber = tokenNumber;
+    if (counterDocData) counterDocData.tokenNumber = tokenNumber;
+    if (guestAccess) {
+      // One token per visit, like the token number: a mixed cart's two docs
+      // share it so the guest can follow both halves.
+      const stored = { tokenHash: guestAccess.tokenHash, expiresAt: guestAccess.expiresAt };
+      primaryDocData.guestAccess = stored;
+      if (counterDocData) counterDocData.guestAccess = { ...stored };
+    }
   }
   if (hold) holdOrderDocs([primaryDocData, counterDocData], { hold, ops });
   const held = !!hold;
@@ -1400,7 +1476,9 @@ async function createOrder(req) {
       await notifyCounterPaymentRequested(req, {
         order: savedOrder,
         payableTotal: Number(savedOrder.total || 0) + Number(counterSideOrder?.total || 0),
-        tableLabel: resolvedTableName ? `Table ${resolvedTableName}` : `Order ${savedOrder.orderId}`,
+        tableLabel: resolvedTableName
+          ? `Table ${resolvedTableName}`
+          : (savedOrder.tokenNumber ? `Token ${savedOrder.tokenNumber}` : `Order ${savedOrder.orderId}`),
         tableAreaName: null,
         responsibleWaiterId: null,
       });
@@ -1451,8 +1529,8 @@ async function createOrder(req) {
   if (!held && ops && req.restaurant?.operations && type === 'dine-in' && !isKioskOrder) {
     const { completesWithoutKitchen, completeWithoutKitchen } = require('./orderHoldService');
     if (completesWithoutKitchen(ops)) {
-      finalOrder = await completeWithoutKitchen(savedOrder);
-      if (counterSideOrder) finalSplit = await completeWithoutKitchen(counterSideOrder);
+      finalOrder = await completeWithoutKitchen(savedOrder, { ops });
+      if (counterSideOrder) finalSplit = await completeWithoutKitchen(counterSideOrder, { ops });
     }
   }
 
@@ -1471,6 +1549,11 @@ async function createOrder(req) {
     splitOrder: finalSplit || null,      // counter-side doc when cart was mixed
     isSplit: !!counterSideOrder,
     trackingToken,
+    // Guest counter order (token mode): the raw access token, this once.
+    // The order itself only carries its hash, so a retry / replay cannot
+    // recover it — the client stores it with the order id.
+    guestAccessToken: guestAccess ? guestAccess.token : undefined,
+    guestAccessExpiresAt: guestAccess ? guestAccess.expiresAt : undefined,
   }, postResponseTasks.map(([label, task]) => [`createOrder ${label}`, task]));
 }
 

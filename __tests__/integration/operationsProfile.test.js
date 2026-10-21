@@ -342,20 +342,25 @@ describe('review fixes — migration, useTables guard, printer question (A10, B1
         expect(again.written).toBe(0);
     });
 
-    test('B12: useTables:false saves with tables kept on and a warning in preview AND save', async () => {
+    test('B12 lifted (§12.2): useTables:false saves as answered, no warning, resolved and public blobs carry false', async () => {
         const body = { operations: { modules: { waiter: false, captain: false }, answers: { counterCash: true, useTables: false } } };
         const prev = await ctx.api.as(saFull).post(`${base()}/preview`).send(body);
         expect(prev.status).toBe(200);
         expect(prev.body.data.errors).toEqual([]);
-        expect(prev.body.data.warnings.join(' | ')).toMatch(/tables\.useTables: token-number mode is not available yet/);
-        expect(prev.body.data.profile.answers.useTables).toBe(true);
+        expect(prev.body.data.warnings.join(' | ')).not.toMatch(/token-number/);
+        expect(prev.body.data.profile.answers.useTables).toBe(false);
+        expect(prev.body.data.resolved.tables.useTables).toBe(false);
 
         const save = await ctx.api.as(saFull).put(base()).send(body);
         expect(save.status).toBe(200);
-        expect(save.body.data.warnings.join(' | ')).toMatch(/token-number mode is not available yet/);
+        expect(save.body.data.warnings.join(' | ')).not.toMatch(/token-number/);
         const stored = (await Restaurant.findById(T.restaurant._id).lean()).operations;
-        expect(stored.answers.useTables).toBe(true);
-        expect(save.body.data.resolved.tables.useTables).toBe(true);
+        expect(stored.answers.useTables).toBe(false);
+        expect(save.body.data.resolved.tables.useTables).toBe(false);
+        const boot = await ctx.api.anon().get(`/public/menu-bootstrap?slug=${T.slug}`);
+        expect(boot.body.data.restaurant.operations.tables.useTables).toBe(false);
+        const me = await ctx.api.as(T.users.admin, T).get('/auth/me');
+        expect(me.body.user.tenant.operations.tables.useTables).toBe(false);
     });
 
     test('B16: QR ordering off + staff ordering off is rejected on save', async () => {
@@ -374,7 +379,7 @@ describe('review fixes — migration, useTables guard, printer question (A10, B1
         expect(q.options.map((o) => o.value)).toEqual([null, 'kitchen', 'counter', 'none']);
         expect(cat.body.data.questions.map((x) => x.key)).toEqual(['dineInPayment', 'counterCash', 'kotPrinter', 'useTables']);
         const useTables = cat.body.data.questions.find((x) => x.key === 'useTables');
-        expect(useTables.options.find((o) => o.value === false).disabled).toBe(true);
+        expect(useTables.options.find((o) => o.value === false).disabled).toBeUndefined();
 
         const res = await ctx.api.as(saFull).put(base()).send({ operations: { answers: { kotPrinter: 'none' } } });
         expect(res.status).toBe(200);

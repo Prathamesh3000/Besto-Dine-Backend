@@ -336,7 +336,7 @@ const getTableByToken = async (req, res) => {
         const table = await Table.findOne({ qrToken }, null, { skipTenantScope: true })
             .select('+qrToken')
             .populate('area', 'name isActive')
-            .populate('restaurant', 'name slug status subscription featureOverrides addons operations logo branding')
+            .populate('restaurant', 'name slug status subscription featureOverrides addons operations operationsByBranch logo branding')
             .populate('branch', 'name slug displayLabel city addressLine1');
 
         // Soft-deleted tables keep their document (and qrToken) for
@@ -378,7 +378,7 @@ const getTableByToken = async (req, res) => {
             if (leaderLean && String(leaderLean._id) !== String(table._id)) {
                 const leaderDoc = await Table.findOne({ _id: leaderLean._id, restaurant: table.restaurant?._id || table.restaurant })
                     .populate('area', 'name isActive')
-                    .populate('restaurant', 'name slug status subscription featureOverrides addons operations logo branding')
+                    .populate('restaurant', 'name slug status subscription featureOverrides addons operations operationsByBranch logo branding')
                     .populate('branch', 'name slug displayLabel city addressLine1');
                 if (leaderDoc) effectiveTable = leaderDoc;
             }
@@ -470,8 +470,11 @@ const getTableByToken = async (req, res) => {
                 name: tableObj.restaurant.name,
                 slug: tableObj.restaurant.slug,
                 features: publicFeaturesOf(tableObj.restaurant),
+                // Resolved for the scanned table's branch (§12.1); a table
+                // with branch:null belongs to Main.
                 operations: publicOperationsOf(tableObj.restaurant, {
-                    branchId: tableObj.branch?._id || tableObj.branch || null,
+                    branchId: await require('./publicMenuBootstrapController')
+                        .operationsBranchFor(tableObj.restaurant, tableObj.branch?._id || tableObj.branch || null),
                 }),
                 // Customer-facing logo — Settings.general.logoUrl first,
                 // then Restaurant.logo as a last resort. ScanTable.jsx
@@ -784,6 +787,22 @@ const regenerateQrToken = async (req, res) => {
     }
 };
 
+// Operations profile: token-number mode (tables.useTables:false, design
+// §12.2) — the restaurant does not seat people at numbered tables, so the
+// table-only actions (assign a waiter, merge / unmerge, free, claim a
+// seat) answer 400 TABLES_DISABLED. Listing stays readable: the admin may
+// still look at the tables that were configured. Decided by
+// utils/orderToken.tokenModeFor — the same resolver (with the caller's
+// branch) the order path uses; tenants with tables are never affected.
+function tablesDisabled(req) {
+    const { tokenModeFor } = require('../utils/orderToken');
+    return tokenModeFor(req);
+}
+function tablesDisabledReply(res) {
+    const { tablesDisabledError } = require('../utils/orderToken');
+    return res.status(400).json(tablesDisabledError());
+}
+
 // Operations profile: table merging switched off (tables.mergeTables).
 function mergeDisabled(req) {
     if (!req.restaurant) return false;
@@ -803,6 +822,7 @@ const mergeTables = async (req, res) => {
     try {
         const { tableIds } = req.body;
 
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
         if (mergeDisabled(req)) return mergeDisabledReply(res);
 
         if (!tableIds || !Array.isArray(tableIds) || tableIds.length < 2) {
@@ -935,6 +955,7 @@ const unmergeTables = async (req, res) => {
         // We can accept a single tableId that is part of a merged group, and unmerge the entire group it belongs to
         const { tableId } = req.body;
 
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
         if (mergeDisabled(req)) return mergeDisabledReply(res);
 
         const table = await Table.findOne({ _id: tableId, ...tenantFilter(req) });
@@ -1015,6 +1036,8 @@ const assignWaiter = async (req, res) => {
     try {
         const { id } = req.params;
         const { waiterId } = req.body;
+
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
 
         const table = await Table.findOne({ _id: id, ...tenantFilter(req) }).populate('area', 'name');
         if (!table) {
@@ -1145,6 +1168,8 @@ const freeTable = async (req, res) => {
         // `?force=true` works as well as a JSON body.
         const force = req.body?.force === true || String(req.query.force || '').toLowerCase() === 'true';
 
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
+
         const table = await Table.findOne({ _id: id, ...tf }).select('_id status activeOrder branch restaurant');
         if (!table) {
             return res.status(404).json({ success: false, message: 'Table not found' });
@@ -1255,6 +1280,7 @@ const claimTable = async (req, res) => {
         if (req.user.role !== 'customer') {
             return res.status(403).json({ success: false, message: 'Only customers can claim a table.' });
         }
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
 
         const table = await Table.findOne({ _id: id, ...tenantFilter(req) });
         if (!table || table.isDeleted) {

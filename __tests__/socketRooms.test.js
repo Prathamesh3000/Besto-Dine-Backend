@@ -14,9 +14,14 @@ const BX = '999999999999999999999999'; // branch of T2
 const U1 = 'cccccccccccccccccccccccc';
 
 const branchTenants = { [B1]: T1, [B2]: T1, [BX]: T2 };
+const { issueGuestAccess } = require('../utils/guestAccess');
+const GA = issueGuestAccess();
 const orders = {
     'ORD-1': { restaurant: T1, branch: B1, user: U1, table: 'dddddddddddddddddddddddd', scanSessionId: 's1' },
     'ORD-2': { restaurant: T2, branch: BX, user: null, table: null, scanSessionId: null },
+    // token-mode guest counter order: no table, no scan session, a guest access token
+    'ORD-3': { restaurant: T1, branch: B1, user: null, table: null, scanSessionId: null, guestAccess: { tokenHash: GA.tokenHash, expiresAt: GA.expiresAt } },
+    'ORD-4': { restaurant: T1, branch: B1, user: null, table: null, scanSessionId: null, guestAccess: { tokenHash: GA.tokenHash, expiresAt: new Date(Date.now() - 1000) } },
 };
 const deps = {
     getBranchTenant: async (b) => branchTenants[b] || null,
@@ -134,6 +139,16 @@ describe('canJoinWith', () => {
         expect(await canJoinWith(adminT1, 'order:ORD-2', deps)).toBe(false);
         expect(await canJoinWith(waiterT2, 'order:ORD-1', deps)).toBe(false);
         expect(await canJoinWith(adminT1, 'order:NOPE', deps)).toBe(false);
+    });
+
+    test("order rooms: a token-mode guest joins with the order's guest access token only", async () => {
+        expect(await canJoinWith({ guestAccess: GA.token }, 'order:ORD-3', deps)).toBe(true);
+        expect(await canJoinWith({ restaurant: T1, guestAccess: GA.token }, 'order:ORD-3', deps)).toBe(true);
+        expect(await canJoinWith({ guestAccess: issueGuestAccess().token }, 'order:ORD-3', deps)).toBe(false);   // another order's token
+        expect(await canJoinWith({ guestAccess: GA.token }, 'order:ORD-4', deps)).toBe(false);                   // expired
+        expect(await canJoinWith({ guestAccess: GA.token }, 'order:ORD-1', deps)).toBe(false);                   // a table order
+        expect(await canJoinWith({}, 'order:ORD-3', deps)).toBe(false);                                           // no proof at all
+        expect(await canJoinWith(adminT1, 'order:ORD-3', deps)).toBe(true);                                       // staff unaffected
     });
 
     test('unknown shapes denied', async () => {

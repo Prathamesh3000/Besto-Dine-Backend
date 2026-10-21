@@ -25,6 +25,24 @@
  *
  * A restaurant with no `operations` (every tenant before this feature)
  * resolves to DEFAULT_PROFILE, which reproduces today's behaviour exactly.
+ *
+ * Per-branch overrides (design §12.1): restaurant.operationsByBranch is
+ * [{ branch, overrides, updatedAt }] where `overrides` is a PARTIAL stored
+ * profile (any of preset / modules / answers / advanced). resolveOperations
+ * (restaurant, { branchId }) deep-merges the branch's overrides over the
+ * tenant profile BEFORE normalise / validate / plan intersection. No
+ * branchId, or no entry for that branch → the tenant profile, byte for
+ * byte what the tenant-only resolver returned.
+ *
+ *   resolveOperations(restaurant, { branchId })       full resolved view
+ *   publicOperationsOf(restaurant, { branchId })      customer-safe subset
+ *   profileFlow(restaurant, { branchId })             flow without plan intersection
+ *   resolveOperationsForRequest(req)                  = resolveOperations(req.restaurant, { branchId: requestBranchId(req) })
+ *   requestBranchId(req)                              pinned / X-Branch-Id branch → ?branch → req.mainBranchId → null
+ *
+ * `branchId` may also be passed bare (string / ObjectId) instead of { branchId }.
+ * The restaurant document must be loaded WITH `operationsByBranch` (every
+ * select that lists `operations` should list it too) for overrides to apply.
  */
 
 const { hasFeature } = require('./featureAccess');
@@ -69,6 +87,7 @@ const ADVANCED_PATHS = {
     'customerApp.requestBill': 'boolean',
     'customerApp.appendToOrder': 'boolean',
     'customerApp.tips': 'boolean',
+    'tables.useTables': 'boolean',
     'tables.assignWaiters': 'boolean',
     'tables.mergeTables': 'boolean',
 };
@@ -83,11 +102,6 @@ const ALL_MODULES_ON = Object.freeze({
 const KOT_PRINTER_OPTIONS = ['kitchen', 'counter', 'none'];
 
 const EMPTY_ANSWERS = Object.freeze({ dineInPayment: null, counterCash: null, useTables: null, kotPrinter: null });
-
-// tables.useTables:false ("token numbers instead of tables") is offered
-// by the preset catalogue but the order path still requires a table, so a
-// profile asking for it is normalised back to true with this warning.
-const USE_TABLES_UNSUPPORTED_WARNING = 'tables.useTables: token-number mode is not available yet — table numbers stay on';
 
 /** Today's behaviour: every module in use, nothing answered, nothing fine-tuned. */
 const DEFAULT_PROFILE = Object.freeze({
@@ -162,9 +176,10 @@ function clampExpiry(n) {
  * typo in the Super Admin form cannot silently do nothing.
  *
  * `opts.warnings` (array) collects non-blocking adjustments made while
- * normalising (e.g. useTables:false → true, not supported yet) so the
- * save / preview response can show them.
+ * normalising so the save / preview response can show them (none are
+ * made today; the hook stays for callers).
  */
+// eslint-disable-next-line no-unused-vars
 function normaliseProfile(input, { warnings } = {}) {
     if (input == null) return clone(DEFAULT_PROFILE);
     if (!isPlainObject(input)) throw new OperationsProfileError(['operations must be an object']);
@@ -205,11 +220,6 @@ function normaliseProfile(input, { warnings } = {}) {
                     else answers[k] = v;
                 } else if (typeof v !== 'boolean') {
                     errors.push(`answers.${k} must be true or false`);
-                } else if (k === 'useTables' && v === false) {
-                    // Not implemented yet (orderCreateService still requires a
-                    // table): keep tables on, tell the Super Admin, save anyway.
-                    answers[k] = true;
-                    if (Array.isArray(warnings)) warnings.push(USE_TABLES_UNSUPPORTED_WARNING);
                 } else answers[k] = v;
             }
         }
@@ -294,10 +304,10 @@ function deriveFlow(profile) {
             tips: floorStaff,
         },
         tables: {
-            // Token-number mode (useTables:false) is not implemented yet —
-            // normaliseProfile already coerces it to true; this guards a
-            // stored profile written before that rule existed.
-            useTables: true,
+            // useTables:false = token-number mode (design §12.2): dine-in
+            // orders carry a token instead of a table. Flows through as
+            // answered; null = tables on (today).
+            useTables: a.useTables == null ? true : a.useTables,
             assignWaiters: floorStaff,
             mergeTables: true,
         },
@@ -345,9 +355,6 @@ function validateProfile(profile) {
     if (!flow.orderFlow.customerSelfOrder && !flow.orderFlow.staffOrder) {
         errors.push('orderFlow.staffOrder: staff ordering cannot be off while QR ordering is also off — nobody could place an order (turn on QR ordering or leave staff ordering on)');
     }
-    if (profile.answers?.useTables === false) {
-        warnings.push(USE_TABLES_UNSUPPORTED_WARNING);
-    }
     if (flow.customerApp.callWaiter && !floorStaff) {
         warnings.push('"Call waiter" is on but there is no waiter or captain to answer it');
     }
@@ -365,6 +372,110 @@ function validateProfile(profile) {
 
 // ─── resolve: stored profile × plan access ──────────────────────────────
 
+// ─── per-branch overrides (design §12.1) ────────────────────────────────
+
+const OVERRIDE_SECTIONS = { modules: MODULE_KEYS, answers: Object.keys(EMPTY_ANSWERS), advanced: Object.keys(ADVANCED_PATHS) };
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+
+/** `{ branchId }`, a bare id / ObjectId / populated branch doc, or nothing → id string or null. */
+function branchIdOf(opts) {
+    if (opts == null) return null;
+    if (typeof opts === 'object' && !(opts instanceof Date)) {
+        if ('branchId' in opts) return branchIdOf(opts.branchId);
+        if (typeof opts.toHexString === 'function') return opts.toHexString();
+        if (opts._id) return branchIdOf(opts._id);
+        return null;
+    }
+    const s = String(opts);
+    return s && s !== 'null' && s !== 'undefined' ? s : null;
+}
+
+/**
+ * Keep only the keys of a branch override that exist in the stored profile
+ * shape (preset, modules.<MODULE_KEYS>, answers.<EMPTY_ANSWERS>,
+ * advanced.<ADVANCED_PATHS>). Unknown keys and `undefined` values are
+ * dropped silently — a branch override is a sparse diff, not a form that
+ * needs typo protection; TYPES are still checked when the merged profile
+ * goes through normaliseProfile. Returns {} for nothing / not an object.
+ */
+function normaliseOverrides(partial) {
+    if (!isPlainObject(partial)) return {};
+    const out = {};
+    if (partial.preset !== undefined && partial.preset !== null) out.preset = partial.preset;
+    for (const [section, keys] of Object.entries(OVERRIDE_SECTIONS)) {
+        if (!isPlainObject(partial[section])) continue;
+        const kept = {};
+        for (const k of keys) {
+            if (partial[section][k] !== undefined) kept[k] = partial[section][k];
+        }
+        if (Object.keys(kept).length) out[section] = kept;
+    }
+    return out;
+}
+
+/** The stored override entry for a branch ({ branch, overrides, updatedAt }) or null. */
+function branchOverrideEntry(restaurant, branchId) {
+    const bid = branchIdOf(branchId);
+    const list = restaurant?.operationsByBranch;
+    if (!bid || !Array.isArray(list) || !list.length) return null;
+    const hit = list.find((e) => e && e.branch && String(e.branch._id || e.branch) === bid);
+    return hit || null;
+}
+
+/**
+ * Deep-merge a branch override over a STORED tenant profile — both in the
+ * stored shape, result in the stored shape, still un-normalised. Override
+ * keys win section by section (modules / answers / advanced are merged
+ * key-wise, preset replaced). `null` in an override answer means "back to
+ * derive" and wins too. Unknown override keys are dropped
+ * (normaliseOverrides).
+ */
+function mergeProfileOverrides(stored, overrides) {
+    const base = isPlainObject(stored) ? stored : {};
+    const ov = normaliseOverrides(overrides);
+    if (!Object.keys(ov).length) return stored == null ? null : base;
+    const out = { ...base };
+    if (ov.preset !== undefined) out.preset = ov.preset;
+    for (const section of Object.keys(OVERRIDE_SECTIONS)) {
+        if (!ov[section]) continue;
+        out[section] = { ...(isPlainObject(base[section]) ? base[section] : {}), ...ov[section] };
+    }
+    return out;
+}
+
+/**
+ * The stored-shape profile that applies to a branch: the tenant profile
+ * with that branch's overrides merged in, or the tenant profile itself
+ * when there is no override. Un-normalised.
+ */
+function storedProfileFor(restaurant, branchId) {
+    const entry = branchOverrideEntry(restaurant, branchId);
+    const tenant = restaurant?.operations ?? null;
+    if (!entry) return tenant;
+    return mergeProfileOverrides(tenant, entry.overrides);
+}
+
+/**
+ * Normalised profile for a branch with the never-break fallbacks: a bad
+ * merged profile falls back to the tenant profile, a bad tenant profile
+ * to DEFAULT_PROFILE (today's behaviour).
+ */
+function effectiveProfile(restaurant, branchId) {
+    const bid = branchIdOf(branchId);
+    if (bid && branchOverrideEntry(restaurant, bid)) {
+        try {
+            return normaliseProfile(storedProfileFor(restaurant, bid));
+        } catch { /* corrupt override → tenant profile */ }
+    }
+    try {
+        return normaliseProfile(restaurant?.operations);
+    } catch {
+        // A corrupt stored profile must never break login or ordering —
+        // fall back to today's behaviour.
+        return clone(DEFAULT_PROFILE);
+    }
+}
+
 /**
  * Fully-resolved operations view for a restaurant document (plain object
  * or Mongoose doc). The profile can only switch things OFF: every access
@@ -374,19 +485,12 @@ function validateProfile(profile) {
  * rules) come from the stored profile only, NOT from the plan — a tenant
  * whose plan lacks the waiter app today must keep today's flow.
  *
- * `branchId` is accepted for the later per-branch overrides (design §2.1);
- * it does nothing yet.
+ * `opts` = { branchId } (or a bare branch id): the branch's overrides from
+ * restaurant.operationsByBranch are merged over the tenant profile first
+ * (design §12.1). No branch / no override → the tenant profile.
  */
-// eslint-disable-next-line no-unused-vars
-function resolveOperations(restaurant, { branchId = null } = {}) {
-    let profile;
-    try {
-        profile = normaliseProfile(restaurant?.operations);
-    } catch {
-        // A corrupt stored profile must never break login or ordering —
-        // fall back to today's behaviour.
-        profile = clone(DEFAULT_PROFILE);
-    }
+function resolveOperations(restaurant, opts = {}) {
+    const profile = effectiveProfile(restaurant, branchIdOf(opts));
     const flow = deriveFlow(profile);
 
     const can = (key) => (restaurant ? hasFeature(restaurant, key) : true);
@@ -563,14 +667,33 @@ function diffImpact(before, after) {
  * tenants that never set a profile (e.g. creating a waiter account on a
  * plan without the waiter app stays allowed, as today).
  */
-function profileFlow(restaurant) {
-    let profile;
-    try {
-        profile = normaliseProfile(restaurant?.operations);
-    } catch {
-        profile = clone(DEFAULT_PROFILE);
-    }
-    return deriveFlow(profile);
+function profileFlow(restaurant, opts = {}) {
+    return deriveFlow(effectiveProfile(restaurant, branchIdOf(opts)));
+}
+
+// ─── request helpers (for controllers / services holding a req) ─────────
+
+/**
+ * The branch a staff / customer request acts for, as a string id or null:
+ *   1. req.branch (tenantContext: the staff member's pinned branch, or a
+ *      validated X-Branch-Id header)
+ *   2. ?branch=<id> (admin branch switcher; tenantContext already 404s a
+ *      foreign / unknown id; keywords like 'all' are skipped)
+ *   3. req.mainBranchId (records with branch:null belong to Main)
+ *   4. null → tenant profile
+ */
+function requestBranchId(req) {
+    if (!req) return null;
+    const pinned = branchIdOf(req.branch);
+    if (pinned) return pinned;
+    const q = req.query?.branch;
+    if (typeof q === 'string' && OBJECT_ID_RE.test(q)) return q;
+    return branchIdOf(req.mainBranchId);
+}
+
+/** resolveOperations(req.restaurant, { branchId: requestBranchId(req) }). */
+function resolveOperationsForRequest(req) {
+    return resolveOperations(req?.restaurant || null, { branchId: requestBranchId(req) });
 }
 
 /** Profile for a preset key (stored shape), ready to normalise / save. */
@@ -595,7 +718,6 @@ module.exports = {
     PRESETS,
     ADVANCED_PATHS,
     KOT_PRINTER_OPTIONS,
-    USE_TABLES_UNSUPPORTED_WARNING,
     DEFAULT_PROFILE,
     HOLD_EXPIRY_DEFAULT,
     OperationsProfileError,
@@ -610,4 +732,13 @@ module.exports = {
     getPath,
     orderIsPayFirst,
     payFirstOrderMatch,
+    // per-branch overrides (§12.1)
+    normaliseOverrides,
+    mergeProfileOverrides,
+    branchOverrideEntry,
+    storedProfileFor,
+    effectiveProfile,
+    branchIdOf,
+    requestBranchId,
+    resolveOperationsForRequest,
 };

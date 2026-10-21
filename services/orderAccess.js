@@ -8,6 +8,7 @@
 const mongoose = require('mongoose');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const { pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
+const { guestAccessFromReq, guestAccessState } = require('../utils/guestAccess');
 
 // ── Caller ↔ order access check (bugs #5 / #7) ──────────────────────
 // Used by customer-facing mutation endpoints that are mounted with
@@ -18,7 +19,12 @@ const { pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 //   • the logged-in owner (order.user === caller), or
 //   • holding an X-Scan-Token whose sessionId matches the order's
 //     scanSessionId — only for orders with NO owner (guest orders). A
-//     table-level match is not enough: two parties can share a table.
+//     table-level match is not enough: two parties can share a table, or
+//   • holding the order's own guest access token (X-Guest-Access /
+//     ?guestAccess=, utils/guestAccess.js) — the table-less counter order
+//     of token mode has no scan session, so createOrder issued this token
+//     instead. Same scope as the scan session: that one ownerless order,
+//     for 24 h.
 const ORDER_STAFF_ROLES = new Set(['admin', 'manager', 'captain', 'waiter', 'chef', 'superadmin']);
 function orderAccessForCaller(req, order) {
   const caller = req.user || null;
@@ -36,8 +42,17 @@ function orderAccessForCaller(req, order) {
     const owns = !!caller && String(order.user) === String(caller._id);
     return { allowed: owns, isStaff: false };
   }
-  // Ownerless (guest) order — must prove the same scan session.
+  // Ownerless (guest) order — must prove the same scan session, or hold
+  // the order's guest access token (token-mode counter order).
   const scanToken = req.headers['x-scan-token'];
+  const guestToken = guestAccessFromReq(req);
+  if (guestToken && order.guestAccess && order.guestAccess.tokenHash) {
+    const state = guestAccessState(order, guestToken);
+    if (state === 'ok') return { allowed: true, isStaff: false };
+    if (!scanToken) {
+      return { allowed: false, isStaff: false, reason: state === 'expired' ? 'GUEST_ACCESS_EXPIRED' : 'GUEST_ACCESS_INVALID' };
+    }
+  }
   if (!scanToken || !order.scanSessionId) {
     return { allowed: false, isStaff: false, reason: scanToken ? 'SCAN_SESSION_MISMATCH' : 'SCAN_TOKEN_REQUIRED' };
   }

@@ -38,6 +38,25 @@ const { buildAvailabilityFilter } = require('../utils/menuAvailability');
  * trimmed to a small subset (taxes, operatingHours, branding) — admin
  * sections like `wallet`, `notifications`, billing are excluded.
  */
+/**
+ * Branch whose operations profile a customer payload carries: the given
+ * branch, else the tenant's Main branch — looked up ONLY when the tenant
+ * has branch overrides (otherwise the answer cannot change the result and
+ * no override must cost nothing extra). Never throws.
+ */
+async function operationsBranchFor(restaurant, branchId) {
+    if (branchId) return branchId;
+    if (!Array.isArray(restaurant?.operationsByBranch) || !restaurant.operationsByBranch.length) return null;
+    try {
+        const main = await Branch.findOne({ restaurant: restaurant._id, isActive: true, slug: 'main' }).select('_id').lean()
+            || await Branch.findOne({ restaurant: restaurant._id, isActive: true }).sort({ createdAt: 1 }).select('_id').lean();
+        return main?._id || null;
+    } catch {
+        return null;
+    }
+}
+exports.operationsBranchFor = operationsBranchFor;
+
 exports.getMenuBootstrap = async (req, res) => {
     try {
         const slug = String(req.query.slug || '').trim().toLowerCase();
@@ -52,7 +71,7 @@ exports.getMenuBootstrap = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug,
             status: { $in: ['active', 'trial'] },
-        }).select('_id name slug city contactPhone logo branding subscription featureOverrides addons operations').lean();
+        }).select('_id name slug city contactPhone logo branding subscription featureOverrides addons operations operationsByBranch').lean();
 
         if (!restaurant) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
@@ -302,7 +321,11 @@ exports.getMenuBootstrap = async (req, res) => {
                     phone: restaurant.contactPhone || '',
                     logo: restaurant.logo || '',
                     features: publicFeaturesOf(restaurant),
-                    operations: publicOperationsOf(restaurant, { branchId: branch?._id || null }),
+                    // Resolved for the bootstrap branch (the picker's /
+                    // kiosk device's branch); no branch picked → Main when
+                    // the tenant has branch overrides, else the tenant
+                    // profile (§12.1).
+                    operations: publicOperationsOf(restaurant, { branchId: await operationsBranchFor(restaurant, branch?._id || null) }),
                 },
                 branch: branch ? {
                     _id: branch._id,

@@ -33,6 +33,9 @@ function formatLiveOrder(o) {
     table: o.table
       ? { _id: o.table._id, name: o.table.name, area: o.table.area, assignedWaiter: o.table.assignedWaiter || null }
       : null,
+    // Token-number mode (tables.useTables:false): the token a table-less
+    // dine-in order is collected by ("T-042"); null for every other order.
+    tokenNumber: o.tokenNumber || null,
     status: o.status,
     time: new Date(o.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
     user: o.customerName,
@@ -91,6 +94,7 @@ function formatPastOrder(o) {
     _id: o._id,
     id: o.orderId,
     table: o.table ? o.table.name : 'Takeaway',
+    tokenNumber: o.tokenNumber || null,
     status: o.status,
     time: new Date(o.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
     user: o.customerName,
@@ -138,6 +142,8 @@ function formatOrderDetail(order) {
     orderId: order.orderId,
     id: order.orderId,
     table: order.table ? order.table.name : 'Takeaway',
+    // Token-number mode: "Your token: T-042" on the confirmation / tracking page.
+    tokenNumber: order.tokenNumber || null,
     status: order.status,
     user: order.customerName,
     phone: order.phone,
@@ -242,6 +248,7 @@ function formatMyOrder(o) {
     _id: o._id,
     id: o.orderId,
     table: o.table ? o.table.name : 'Takeaway',
+    tokenNumber: o.tokenNumber || null,
     status: o.status,
     time: new Date(o.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
     user: o.customerName,
@@ -317,6 +324,8 @@ function formatKitchenOrder(o, now, mergedLabelFor) {
     id: o.orderId,
     tableId: tableLabel || 'TA',
     table: o.table ? { name: tableLabel, area: areaObj } : null,
+    // Token-number mode: the KDS card shows the token instead of a table.
+    tokenNumber: o.tokenNumber || null,
     status: o.status,
     time: new Date(o.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
     user: o.customerName,
@@ -405,6 +414,7 @@ function formatCompletedKitchenOrder(o) {
     customerName: o.customerName,
     tableName: o.table?.name || null,
     areaName: o.table?.area?.name || null,
+    tokenNumber: o.tokenNumber || null,
     itemCount: (o.items || []).reduce((s, it) => s + (Number(it.quantity) || 1), 0),
     items: (o.items || []).map((it) => ({ name: it.name, quantity: it.quantity })),
     createdAt: o.createdAt,

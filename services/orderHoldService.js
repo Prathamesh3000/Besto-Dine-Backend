@@ -24,15 +24,39 @@ const Order = require('../models/order');
 const Restaurant = require('../models/restaurant');
 const EVENTS = require('../realtime/events');
 const logger = require('../utils/logger');
+const { customerEventPayload, customerHearsTransition } = require('../utils/customerTrackingPolicy');
+
+// Customer rooms (owner + `order:<id>`) for a status change, shaped by the
+// branch's tracking policy (§12.3): with tracking off the kitchen status is
+// collapsed and the kitchen steps are skipped; tracking on (the default,
+// and every tenant without a profile) sends `payload` exactly as before.
+function emitToCustomerRooms(io, order, payload, ops, status) {
+    if (!customerHearsTransition(status) && ops && ops.orderFlow && ops.orderFlow.customerTracking === false) return;
+    const customerPayload = customerEventPayload(payload, ops);
+    io.to(`order:${order.orderId}`).emit(EVENTS.ORDER_UPDATED, customerPayload);
+    if (order.user) io.to(String(order.user)).emit(EVENTS.ORDER_UPDATED, customerPayload);
+}
 
 const HELD = 'awaiting-payment';
 
-async function loadOps(restaurantId) {
+/**
+ * Resolved operations profile for a tenant, loaded from the DB.
+ *
+ *   loadOps(restaurantId)                       tenant profile (as before)
+ *   loadOps(restaurantId, { branchId })         with that branch's overrides (§12.1)
+ *   loadOps(restaurantId, { branchId: order.branch })   the usual call for an order
+ *
+ * `branchId` may be an id, an ObjectId, a populated branch or null. No
+ * branch / no override → the tenant profile. Callers holding `req` should
+ * use operationsProfile.resolveOperationsForRequest(req) instead (no
+ * query — req.restaurant already carries the overrides).
+ */
+async function loadOps(restaurantId, { branchId = null } = {}) {
     const { resolveOperations } = require('../utils/operationsProfile');
     if (!restaurantId) return resolveOperations(null);
     const r = await Restaurant.findById(restaurantId)
-        .select('subscription featureOverrides addons operations').lean();
-    return resolveOperations(r);
+        .select('subscription featureOverrides addons operations operationsByBranch').lean();
+    return resolveOperations(r, { branchId });
 }
 
 /** No kitchen screen and nobody serving → an order is complete once released. */
@@ -52,9 +76,11 @@ async function deductStock(order) {
 
 /**
  * Mark an order complete without a kitchen screen or a serving step.
- * Atomic on the order still being open, so it never runs twice.
+ * Atomic on the order still being open, so it never runs twice. `ops` is
+ * the resolved profile when the caller has it (else loaded for the order's
+ * branch) — it decides what the customer rooms hear.
  */
-async function completeWithoutKitchen(order) {
+async function completeWithoutKitchen(order, { ops: knownOps } = {}) {
     const done = await Order.findOneAndUpdate(
         { _id: order._id, restaurant: order.restaurant, status: { $in: ['new', 'ready'] } },
         { $set: { status: 'served', servedAt: new Date() } },
@@ -78,8 +104,8 @@ async function completeWithoutKitchen(order) {
         const { getIO } = require('../utils/socket');
         const io = getIO();
         const payload = { orderId: done.orderId, status: 'served', restaurant: String(done.restaurant) };
-        io.to(`order:${done.orderId}`).emit(EVENTS.ORDER_UPDATED, payload);
-        if (done.user) io.to(String(done.user)).emit(EVENTS.ORDER_UPDATED, payload);
+        const ops = knownOps || await loadOps(done.restaurant, { branchId: done.branch || null });
+        emitToCustomerRooms(io, done, payload, ops, 'served');
     } catch { /* socket not critical */ }
     return done;
 }
@@ -102,8 +128,10 @@ async function runReleaseSideEffects(order, ops) {
             emitToKitchen(io, order.branch || null, EVENTS.ORDER_NEW, payload);
         }
         emitToAdmin(io, order.branch || null, EVENTS.ORDER_UPDATED, { ...payload, status: order.status });
-        io.to(`order:${order.orderId}`).emit(EVENTS.ORDER_UPDATED, { orderId: order.orderId, status: order.status });
-        if (order.user) io.to(String(order.user)).emit(EVENTS.ORDER_UPDATED, { orderId: order.orderId, status: order.status });
+        // The customer hears the release as a payment event ('new' →
+        // 'confirmed' with tracking off); a counter-only 'ready' release is
+        // a kitchen step they do not hear then.
+        emitToCustomerRooms(io, order, { orderId: order.orderId, status: order.status }, ops, order.status);
     } catch { /* socket not critical */ }
 
     // Thermal KOT — held orders were never printed.
@@ -141,10 +169,10 @@ async function releaseHeldOrder(orderOrId, { ops: knownOps } = {}) {
     );
     if (!released) return Order.findById(id);   // someone else released / cancelled it
 
-    const ops = knownOps || await loadOps(released.restaurant);
+    const ops = knownOps || await loadOps(released.restaurant, { branchId: released.branch || null });
     await runReleaseSideEffects(released, ops);
     let out = released;
-    if (completesWithoutKitchen(ops)) out = await completeWithoutKitchen(released);
+    if (completesWithoutKitchen(ops)) out = await completeWithoutKitchen(released, { ops });
 
     // The counter half of a mixed cart is released only once IT is paid
     // (an online checkout settles both; a wallet pay of the primary

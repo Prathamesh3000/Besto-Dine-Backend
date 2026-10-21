@@ -206,6 +206,10 @@ router.get('/operations/presets', opsCtrl.getPresets);
 router.get('/restaurants/:id/operations', validate([restaurantId]), opsCtrl.getRestaurantOperations);
 router.post('/restaurants/:id/operations/preview', superAdminFull, validate([restaurantId]), opsCtrl.previewRestaurantOperations);
 router.put('/restaurants/:id/operations', superAdminFull, validate([restaurantId]), opsCtrl.updateRestaurantOperations);
+// §12.1 — per-branch overrides: body { overrides, expectedUpdatedAt }; DELETE resets the branch to the tenant profile.
+const opsBranchId = objectIdParam('branchId', 'Invalid branch id');
+router.put('/restaurants/:id/operations/branches/:branchId', superAdminFull, validate([restaurantId, opsBranchId]), opsCtrl.updateBranchOperations);
+router.delete('/restaurants/:id/operations/branches/:branchId', superAdminFull, validate([restaurantId, opsBranchId]), opsCtrl.deleteBranchOperations);
 
 // Phase 7.2 — tenant backups (create / list / download / delete)
 router.post('/restaurants/:id/backup',              superAdminFull, validate([restaurantId]), backup.createBackup);

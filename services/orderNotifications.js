@@ -14,21 +14,72 @@
  * order:ready, order:updated, table:updated …) are still emitted directly.
  */
 const logger = require('../utils/logger');
-const { getIO, emitToKitchen, emitToWaiter, emitToAdmin } = require('../utils/socket');
+const { getIO, emitToKitchen, emitToWaiter, emitToAdmin, emitToStaff } = require('../utils/socket');
 const { tenantId } = require('../utils/tenantScope');
 const { notify } = require('./notificationService');
 const EVENTS = require('../realtime/events');
 const { summariseItems, newOrderAdminDescription, emitOrderEvent, emitStaffTable } = require('./orderHelpers');
+const { resolveOperations } = require('../utils/operationsProfile');
+const {
+  customerTrackingEnabled, customerEventPayload, customerHearsTransition,
+} = require('../utils/customerTrackingPolicy');
+
+// ── Customer tracking policy (design §12.3) ─────────────────────────
+// With `orderFlow.customerTracking:false` (chef module off) the customer
+// rooms — the owner's user room and `order:<id>` — hear only payment,
+// cancellation and completion; the kitchen steps (preparing / ready) and
+// their customer bell rows are skipped. Staff rooms and rows are untouched.
+//
+// Resolved profile for the order's restaurant + branch, or null (= tracking
+// on, today's behaviour) when there is no DB connection, no restaurant, or
+// the lookup fails. One small read per fan-out.
+async function customerOpsFor(order) {
+  const rid = order && order.restaurant ? (order.restaurant._id || order.restaurant) : null;
+  if (!rid) return null;
+  try {
+    if (require('mongoose').connection.readyState !== 1) return null;
+    const Restaurant = require('../models/restaurant');
+    const r = await Restaurant.findById(rid)
+      .select('subscription featureOverrides addons operations operationsByBranch')
+      .lean();
+    if (!r) return null;
+    const branchId = order.branch ? (order.branch._id || order.branch) : null;
+    return resolveOperations(r, { branchId });
+  } catch (err) {
+    logger.warn('customerOpsFor failed; treating customer tracking as on', { error: err?.message });
+    return null;
+  }
+}
+
+// emitOrderEvent split by audience. Tracking on → exactly emitOrderEvent.
+// Tracking off → staff rooms get the real payload; the customer rooms get
+// it only for transitions they still hear about (`status` undefined =
+// payment-only update), with the kitchen status collapsed.
+function emitOrderEventWithPolicy(event, payload, order, ops, status) {
+  if (customerTrackingEnabled(ops)) return emitOrderEvent(event, payload, order);
+  try {
+    const io = getIO();
+    emitToStaff(io, order && order.branch ? order.branch : null, event, payload);
+    if (!customerHearsTransition(status)) return;
+    const customerPayload = customerEventPayload(payload, ops);
+    if (order && order.user) io.to(String(order.user)).emit(event, customerPayload);
+    if (order && order.orderId) io.to(`order:${order.orderId}`).emit(event, customerPayload);
+  } catch { /* socket not critical */ }
+}
 
 // Counter-side (no-prep) order is ready: waiter bell row + order:ready to
 // the waiter room, the per-order guest room and the owner's room. Used by
-// createOrder's mixed-cart split and the repeat flows.
-function notifyCounterOrderReady(doc, hasTable) {
+// createOrder's mixed-cart split and the repeat flows. The customer rooms
+// are left out when the branch has customer tracking off (§12.3).
+async function notifyCounterOrderReady(doc, hasTable) {
+  const customerRooms = customerTrackingEnabled(await customerOpsFor(doc))
+    ? [`order:${doc.orderId}`, doc.user ? doc.user.toString() : null]
+    : [];
   return notify({
     restaurant: doc.restaurant,
     branch: doc.branch || null,
     audience: 'waiter',
-    rooms: [`order:${doc.orderId}`, doc.user ? doc.user.toString() : null],
+    rooms: customerRooms,
     event: EVENTS.ORDER_READY,
     payload: { orderId: doc.orderId },
     notification: {
@@ -140,10 +191,13 @@ function buildCreateOrderNotificationTasks({
         emitToKitchen(io, orderBranch, EVENTS.ORDER_NEW, orderPayload);
       } else {
         // Counter-only path: tell the waiter room directly + the
-        // per-order room so the customer's tracking page lights up.
+        // per-order room so the customer's tracking page lights up
+        // (customer rooms skipped when the branch has tracking off, §12.3).
         emitToWaiter(io, orderBranch, EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
-        io.to(`order:${savedOrder.orderId}`).emit(EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
-        if (savedOrder.user) io.to(savedOrder.user.toString()).emit(EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
+        if (customerTrackingEnabled(await customerOpsFor(savedOrder))) {
+          io.to(`order:${savedOrder.orderId}`).emit(EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
+          if (savedOrder.user) io.to(savedOrder.user.toString()).emit(EVENTS.ORDER_READY, { orderId: savedOrder.orderId });
+        }
       }
       // Admin / manager live lists (Admin OrdersDashboard) refetch on
       // order:new. Until 2026-10-12 only the kitchen and waiter rooms got
@@ -188,6 +242,14 @@ function buildCreateOrderNotificationTasks({
 
 // updateOrderStatus: per-transition waiter / customer notifications.
 async function notifyStatusTransition({ status, oldOrder, order }) {
+  // §12.3 — the customer's "Being Prepared" / "Ready" rows exist only
+  // where the customer tracking page is live. Looked up only when such a
+  // row would be written; served / cancelled rows below are unaffected.
+  const kitchenStep = (status === 'ready' && oldOrder.status !== 'ready')
+    || (status === 'preparing' && oldOrder.status !== 'preparing');
+  const customerSeesKitchen = !(kitchenStep && order.user)
+    || customerTrackingEnabled(await customerOpsFor(order));
+
   // Notify waiter when chef marks order as ready
   if (status === 'ready' && oldOrder.status !== 'ready') {
     await notify({
@@ -204,7 +266,7 @@ async function notifyStatusTransition({ status, oldOrder, order }) {
     });
 
     // Notify Customer - Order Ready
-    if (order.user) {
+    if (order.user && customerSeesKitchen) {
       await notify({
         restaurant: order.restaurant,
         recipients: [order.user],
@@ -222,7 +284,7 @@ async function notifyStatusTransition({ status, oldOrder, order }) {
   }
 
   // Notify Customer - Order Preparing
-  if (status === 'preparing' && oldOrder.status !== 'preparing' && order.user) {
+  if (status === 'preparing' && oldOrder.status !== 'preparing' && order.user && customerSeesKitchen) {
     await notify({
       restaurant: order.restaurant,
       recipients: [order.user],
@@ -275,19 +337,26 @@ async function notifyStatusTransition({ status, oldOrder, order }) {
 // updateOrderStatus: order:updated fan-out + the gated order-ready ping
 // (and the assigned waiter's personal notification).
 async function emitStatusUpdateEvents({ io, status, order, settings }) {
-  emitOrderEvent(
+  // §12.3 — null (tracking on) keeps today's fan-out exactly.
+  const ops = await customerOpsFor(order);
+  emitOrderEventWithPolicy(
     EVENTS.ORDER_UPDATED,
     { orderId: order.orderId, status: order.status, paymentStatus: order.paymentStatus },
-    order
+    order,
+    ops,
+    status
   );
 
   // Gate Order Ready notification with settings
   if (status === 'ready' && (!settings || settings.notifications?.orderReady !== false)) {
     emitToWaiter(io, order.branch, EVENTS.ORDER_READY, { orderId: order.orderId });
     // Also notify the order owner + per-order room so the customer
-    // tracking page lights up immediately.
-    if (order.user) io.to(String(order.user)).emit(EVENTS.ORDER_READY, { orderId: order.orderId });
-    io.to(`order:${order.orderId}`).emit(EVENTS.ORDER_READY, { orderId: order.orderId });
+    // tracking page lights up immediately — unless the branch has no
+    // customer tracking (§12.3), when the customer never hears "ready".
+    if (customerTrackingEnabled(ops)) {
+      if (order.user) io.to(String(order.user)).emit(EVENTS.ORDER_READY, { orderId: order.orderId });
+      io.to(`order:${order.orderId}`).emit(EVENTS.ORDER_READY, { orderId: order.orderId });
+    }
     // Also create a DB notification for the waiter if assigned
     if (order.waiter) {
       await notify({
@@ -384,10 +453,13 @@ async function notifyCounterPaymentRequested(req, { order, payableTotal, tableLa
     }
 
     // Refresh dashboards so the new flag renders without a manual reload.
-    emitOrderEvent(
+    // A payment event, so the customer rooms hear it even with tracking
+    // off — with the kitchen status collapsed (§12.3).
+    emitOrderEventWithPolicy(
       EVENTS.ORDER_UPDATED,
       { orderId: order.orderId, status: order.status, paymentStatus: order.paymentStatus, counterPaymentRequestedAt: order.counterPaymentRequestedAt },
-      order
+      order,
+      await customerOpsFor(order)
     );
   } catch (socketErr) {
     logger.warn('counter-payment notification fanout failed:', socketErr.message);
@@ -500,6 +572,8 @@ async function notifyPaymentConfirmed({ order, restaurant, earnedPoints, include
 }
 
 module.exports = {
+  customerOpsFor,
+  emitOrderEventWithPolicy,
   notifyCounterOrderReady,
   notifyCustomerCancellation,
   buildCreateOrderNotificationTasks,

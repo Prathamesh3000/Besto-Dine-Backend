@@ -442,7 +442,7 @@ describe('GET /orders/track/:orderId (kiosk)', () => {
         expect(res.status).toBe(200);
         expect(Object.keys(res.body.order).sort()).toEqual([
             'cancelledAt', 'createdAt', 'orderId', 'paymentStatus', 'pickupLocation', 'preparationCompletedAt',
-            'preparationStartedAt', 'status', 'total', 'type',
+            'preparationStartedAt', 'status', 'tokenNumber', 'total', 'type',
         ].filter((x) => x !== 'pickupLocation' || res.body.order.pickupLocation !== undefined).sort());
         expect(res.body.order.total).toBe(421.05);
         expectNoSecrets(res.body);
