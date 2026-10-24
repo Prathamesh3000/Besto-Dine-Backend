@@ -113,6 +113,20 @@ describe('renderKot', () => {
         expect(textLines(doc).every((l) => l.length <= 32)).toBe(true);
         expect(toPlainText(renderKot({ order: { ...order(), source: 'kiosk' }, items: [], station: 'kitchen', reason: 'create' }))).toContain('KIOSK');
     });
+
+    test('token-number mode: the token leads the KOT and the bill when there is no table', () => {
+        const o = { ...order(), tokenNumber: 'T-042', customerName: 'Asha' };
+        const kot = toPlainText(renderKot({ order: o, items: o.items, station: 'kitchen', tableLabel: null, reason: 'create', paperWidth: '80' }));
+        expect(kot).toContain('TOKEN T-042');
+        const bill = toPlainText(renderBill({ settings: { general: {} }, order: o, tableLabel: null, paperWidth: '80' }));
+        expect(bill).toContain('Token: T-042');
+        // With a table the table wins and no token line is added.
+        const withTable = toPlainText(renderKot({ order: o, items: o.items, station: 'kitchen', tableLabel: '5', reason: 'create', paperWidth: '80' }));
+        expect(withTable).toContain('Table 5');
+        expect(withTable).not.toContain('TOKEN T-042');
+        // No token on the order: output is unchanged.
+        expect(toPlainText(renderKot({ order: order(), items: order().items, station: 'kitchen', tableLabel: null, reason: 'create' }))).not.toContain('TOKEN');
+    });
 });
 
 describe('renderBill', () => {

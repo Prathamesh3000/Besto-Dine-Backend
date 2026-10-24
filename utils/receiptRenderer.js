@@ -151,6 +151,8 @@ function renderKot({ cafeName, order, items, station, tableLabel, reason, waiter
     lines.push(HR);
 
     pushRow(lines, order?.orderId || '', orderTypeLabel(order), w, { b: true });
+    // Token-number mode (tables off): the token is how staff call the order, so it leads the line.
+    if (!tableLabel && order?.tokenNumber) lines.push(L(center(`TOKEN ${text(order.tokenNumber)}`, w), 'c', { b: true, s: 2 }));
     const who = tableLabel ? `Table ${tableLabel}` : (order?.customerName ? text(order.customerName) : '');
     pushRow(lines, who, formatTime(reason === 'append' ? Date.now() : (order?.createdAt || Date.now()), timezone), w);
     lines.push(HR);
@@ -198,6 +200,7 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer }) {
     pushRow(lines, `Bill ${order?.orderId || ''}`, formatDateTime(order?.createdAt || Date.now(), timezone), w, { b: true });
     const typeLabel = orderTypeLabel(order);
     pushRow(lines, tableLabel ? `Table ${tableLabel}` : typeLabel, tableLabel ? typeLabel : '', w);
+    if (!tableLabel && order?.tokenNumber) pushRow(lines, `Token: ${text(order.tokenNumber)}`, '', w, { b: true });
     if (order?.customerName) pushRow(lines, `Customer: ${text(order.customerName)}`, '', w);
     lines.push(HR);
 
