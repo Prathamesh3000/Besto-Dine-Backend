@@ -633,3 +633,61 @@ describe('GET /orders/live ?floor and /orders/past ?dateRange presets', () => {
         else expect(res.body.orders.map((o) => o.id)).toContain(o1.orderId);
     });
 });
+
+describe('customer / guest payloads omit staff internals', () => {
+    const STRIPPED = ['reference', 'cashReceived', 'changeDue', 'failureReason', 'updatedBy',
+        'history', 'savedBy', 'reopenReason', 'reopenedBy', 'sentBy', 'kotRoundSeq'];
+    let table; let g1; let order;
+    beforeAll(async () => {
+        table = await createTable(A);
+        g1 = await scanTable(ctx.api, table);
+        order = await mkOrder(A, {
+            type: 'dine-in', table: table._id, status: 'served', scanSessionId: g1.sessionId, user: cust1._id,
+            kotRoundSeq: 2,
+            kots: [{ kotNo: 1, ticketNo: 1, sentBy: A.users.waiter._id, sentAt: new Date() }],
+            bill: {
+                status: 'final', billNo: 7, savedBy: A.users.waiter._id, reopenReason: 'typo', reopenedBy: A.users.captain._id,
+                history: [{ action: 'finalize', at: new Date(), by: A.users.waiter._id, total: 421 }],
+            },
+            payment: {
+                state: 'failed', method: 'online', amount: 421, reference: 'order_REF123', cashReceived: 500, changeDue: 79,
+                failureReason: 'card declined 10.0.0.1', updatedAt: new Date(), updatedBy: A.users.waiter._id,
+            },
+        });
+    });
+
+    const expectStripped = (body) => {
+        const keys = keysDeep(body);
+        for (const k of STRIPPED) expect({ key: k, present: keys.has(k) }).toEqual({ key: k, present: false });
+        expect(JSON.stringify(body)).not.toMatch(/order_REF123|card declined/);
+    };
+
+    test('guest and customer reads show none of the staff fields; staff still sees them', async () => {
+        const guest = await ctx.api.guest(A, g1.scanToken).get(`/orders/${order.orderId}/detail`);
+        expect(guest.status).toBe(200);
+        expectStripped(guest.body);
+        expect(guest.body.order.payment).toMatchObject({ state: 'failed' });
+
+        const cust = await ctx.api.as(cust1, A).get(`/orders/${order._id}/detail`);
+        expect(cust.status).toBe(200);
+        expectStripped(cust.body);
+
+        const mine = await ctx.api.as(cust1, A).get('/orders/my-orders');
+        expectStripped(mine.body);
+
+        const gActive = await ctx.api.guest(A, g1.scanToken).get(`/orders/active/table/${table._id}`);
+        expectStripped(gActive.body);
+        const gList = await ctx.api.guest(A, g1.scanToken).get(`/orders/active-list/table/${table._id}`);
+        expect(gList.body.orders).toHaveLength(1);
+        expectStripped(gList.body);
+
+        const staff = await ctx.api.as(A.users.waiter).get(`/orders/${order._id}/detail`);
+        expect(staff.status).toBe(200);
+        const sk = keysDeep(staff.body);
+        expect(sk.has('reference') || sk.has('failureReason') || sk.has('billNo')).toBe(true);
+        const staffActive = await ctx.api.as(A.users.waiter).get(`/orders/active-list/table/${table._id}`);
+        const skeys = keysDeep(staffActive.body);
+        expect(skeys.has('reference')).toBe(true);
+        expect(skeys.has('sentBy')).toBe(true);
+    });
+});

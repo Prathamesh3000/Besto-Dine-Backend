@@ -399,7 +399,7 @@ describe('deleted tables', () => {
         const { scanToken } = await scanTable(ctx.api, table);
 
         // The scan seats the guest; an occupied table must be freed first.
-        const free = await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true });
+        const free = await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true, reason: 'test reset' });
         expect(free.status).toBe(200);
 
         const del = await ctx.api.as(A.users.admin).delete(`/tables/${table._id}`);

@@ -169,6 +169,26 @@ exports.appendOrderItems = (req, res) => run(res, () => orderItemsService.append
   return res.status(500).json({ success: false, message: 'Failed to add items to order' });
 });
 
+// Bill workspace (Phase 3) — see services/orderBillService.js
+const orderBillService = require('../services/orderBillService');
+exports.saveBill = (req, res) => run(res, () => orderBillService.saveBill(req), (error) => {
+  logger.error('Save Bill Error:', { error: error.message });
+  return res.status(500).json({ success: false, message: 'Failed to save the bill' });
+});
+exports.reopenBill = (req, res) => run(res, () => orderBillService.reopenBill(req), (error) => {
+  logger.error('Reopen Bill Error:', { error: error.message });
+  return res.status(500).json({ success: false, message: 'Failed to reopen the bill' });
+});
+exports.previewBill = (req, res) => run(res, () => orderBillService.previewBill(req), (error) => {
+  logger.error('Bill Preview Error:', { error: error.message });
+  return res.status(500).json({ success: false, message: 'Failed to build the bill preview' });
+});
+
+exports.upiQr = (req, res) => run(res, () => orderBillService.upiQr(req), (error) => {
+  logger.error('UPI QR Error:', { error: error.message });
+  return res.status(500).json({ success: false, message: 'Failed to build the UPI QR' });
+});
+
 // Apply (or clear) a coupon on an existing active order
 exports.applyCouponToOrder = (req, res) => run(res, () => orderPaymentService.applyCouponToOrder(req), (error) => {
   logger.error('applyCouponToOrder error:', { error: error.message });
@@ -179,6 +199,12 @@ exports.applyCouponToOrder = (req, res) => run(res, () => orderPaymentService.ap
 exports.getOrderById = (req, res) => run(res, () => orderQueryService.getOrderById(req), (error) => {
   logger.error('Get Order By ID Error:', { error: error.message });
   res.status(500).json({ success: false, message: 'Failed to fetch order' });
+});
+
+// KOT rounds of an order (staff)
+exports.getOrderKots = (req, res) => run(res, () => orderQueryService.getOrderKots(req), (error) => {
+  logger.error('Get Order KOTs Error:', { error: error.message });
+  res.status(500).json({ success: false, message: 'Failed to fetch KOTs' });
 });
 
 // Orders for the logged-in customer

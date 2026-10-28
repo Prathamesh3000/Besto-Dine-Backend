@@ -4,6 +4,7 @@ const settingsController = require('../controllers/settingsController');
 const { optionalAuth, protect, adminOnly } = require('../middlewares/authMiddleware');
 const { body, param, isObjectIdLike } = require('../middlewares/validate');
 const { validationResult } = require('express-validator');
+const { normalizeVpa, normalizePayeeName } = require('../utils/upiQr');
 
 // BUGS_REPORT #33 — settings bodies are large nested objects whose field
 // rules (email/phone/GSTIN/delivery slabs, schema min/max) already live in
@@ -28,7 +29,7 @@ function handleSettingsValidation(req, res, next) {
 }
 const settingsValidate = (chains) => [...chains, handleSettingsValidation];
 
-const OBJECT_SECTIONS = ['general', 'taxes', 'notifications', 'reservation', 'delivery', 'wallet', 'landingPage', 'printers'];
+const OBJECT_SECTIONS = ['general', 'taxes', 'notifications', 'reservation', 'delivery', 'wallet', 'landingPage', 'printers', 'payments'];
 const ARRAY_SECTIONS = ['operatingHours', 'branches'];
 const VALID_SECTIONS = [...OBJECT_SECTIONS, ...ARRAY_SECTIONS];
 
@@ -138,6 +139,16 @@ const SECTION_FIELD_RULES = {
         field(`${p}accentColor`, c).optional({ values: 'falsy' })
             .custom((v) => typeof v === 'string' && HEX_COLOR_RE.test(v.trim()))
             .withMessage('Accent colour must be a hex code like #FE8301'),
+    ],
+    // UPI payee for "scan to pay" on the bill (models/settings.js `payments`).
+    // '' / null clears a field. Normalisation lives in the controller.
+    payments: (p, c) => [
+        field(`${p}upiId`, c).optional({ values: 'null' })
+            .custom((v) => typeof v === 'string').withMessage('UPI ID must be text').bail()
+            .custom((v) => normalizeVpa(v) !== null).withMessage('Enter a valid UPI ID (for example name@bank), at most 100 characters'),
+        field(`${p}upiPayeeName`, c).optional({ values: 'null' })
+            .custom((v) => typeof v === 'string').withMessage('Payee name must be text').bail()
+            .custom((v) => normalizePayeeName(v) !== null).withMessage('Payee name can be at most 60 characters'),
     ],
     // Thermal printers (models/settings.js `printers`). The `agent`
     // block is server-owned and ignored here (controller strips it).

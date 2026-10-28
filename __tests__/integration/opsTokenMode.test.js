@@ -223,7 +223,7 @@ describe('table-only endpoints → 400 TABLES_DISABLED; listing stays readable',
         expectDisabled(await ctx.api.as(T.users.captain, T).put(`/tables/${a._id}/assign`).send({ waiterId: String(T.users.waiter._id) }));
         expectDisabled(await admin.post('/tables/merge').send({ tableIds: [String(a._id), String(b._id)] }));
         expectDisabled(await admin.post('/tables/unmerge').send({ tableId: String(a._id) }));
-        expectDisabled(await admin.post(`/tables/${a._id}/free`).send({ force: true }));
+        expectDisabled(await admin.post(`/tables/${a._id}/free`).send({ force: true, reason: 'test reset' }));
         const t = await Table.findById(a._id).lean();
         expect(t.assignedWaiter ?? null).toBeNull();
         expect(t.status).toBe('free');
@@ -392,7 +392,7 @@ describe('regression: tenants with tables behave exactly as today', () => {
 
         const assign = await ctx.api.as(t.users.captain, t).put(`/tables/${table._id}/assign`).send({ waiterId: String(t.users.waiter._id) });
         expect(assign.status).toBe(200);
-        const freed = await ctx.api.as(t.users.admin, t).post(`/tables/${table._id}/free`).send({ force: true });
+        const freed = await ctx.api.as(t.users.admin, t).post(`/tables/${table._id}/free`).send({ force: true, reason: 'test reset' });
         expect(freed.status).toBe(200);
     });
 

@@ -15,10 +15,14 @@ const Area = require('../models/area');
 const Table = require('../models/table');
 const Order = require('../models/order');
 const User = require('../models/user');
+const Request = require('../models/request');
+const Shift = require('../models/shift');
 const { notify } = require('../services/notificationService');
 const EVENTS = require('../realtime/events');
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const logger = require('../utils/logger');
+const { resolveOperationsForRequest } = require('../utils/operationsProfile');
+const { billingStatesForTables } = require('../utils/paymentState');
 const { seatsTakenOf } = require('../utils/tableSeats');
 
 // Delay thresholds (minutes). A kitchen ticket sitting in new/preparing past
@@ -55,6 +59,23 @@ const isOrderDelayed = (o) => {
     }
     return false;
 };
+
+// Customer requests still open (pending + accepted) in the caller's scope:
+// tenant, branch pin and the captain's areas (a request belongs to a table,
+// the table to an area). `tableById` is the already-scoped table map.
+async function openRequestsInScope(tf, bf, scopedTableIds) {
+    const rows = await Request.find({ status: { $in: ['pending', 'accepted'] }, ...tf, ...bf })
+        .select('table type status priority createdAt waiter')
+        .sort({ createdAt: 1 })
+        .lean();
+    return rows.filter((r) => scopedTableIds.has(String(r.table)));
+}
+
+// The caller's active shift (or none) for the home screen.
+async function myShiftOf(req, tf) {
+    const shift = await Shift.findOne({ staff: req.user._id, status: 'active', ...tf }).select('clockIn').lean();
+    return { active: !!shift, clockedInAt: shift ? shift.clockIn : null };
+}
 
 // GET /api/v1/captain/floor-overview
 // One round-trip that powers the whole dashboard: areas in scope, every
@@ -130,6 +151,7 @@ exports.getFloorOverview = async (req, res) => {
             };
         };
 
+        const billing = await billingStatesForTables(tables.map(t => t._id), tf);
         const tablesOut = tables.map(t => {
             const seatGroup = seatsOfGroup(t);
             const tableOrders = ordersByTable.get(String(t._id)) || [];
@@ -154,6 +176,8 @@ exports.getFloorOverview = async (req, res) => {
                 activeOrders: tableOrders.length,
                 oldestOrderAt: oldest,
                 delayed: tableOrders.some(isOrderDelayed),
+                // Derived (Phase 4): billing_pending | payment_pending | payment_failed | print_failed | null
+                billingState: billing.get(String(t._id)) || null,
             };
         });
 
@@ -199,6 +223,10 @@ exports.getFloorOverview = async (req, res) => {
             readyOrders: orders.filter(o => o.status === 'ready').length,
             delayedOrders: delayedOrders.length,
             waitersOnFloor: waiters.length,
+            // Captain home priorities (Phase 6): additive.
+            openRequests: (await openRequestsInScope(tf, bf, new Set(tables.map(t => String(t._id))))).length,
+            unassignedTables: tablesOut.filter(t => !t.assignedWaiter).length,
+            myShift: await myShiftOf(req, tf),
         };
 
         res.status(200).json({
@@ -228,6 +256,18 @@ exports.getAssignableWaiters = async (req, res) => {
             .select('name staffId assignedAreas')
             .sort({ name: 1 })
             .lean();
+
+        // Workload (D7): live tables each waiter holds + the Operations
+        // limit (0 = no limit). Additive per-waiter field.
+        const limit = Number(resolveOperationsForRequest(req).tables.maxTablesPerWaiter) || 0;
+        const held = waiters.length
+            ? await Table.find({ assignedWaiter: { $in: waiters.map(w => w._id) }, isDeleted: { $ne: true }, ...tf })
+                .select('assignedWaiter').lean()
+            : [];
+        const counts = new Map();
+        for (const t of held) counts.set(String(t.assignedWaiter), (counts.get(String(t.assignedWaiter)) || 0) + 1);
+        for (const w of waiters) w.workload = { tables: counts.get(String(w._id)) || 0, limit };
+
         res.status(200).json({ success: true, waiters });
     } catch (error) {
         logger.error('captain.waiters failed:', error);

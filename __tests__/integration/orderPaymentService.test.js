@@ -318,7 +318,7 @@ describe('POST /orders/:id/request-counter-payment', () => {
 
 describe('PATCH /orders/:id/coupon', () => {
     const apply = (client, order, code) => client.patch(`/orders/${order._id}/coupon`).send({ code });
-    const waiter = () => ctx.api.as(A.users.waiter);
+    const waiter = () => ctx.api.as(A.users.captain);
 
     test.each([
         ['a customer', async () => ctx.api.as(await createCustomer('cpn-cust'), A), 403],

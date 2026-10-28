@@ -705,10 +705,45 @@ exports.login = async (req, res) => {
                 }).select('+password');
 
                 if (candidates.length > 1) {
+                    // Only reveal restaurants whose account accepts the supplied
+                    // password. Locked accounts are skipped (no bcrypt, no bypass);
+                    // if nothing matches, answer the generic 401 and count a
+                    // failure against each account that was actually checked.
+                    const matched = [];
+                    const checked = [];
+                    for (const c of candidates) {
+                        if (!c.password) continue;
+                        const key = loginAttempts.accountKey({ user: c, email: cleanEmail });
+                        const lock = await loginAttempts.getLock(key);
+                        if (lock.locked) continue;
+                        checked.push(key);
+                        if (await c.comparePassword(password)) matched.push(c);
+                    }
+                    if (!matched.length) {
+                        for (const key of checked) {
+                            try {
+                                const r = await loginAttempts.recordFailure(key, { ip: req.ip, exempt: false });
+                                if (r.justLocked) {
+                                    logger.warn('auth.account.locked', {
+                                        accountKey: loginAttempts.maskKey(key),
+                                        fails: r.fails,
+                                        lockedUntil: r.lockedUntil,
+                                        ip: req.ip,
+                                    });
+                                }
+                            } catch (lockErr) {
+                                logger.error('auth.login.record-failure-error', { error: lockErr.message });
+                            }
+                        }
+                        return res.status(401).json({ success: false, message: 'Invalid email or password' });
+                    }
+                    const rests = await Restaurant.find({ _id: { $in: matched.map((m) => m.restaurant) } })
+                        .select('name slug').lean();
                     return res.status(409).json({
                         success: false,
                         code: 'TENANT_DISAMBIGUATION_REQUIRED',
                         message: 'This email exists at multiple restaurants. Please pick a restaurant before logging in.',
+                        restaurants: rests.map((r) => ({ name: r.name, slug: r.slug })),
                     });
                 }
                 user = candidates[0] || null;

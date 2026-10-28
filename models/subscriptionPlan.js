@@ -40,6 +40,9 @@ const FEATURE_KEYS = [
     'accountingExport',
     'eInvoice',
     'whiteLabelBranding',
+    // Staff item-wise incentives (CAPTAIN_FLOW_UPDATE_PLAN Phase 5, D11): off
+    // by default on every plan, sold as an add-on / Super Admin override.
+    'incentives',
 ];
 
 // Build the features sub-schema dynamically so adding a new feature key

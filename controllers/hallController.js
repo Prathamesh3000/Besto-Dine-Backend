@@ -89,8 +89,10 @@ exports.getHalls = async (req, res) => {
         tags: h.badges || [], // Add compatibility for hall.tags
         contact: h.contact,
         status: h.isActive,
-        images: h.images.length > 0 ? h.images : ['https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=2000'],
-        image: h.images.length > 0 ? h.images[0] : 'https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=2000'
+        // Blank, no fallback (2026-10-28): a hall the admin never gave a
+        // photo is returned with no image — never a stock placeholder.
+        images: h.images || [],
+        image: h.images?.[0] || ''
       }))
     });
   } catch (err) {
@@ -269,8 +271,7 @@ exports.importHallsCsv = async (req, res) => {
       // ── Images (pipe-delimited URLs) ──────────────────────────────
       // Each `|`-separated URL becomes one entry in the model's
       // `images: [String]` array. Empty cell → schema default
-      // (empty array), at which point `getHalls` injects its
-      // hard-coded Unsplash placeholder so cards never render naked.
+      // (empty array); `getHalls` returns it blank (no placeholder).
       images:          header.indexOf('images'),
     };
     const missing = ['name', 'type', 'maxcapacity', 'baseprice'].filter(col => idx[col] === -1);

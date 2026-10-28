@@ -107,8 +107,42 @@ function applyStatusTransition(req, oldOrder, status, updateData) {
 }
 
 // Payment / tip / manual-discount fields + bill-paid auto-close.
-function applyPaymentFields(oldOrder, body, updateData) {
-  const { paymentStatus, paymentMethod, amountPaid, tipAmount, manualDiscount } = body;
+function applyPaymentFields(oldOrder, body, updateData, userId = null, role = null) {
+  const { paymentStatus, paymentMethod, tipAmount, manualDiscount } = body;
+  let { amountPaid } = body;
+
+  // UPI settle (QR on the bill, paid into the restaurant's own UPI id; the
+  // app cannot see it, so staff confirm it). Body extras: `manualConfirm:
+  // true` (record as 'upi-qr-manual') and `upiRef` (<=40 chars, e.g. last
+  // UTR digits). Captain / admin / manager only.
+  const isUpi = /^upi$/i.test(String(paymentMethod || ''));
+  const manualConfirm = body.manualConfirm === true;
+  const hasUpiRef = body.upiRef !== undefined && body.upiRef !== null && body.upiRef !== '';
+  if (isUpi || manualConfirm || hasUpiRef) {
+    if (!['captain', 'admin', 'manager'].includes(role)) {
+      throw httpError(403, { success: false, code: 'BILLING_CAPTAIN_ONLY', message: 'Billing and payment are handled by the captain' });
+    }
+  }
+  if (body.manualConfirm !== undefined && typeof body.manualConfirm !== 'boolean') {
+    throw httpError(400, { success: false, code: 'INVALID_MANUAL_CONFIRM', message: 'manualConfirm must be true or false.' });
+  }
+  if (manualConfirm && (!isUpi || paymentStatus !== 'Paid')) {
+    throw httpError(400, { success: false, code: 'MANUAL_CONFIRM_NEEDS_UPI', message: "manualConfirm needs paymentStatus 'Paid' and paymentMethod 'UPI'." });
+  }
+  let upiRef = '';
+  if (hasUpiRef) {
+    const cleaned = typeof body.upiRef === 'string' ? require('../utils/upiQr').cleanText(body.upiRef) : null;
+    if (cleaned === null || cleaned.length > 40) {
+      throw httpError(400, { success: false, code: 'INVALID_UPI_REF', message: 'UPI reference must be text of at most 40 characters.' });
+    }
+    upiRef = cleaned;
+  }
+  if (manualConfirm && (amountPaid === undefined || amountPaid === null || amountPaid === '')) {
+    // The customer paid the bill's amount due: record exactly that.
+    const effDisc = body.manualDiscount !== undefined && Number.isFinite(Number(body.manualDiscount))
+      ? Math.max(0, Number(body.manualDiscount)) : Math.max(0, Number(oldOrder.manualDiscount) || 0);
+    amountPaid = Math.round(Math.max(0, (Number(oldOrder.total) || 0) - effDisc - Math.max(0, Number(oldOrder.amountPaid) || 0)) * 100) / 100;
+  }
   if (paymentStatus) updateData.paymentStatus = paymentStatus;
   if (paymentMethod) updateData.paymentMethod = paymentMethod;
   if (amountPaid !== undefined) updateData.amountPaid = amountPaid;
@@ -124,6 +158,11 @@ function applyPaymentFields(oldOrder, body, updateData) {
   // Persisted so the customer's bill-preview reflects it before they pay
   // (emitted via order:updated below → the customer bill refetches).
   if (manualDiscount !== undefined && Number.isFinite(Number(manualDiscount))) {
+    // A finalised bill (Save Bill, D4) keeps its discount; re-sending the
+    // current value (a settle screen echoing it back) is not a change.
+    if (Math.max(0, Number(manualDiscount)) !== (Math.max(0, Number(oldOrder.manualDiscount) || 0))) {
+      require('../utils/billWorkspace').assertBillNotFinal(oldOrder);
+    }
     updateData.manualDiscount = Math.max(0, Number(manualDiscount));
   }
   if (paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid' && !oldOrder.paidAt) {
@@ -163,6 +202,54 @@ function applyPaymentFields(oldOrder, body, updateData) {
         amountDue: due,
       });
     }
+  }
+
+  // Payment state block (Phase 4): a staff settle records payment.state
+  // 'paid'. For cash it also records cashReceived (explicit body field,
+  // default amountPaid) and changeDue. Existing semantics are untouched:
+  // partial payment was never allowed here (AMOUNT_TOO_LOW above, same
+  // INR 1 tolerance), so a cash amount below the payable is CASH_SHORT.
+  if (paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid') {
+    const method = String(paymentMethod || oldOrder.paymentMethod || '');
+    const effDiscount = updateData.manualDiscount !== undefined
+      ? updateData.manualDiscount
+      : Math.max(0, Number(oldOrder.manualDiscount) || 0);
+    const payable = Math.round(Math.max(0,
+      (Number(oldOrder.total) || 0) - effDiscount - Math.max(0, Number(oldOrder.amountPaid) || 0)) * 100) / 100;
+    // A tip already stored on the order is already inside oldOrder.total
+    // (utils/billing.js adds it), hence inside `payable`. Only a tip RAISED
+    // by this request is not yet in total (it is not recomputed here), so
+    // only that increase is added on top. Subtracting the full tip would
+    // count a stored tip twice and understate change.
+    const oldTip = Math.max(0, Number(oldOrder.tipAmount) || 0);
+    const extraTip = updateData.tipAmount !== undefined ? Math.max(0, updateData.tipAmount - oldTip) : 0;
+    const payableInclTip = Math.round((payable + extraTip) * 100) / 100;
+    let cashReceived = null;
+    let changeDue = null;
+    if (/cash/i.test(method)) {
+      const raw = body.cashReceived !== undefined && body.cashReceived !== null && body.cashReceived !== ''
+        ? body.cashReceived
+        : (amountPaid !== undefined && amountPaid !== null && amountPaid !== '' ? amountPaid : null);
+      if (raw !== null) {
+        const received = Number(raw);
+        if (!Number.isFinite(received) || received < 0) {
+          throw httpError(400, { success: false, code: 'INVALID_AMOUNT', message: 'Cash received must be a non-negative number.' });
+        }
+        if (received < payableInclTip - 1) {
+          throw httpError(400, {
+            success: false,
+            code: 'CASH_SHORT',
+            message: `Cash received ₹${received.toFixed(2)} is less than the amount payable ₹${payableInclTip.toFixed(2)}.`,
+            amountDue: payableInclTip,
+          });
+        }
+        cashReceived = Math.round(received * 100) / 100;
+        changeDue = Math.round(Math.max(0, received - payableInclTip) * 100) / 100;
+      }
+    }
+    Object.assign(updateData, require('../utils/paymentState').paidSet({
+      method: manualConfirm ? 'upi-qr-manual' : method, amount: payable, reference: upiRef, cashReceived, changeDue, userId,
+    }));
   }
 
   // Bill-paid auto-close for dine-in.
@@ -509,7 +596,7 @@ async function updateOrderStatus(req) {
 
   const updateData = {};
   applyStatusTransition(req, oldOrder, status, updateData);
-  applyPaymentFields(oldOrder, req.body, updateData);
+  applyPaymentFields(oldOrder, req.body, updateData, req.user?._id || null, req.user?.role || null);
   applyKitchenStamps(req, oldOrder, status, updateData);
 
   let order = await commitStatusUpdate(oldOrder, updateData, tf);
@@ -539,6 +626,12 @@ async function updateOrderStatus(req) {
   await notifyStatusTransition({ status, oldOrder, order });
 
   const justPaid = order.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
+
+  // Staff incentives (fire-and-forget, never fails this request): a served
+  // transition accrues (the paid side is covered by createTipForPaidOrder
+  // below); a cancel reverses.
+  if (order.status === 'served' && oldOrder.status !== 'served') require('./incentiveService').accrueSafe(order);
+  if (order.status === 'cancelled' && oldOrder.status !== 'cancelled') require('./incentiveService').reverseIfVoidSafe(order, 'order cancelled');
 
   // Side Effect: Record Tip if tipAmount > 0 and status is Paid.
   // Delegated to the shared helper so every payment entry point

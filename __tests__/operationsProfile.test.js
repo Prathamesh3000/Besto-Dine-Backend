@@ -35,7 +35,7 @@ const TODAY = {
         holdUntilPaid: false, holdExpiryMinutes: 20,
     },
     customerApp: { callWaiter: true, requestBill: true, appendToOrder: true, tips: true },
-    tables: { useTables: true, assignWaiters: true, mergeTables: true },
+    tables: { useTables: true, assignWaiters: true, mergeTables: true, maxTablesPerWaiter: 0 },
     // Informational only (design §0.4 q3): kitchen printer with the chef module.
     printing: { kotAt: 'kitchen' },
 };

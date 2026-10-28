@@ -295,6 +295,7 @@ function createApp({ isShuttingDown = () => false } = {}) {
     const { attachTenant } = require('./middlewares/tenantContext');
     v1.use(optionalAuth);
     v1.use(attachTenant);
+    v1.use(require('./middlewares/tableSessionGuard'));   // revoked table scan sessions -> 401 TABLE_SESSION_ENDED
     // CRIT-05 — enforce mustChangePassword server-side. Runs after
     // optionalAuth so req.user is available, before any controller.
     v1.use(requirePasswordCurrent);
@@ -340,6 +341,7 @@ function createApp({ isShuttingDown = () => false } = {}) {
     v1.use('/production', require('./routes/productionRoute'));     // Batch cooking (10.6.2)
     v1.use('/shifts', require('./routes/shiftRoute'));
     v1.use('/campaigns', require('./routes/campaignRoute'));
+    v1.use('/incentives', require('./routes/incentiveRoute'));   // Staff item incentives (module `incentives`)
     // Aggregated first-paint bundle for admin dashboards — single round trip
     // in place of 5 parallel calls (tables, areas, reservations, staff,
     // settings). See controllers/adminBootstrapController.js.

@@ -926,7 +926,7 @@ describe('orderNotifications', () => {
             // personal waiter emit is not guaranteed.
             expect(roomsFor(mockIo, 'order:new').sort()).toEqual([`t:${T1}:kitchen:${B1}`, `t:${T1}:kitchen`, `t:${T1}:admin:${B1}`, `t:${T1}:admin`, W1].sort());
             const payload = mockIo.sent.find((s) => s.event === 'order:new').payload;
-            expect(payload).toEqual({ orderId: 'ORD-9', type: 'dine-in', table: TB, area: 'area1', tableName: 'T5', items: 'Soup ×2, Tea' });
+            expect(payload).toEqual({ orderId: 'ORD-9', type: 'dine-in', table: TB, area: 'area1', tableName: 'T5', items: 'Soup ×2, Tea', kotNo: 1, ticketNo: null });
             const roles = notifyCalls().map((c) => c.notification.recipientRole);
             expect(roles).toEqual(['chef', 'admin', 'customer']);
             expect(notifyCalls()[1].notification.description).toBe('Dine-in · Table T5 · Soup ×2, Tea · ₹300');

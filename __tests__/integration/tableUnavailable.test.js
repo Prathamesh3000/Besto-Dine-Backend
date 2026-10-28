@@ -108,7 +108,7 @@ describe('table:unavailable push to seated diners', () => {
 
         // An occupied table can't be deleted (see orderFlow "deleted
         // tables"); staff free it first, then delete.
-        const free = await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true });
+        const free = await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true, reason: 'test reset' });
         expect(free.status).toBe(200);
         const del = await ctx.api.as(A.users.admin).delete(`/tables/${table._id}`);
         expect(del.status).toBe(200);

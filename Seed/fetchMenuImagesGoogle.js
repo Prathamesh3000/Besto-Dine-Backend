@@ -2,12 +2,11 @@
  * fetchMenuImagesGoogle.js — fetch ACTUAL dish photos from Google
  * Custom Search (Images API) for every MenuItem and Combo in the DB.
  *
- * Why this script instead of applyMenuImages.js?
- *   applyMenuImages.js picks from a small curated Unsplash pool by
- *   keyword scoring. The pool is mostly Western lifestyle photos —
- *   "Aloo Tikki" / "Gulab Jamun" / "Misal Pav" don't actually exist
- *   in the pool, so they fall through to generic substitutes that
- *   don't look like the real dish. This script searches Google Images
+ * Why Google rather than a curated stock pool?
+ *   The old Unsplash pool (removed 2026-10-28) was mostly Western
+ *   lifestyle photos — "Aloo Tikki" / "Gulab Jamun" / "Misal Pav" didn't
+ *   exist in it, so they fell through to generic substitutes that
+ *   didn't look like the real dish. This script searches Google Images
  *   for each item's exact name and writes the first high-quality
  *   result back to the DB, giving 100% dish-accurate thumbnails.
  *
@@ -67,12 +66,8 @@ if (!process.env.MONGO_URL) {
     process.exit(1);
 }
 
-// Reuse the dead-URL list from applyMenuImages.js — same triggers.
-const DEAD_IMAGE_PATTERNS = [
-    /^https?:\/\/images\.unsplash\.com\/photo-(1567620905732-2d1ec7bb7445|1484723088339-323833995221)/i,
-    /^https?:\/\/(?:[a-z0-9-]+\.)?picsum\.photos\//i,
-    /^https?:\/\/source\.unsplash\.com\//i,
-];
+// Same dead-URL triggers as the CSV importers.
+const { DEAD_IMAGE_PATTERNS } = require('../utils/deadImage');
 
 function needsRefresh(currentImages) {
     if (FORCE) return true;

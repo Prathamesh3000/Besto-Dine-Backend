@@ -665,7 +665,7 @@ describe('free table (POST /tables/:id/free)', () => {
         expect(preview.body.totalAmount).toBe(expected);
         expect((await reload(first.order._id)).status).toBe('new');
 
-        const forced = await ctx.api.as(A.users.captain).post(`/tables/${first.table._id}/free`).send({ force: true });
+        const forced = await ctx.api.as(A.users.admin).post(`/tables/${first.table._id}/free`).send({ force: true, reason: 'test reset' });
         expect(forced.status).toBe(200);
         expect(forced.body.closedOrderCount).toBe(2);
         for (const o of [first.order, second_.order]) {
@@ -858,10 +858,11 @@ describe('CSV bulk import (POST /tables/import)', () => {
 
 // Regression (fixed 2026-10): freeTable, mergeTables, unmergeTables and deleteTable enforce the branch pin (BRANCH_MISMATCH).
 describe('cross-branch staff on table write endpoints', () => {
-    test('a Second-branch captain cannot force-free a Main-branch table and write off its bill', async () => {
+    test('a Second-branch admin cannot force-free a Main-branch table and write off its bill', async () => {
         const { order, table } = await guestOrder();
-        const res = await ctx.api.as(second.captain).post(`/tables/${table._id}/free`).send({ force: true });
+        const res = await ctx.api.as(second.admin).post(`/tables/${table._id}/free`).send({ force: true, reason: 'test reset' });
         expect(res.status).toBe(403);
+        expect(res.body.code).toBe('BRANCH_MISMATCH');
         expect((await reload(order._id)).status).toBe('new');
     });
 

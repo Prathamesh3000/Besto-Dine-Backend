@@ -377,7 +377,7 @@ describe('a newly seated party is never freed out from under', () => {
         const orderA = await guestOrder(table, a.scanToken);
         expect((await staffCashSettle(orderA._id)).status).toBe(200);
         expect((await scanTable(ctx.api, table)).res.status).toBe(200); // B sits down
-        expect((await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true })).status).toBe(200);
+        expect((await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true, reason: 'test reset' })).status).toBe(200);
         const t = await Table.findById(table._id).select('+seats').lean();
         expect({ status: t.status, seats: t.seats }).toEqual({ status: 'free', seats: [] });
     });

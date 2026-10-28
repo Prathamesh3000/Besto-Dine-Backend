@@ -730,6 +730,12 @@ exports.payWithWallet = async (req, res) => {
       }
     }
 
+    // Staff incentives: the order is now paid (served + paid => confirmed).
+    // Fire-and-forget; re-reads the order so the hook sees committed state.
+    if (outcome?.orderPaid) {
+      Order.findOne({ _id: orderId, ...tf }).then((o) => o && require('../services/incentiveService').accrueSafe(o)).catch(() => {});
+    }
+
     // Table-status rule: the bill is settled → free the dine-in table now
     // (unless another order on it is still unpaid). After the commit, so
     // a rolled-back payment never frees a table. Best-effort.

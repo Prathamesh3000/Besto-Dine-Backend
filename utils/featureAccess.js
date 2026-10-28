@@ -42,6 +42,7 @@ const ADDON_CATALOG = {
     advanceBookingHall: { label: 'Banquet / hall bookings', monthlyPrice: 799 },
     kiosk:              { label: 'Self-order kiosk',        monthlyPrice: 499 },
     eInvoice:           { label: 'GST e-invoice (IRN)',     monthlyPrice: 0 },
+    incentives:         { label: 'Staff incentives',        monthlyPrice: 299 },
 };
 
 function isOn(value) {

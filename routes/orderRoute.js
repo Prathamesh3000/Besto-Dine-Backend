@@ -3,7 +3,7 @@ const router = express.Router();
 const { makeLimiter } = require('../utils/rateLimitStore');
 const { ipKeyGenerator } = require('express-rate-limit');
 const orderController = require('../controllers/orderController');
-const { protect, staffOnly, optionalAuth, checkPermission, restrictTo, adminOnly } = require('../middlewares/authMiddleware');
+const { protect, staffOnly, optionalAuth, checkPermission, restrictTo, adminOnly, noWaiterBilling, noWaiterBillingFields } = require('../middlewares/authMiddleware');
 const { featureGate } = require('../middlewares/featureGate');
 const { idempotency } = require('../middlewares/idempotency');
 
@@ -78,7 +78,7 @@ const allowStatusUpdateOrFloorCancel = (req, res, next) => {
     if (isPureCancel && ['waiter', 'captain'].includes(req.user?.role)) return next();
     return checkPermission('updateOrderStatus')(req, res, next);
 };
-router.patch('/:id/status', protect, staffOnly, allowStatusUpdateOrFloorCancel, orderController.updateOrderStatus);
+router.patch('/:id/status', protect, staffOnly, noWaiterBillingFields, allowStatusUpdateOrFloorCancel, orderController.updateOrderStatus);
 // Pickup is a waiter/captain duty (ready → served). It's not order creation,
 // so `addOrders` was semantically wrong — waiters without that flag ticked
 // were locked out of their core serving workflow. Role-gate instead, matching
@@ -117,8 +117,17 @@ router.patch(
     '/:id/coupon',
     protect,
     restrictTo('waiter', 'captain', 'admin', 'manager'),
+    noWaiterBilling,
     orderController.applyCouponToOrder
 );
+
+// Bill workspace (Phase 3, D4): Save Bill (draft | final), Reopen (captain+
+// with a reason) and Bill Preview (the exact slip the printer would get).
+router.post('/:id/bill/save', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, orderController.saveBill);
+router.post('/:id/bill/reopen', protect, restrictTo('captain', 'admin', 'manager'), orderController.reopenBill);
+router.get('/:id/bill/preview', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, orderController.previewBill);
+// UPI QR for the amount due now (restaurant's own UPI id). Captain/admin/manager; waiters get 403 BILLING_CAPTAIN_ONLY.
+router.get('/:id/upi-qr', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, orderController.upiQr);
 
 // Re-fire the KOT socket event for an existing order — used by the
 // Admin "KOT" drawer button to re-alert the kitchen without modifying
@@ -136,6 +145,8 @@ router.get('/my-orders', protect, orderController.getMyOrders);
 // Order detail — optionalAuth so guests can track via QR session,
 // but the controller enforces ownership for authenticated users
 router.get('/:id/detail', optionalAuth, orderController.getOrderById);
+// KOT rounds of an order (second / third KOT) — staff only.
+router.get('/:id/kots', protect, staffOnly, orderController.getOrderKots);
 
 // Kiosk-only order tracking. The kiosk has no auth and no scan token,
 // so getOrderById would 404 it. The token returned at create time

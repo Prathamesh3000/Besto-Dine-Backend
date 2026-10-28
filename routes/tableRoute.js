@@ -14,7 +14,9 @@ const {
     mergeTables,
     unmergeTables,
     assignWaiter,
+    getAssignmentHistory,
     freeTable,
+    freeAllTables,
     claimTable,
     downloadTablesTemplate,
     importTablesCsv,
@@ -134,8 +136,14 @@ router.put('/:id/assign', protect, captainOrAdmin, validate([
     // null / '' clears the assignment.
     optionalObjectId('body', 'waiterId', 'Invalid waiter id'),
 ]), assignWaiter);
+router.get('/:id/assignments', protect, captainOrAdmin, validate([tableIdParam]), getAssignmentHistory);
 router.post('/', protect, adminOnly, createTableRules, createTable);
 router.put('/:id', protect, captainOrAdmin, updateTableRules, updateTable);
+// Free EVERY table in scope and sign out the diners seated at them. Admin / manager only;
+// the literal path cannot collide with '/:id/free' (different segment count).
+router.post('/free-all', protect, adminOnly, validate([
+    body('force').optional({ values: 'null' }).isBoolean().withMessage('force must be true or false'),
+]), freeAllTables);
 router.post('/:id/free', protect, captainOrAdmin, validate([
     tableIdParam,
     body('force').optional({ values: 'null' }).isBoolean().withMessage('force must be true or false'),

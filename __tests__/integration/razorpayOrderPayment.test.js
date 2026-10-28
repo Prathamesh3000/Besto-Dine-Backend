@@ -210,12 +210,12 @@ describe('POST /razorpay/create-order', () => {
         const cust = await createCustomer('c-staff');
         const order = await makeOrder(A, { user: cust._id });
 
-        const res = await create(ctx.api.as(A.users.waiter), { amount: 500, cafeOrderId: order.orderId });
+        const res = await create(ctx.api.as(A.users.captain), { amount: 500, cafeOrderId: order.orderId });
 
         expect(res.status).toBe(200);
         const { notes } = rzp.instance.orders.create.mock.calls[0][0];
-        expect(notes.payerRole).toBe('waiter');
-        expect(notes.userId).toBe(String(A.users.waiter._id));
+        expect(notes.payerRole).toBe('captain');
+        expect(notes.userId).toBe(String(A.users.captain._id));
     });
 
     test.each([
@@ -633,10 +633,10 @@ describe('POST /razorpay/verify-payment — deferred checkout binding', () => {
         const c = await deferred({ user: owner._id });
         stubGateway({
             ...c, amount: 50000,
-            notes: { cafeOrderId: 'none', restaurantId: String(A.restaurant._id), purpose: 'cafe_order', userId: String(A.users.waiter._id), payerRole: 'waiter' },
+            notes: { cafeOrderId: 'none', restaurantId: String(A.restaurant._id), purpose: 'cafe_order', userId: String(A.users.captain._id), payerRole: 'captain' },
         });
 
-        const res = await verify(ctx.api.as(A.users.waiter), c.body);
+        const res = await verify(ctx.api.as(A.users.captain), c.body);
 
         expect(res.status).toBe(200);
         expect((await reload(c.order)).paymentStatus).toBe('Paid');
@@ -717,7 +717,7 @@ describe('create-order → verify-payment', () => {
     test('paying the first of two checkouts still settles the order', async () => {
         const order = await makeOrder(A);
         const first = await create(ctx.api.guest(A), { amount: 500, cafeOrderId: String(order._id) });
-        const second = await create(ctx.api.as(A.users.waiter), { amount: 500, cafeOrderId: String(order._id) });
+        const second = await create(ctx.api.as(A.users.captain), { amount: 500, cafeOrderId: String(order._id) });
         expect(first.status).toBe(200);
         expect(second.status).toBe(200);
 
@@ -815,7 +815,7 @@ describe('webhook — several checkouts on one order', () => {
     test('a payment from an older checkout of the same order settles it', async () => {
         const order = await makeOrder(A);
         const first = await create(ctx.api.guest(A), { amount: 500, cafeOrderId: String(order._id) });
-        await create(ctx.api.as(A.users.waiter), { amount: 500, cafeOrderId: String(order._id) });
+        await create(ctx.api.as(A.users.captain), { amount: 500, cafeOrderId: String(order._id) });
         const r1 = first.body.razorpayOrder.id;
         const payment = captured(r1, { cafeOrderId: String(order._id), restaurantId: String(A.restaurant._id), purpose: 'cafe_order' });
 

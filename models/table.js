@@ -72,6 +72,11 @@ const tableSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Order'
     },
+    // Stamped when staff free the table (utils/tableSessions.endTableSessions).
+    // A scan token issued before this moment is rejected by
+    // middlewares/tableSessionGuard (401 TABLE_SESSION_ENDED), which signs
+    // out the diners who were seated here.
+    sessionEpoch: { type: Date, default: null },
     // Snapshot of who is currently sitting at this table. Populated when
     // a logged-in customer claims the table after QR scan (POST /tables/
     // :id/claim) and when an order with a `user` link is created. Cleared
@@ -87,6 +92,23 @@ const tableSchema = new mongoose.Schema({
     assignedWaiter: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User'
+    },
+    // Who held this table, newest last, capped at the last 20 (written by
+    // PUT /tables/:id/assign, read by GET /tables/:id/assignments).
+    // `reason` carries a workload-limit override reason. select:false so
+    // the floor listings stay light.
+    assignmentHistory: {
+        type: [{
+            waiter: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+            waiterName: { type: String, default: '' },
+            assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+            assignedByName: { type: String, default: '' },
+            at: { type: Date, default: Date.now },
+            reason: { type: String, default: '' },
+            cleared: { type: Boolean, default: false },
+        }],
+        default: [],
+        select: false,
     },
     // QA #13 — seat reservations. One entry per diner PARTY currently
     // seated (a phone that scanned the QR, optionally logged in). A seat

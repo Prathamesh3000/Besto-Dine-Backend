@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { makeLimiter } = require('../utils/rateLimitStore');
 const printController = require('../controllers/printController');
-const { protect, adminOnly, restrictTo } = require('../middlewares/authMiddleware');
+const { protect, adminOnly, restrictTo, noWaiterBilling } = require('../middlewares/authMiddleware');
 
 // A test page per click is plenty; stops a stuck button from spooling
 // paper out of a kitchen printer.
@@ -21,7 +21,12 @@ router.get('/agent-status', protect, adminOnly, printController.agentStatus);
 router.get('/jobs', protect, adminOnly, printController.listJobs);
 router.post('/test', protect, adminOnly, testPrintLimiter, printController.testPrint);
 
+// Staff-safe printer status + job read-back for the waiter / captain app
+// (agent-status and the job list above stay admin-only).
+router.get('/status', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, printController.staffStatus);
+router.get('/jobs/:id', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, printController.getJob);
+
 // On-demand bill to the counter printer — same audience as reprint-kot.
-router.post('/orders/:id/bill', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), printController.printBill);
+router.post('/orders/:id/bill', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, printController.printBill);
 
 module.exports = router;

@@ -316,7 +316,25 @@ async function reprintKOT(req) {
 
   // Thermal reprint on the station printers too (services/printService.js).
   // Explicit staff action, so it ignores the auto-print toggles.
-  require('./printService').enqueueKotJobs({ order, items: order.items, reason: 'reprint' }).catch(() => {});
+  // Same numbers as the original send: `kotNo` in the body reprints just
+  // that round; otherwise the whole order (header shows the round range,
+  // or the single round's own numbers).
+  const kotRounds = require('../utils/kotRounds');
+  const rounds = kotRounds.roundsOf(order);
+  const wantedRound = Number(req.body?.kotNo) || null;
+  let slipItems = order.items;
+  let slipKot = null;
+  if (wantedRound) {
+    const r = rounds.find((x) => x.kotNo === wantedRound);
+    if (!r) throw httpError(404, { success: false, code: 'KOT_NOT_FOUND', message: `KOT round ${wantedRound} not found on this order.` });
+    slipItems = kotRounds.roundItems(r);
+    slipKot = { kotNo: r.kotNo, ticketNo: r.ticketNo };
+  } else if (rounds.length === 1) {
+    slipKot = { kotNo: rounds[0].kotNo, ticketNo: rounds[0].ticketNo };
+  } else {
+    slipKot = { rounds: rounds.length };
+  }
+  require('./printService').enqueueKotJobs({ order, items: slipItems, reason: 'reprint', kot: slipKot }).catch(() => {});
 
   logger.info(`KOT reprinted for ${order.orderId} by ${req.user?._id || 'unknown'}`);
 

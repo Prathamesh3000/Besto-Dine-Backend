@@ -23,6 +23,7 @@
 
 const Tip = require('../models/tip');
 const logger = require('./logger');
+const incentives = require('../services/incentiveService');
 
 /**
  * Create a Tip record for an order that was just paid.
@@ -36,6 +37,11 @@ const logger = require('./logger');
  */
 async function createTipForPaidOrder(order, restaurantId) {
     if (!order) return null;
+    // Shared "order just got paid / picked up" hook: every payment path (PATCH
+    // paid, cash settle, razorpay verify + webhook, pickup) already calls this,
+    // so staff-incentive accrual (served AND paid, D3) rides along. Fire and
+    // forget - never delays or fails the payment (services/incentiveService).
+    incentives.accrueSafe(order);
     if (order.paymentStatus !== 'Paid') return null;
     if (!order.tipAmount || order.tipAmount <= 0) return null;
     if (!order.waiter) return null;
@@ -104,6 +110,9 @@ async function createTipForPaidOrder(order, restaurantId) {
 async function revokeTipsForOrder(orderOrId, opts = {}) {
     const orderId = orderOrId && orderOrId._id ? orderOrId._id : orderOrId;
     if (!orderId) return { updated: 0 };
+    // Refund hook: a fully refunded (or cancelled) order also reverses its
+    // incentive entries; partial refunds keep them (the service decides).
+    incentives.reverseIfVoidSafe(orderOrId, opts.reason);
     try {
         const result = await Tip.updateMany(
             { order: orderId, status: 'pending' },

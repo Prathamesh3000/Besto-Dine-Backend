@@ -12,11 +12,13 @@ const BACKEND = path.join(__dirname, '..', '..');
 const User = require(path.join(BACKEND, 'models/user'));
 const Order = require(path.join(BACKEND, 'models/order'));
 const Request = require(path.join(BACKEND, 'models/request'));
+const IncentiveEntry = require(path.join(BACKEND, 'models/incentiveEntry'));
 
 let conn;
 let FreshUser;
 let FreshOrder;
 let FreshRequest;
+let FreshIncentiveEntry;
 
 beforeAll(async () => {
     const u = new URL(process.env.MONGO_URL);
@@ -31,6 +33,8 @@ beforeAll(async () => {
     await FreshUser.init();
     await FreshOrder.init();
     await FreshRequest.init();
+    FreshIncentiveEntry = conn.model('IncentiveEntry', IncentiveEntry.schema);
+    await FreshIncentiveEntry.init();
 });
 
 afterAll(async () => {
@@ -108,5 +112,30 @@ describe('Request TTL index (completed_request_ttl)', () => {
         expect(covered.map((d) => d.status)).toEqual(['completed']);
         // and the open ones are still there in full
         expect(await FreshRequest.countDocuments({ status: { $in: ['pending', 'accepted'] } })).toBe(2);
+    });
+});
+
+// Staff incentives ledger (CAPTAIN_FLOW_UPDATE_PLAN Phase 5): accrual is
+// idempotent because (order, itemKey, campaign) is unique.
+describe('IncentiveEntry unique key (incentive_entry_once)', () => {
+    const entry = (over = {}) => ({
+        restaurant: new mongoose.Types.ObjectId(), campaign: new mongoose.Types.ObjectId(),
+        order: new mongoose.Types.ObjectId(), itemKey: 'line-1', quantity: 1, rate: 10, amount: 10,
+        staff: new mongoose.Types.ObjectId(), staffRole: 'waiter', day: '2026-10-22', ...over,
+    });
+
+    test('is a unique index on order + itemKey + campaign', async () => {
+        const idx = (await FreshIncentiveEntry.collection.indexes()).find((i) => i.name === 'incentive_entry_once');
+        expect(idx).toBeTruthy();
+        expect(idx.unique).toBe(true);
+        expect(idx.key).toEqual({ order: 1, itemKey: 1, campaign: 1 });
+    });
+
+    test('a second row for the same line + campaign is refused; another campaign or line is fine', async () => {
+        const first = entry();
+        await FreshIncentiveEntry.create(first);
+        await expect(FreshIncentiveEntry.create({ ...first })).rejects.toMatchObject({ code: 11000 });
+        await expect(FreshIncentiveEntry.create({ ...first, campaign: new mongoose.Types.ObjectId() })).resolves.toBeTruthy();
+        await expect(FreshIncentiveEntry.create({ ...first, itemKey: 'line-2' })).resolves.toBeTruthy();
     });
 });

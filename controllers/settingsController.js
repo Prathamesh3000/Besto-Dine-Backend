@@ -11,6 +11,7 @@ const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope
 const { getMainBranchId, isSubBranchCaller } = require('../utils/mainBranch');
 const EVENTS = require('../realtime/events');
 const logger = require('../utils/logger');
+const { normalizeVpa, normalizePayeeName, maskVpa } = require('../utils/upiQr');
 
 // Broadcast `settings:updated` to every staff dashboard at the caller's
 // branch so headers (admin / waiter / chef) can refetch and swap the
@@ -333,8 +334,62 @@ async function buildDefaults(req) {
 exports.resolveSettingsForRequest = async (req) => {
   let settings = await Settings.findOne(settingsScope(req));
   const resolved = await resolveSettingsCore(req, settings);
-  return overlayTenantLandingPage(req, resolved);
+  return await shapePayments(req, await overlayTenantLandingPage(req, resolved));
 };
+
+// `payments` (UPI payee) visibility:
+//   admin / manager / superadmin  full { upiId, upiPayeeName } + upiIdMasked, upiConfigured
+//   captain / waiter / chef       { upiConfigured, upiIdMasked, upiPayeeName } (no raw id)
+//   customers / guests            section removed
+// A branch-scoped caller whose own doc has no UPI id uses the tenant-level
+// one (the QR / slip do the same), reported as `upiInherited`.
+async function shapePayments(req, resolved) {
+  if (!resolved || typeof resolved !== 'object') return resolved;
+  const out = { ...resolved };
+  const role = req?.user?.role;
+  const isAdminRole = ['admin', 'manager', 'superadmin'].includes(role);
+  if (!isAdminRole && !['captain', 'waiter', 'chef'].includes(role)) {
+    delete out.payments;
+    return out;
+  }
+  const src = (out.payments && typeof out.payments.toObject === 'function' ? out.payments.toObject() : out.payments) || {};
+  const upiId = typeof src.upiId === 'string' ? src.upiId : '';
+  const upiPayeeName = typeof src.upiPayeeName === 'string' ? src.upiPayeeName : '';
+  let effId = upiId;
+  let effName = upiPayeeName;
+  let inherited = false;
+  if (!upiId && resolveScopeBranchId(req)) {
+    const tenantDoc = await Settings.findOne({ ...tenantFilter(req), branch: null }).select('payments').lean();
+    if (tenantDoc?.payments?.upiId) {
+      effId = tenantDoc.payments.upiId;
+      effName = upiPayeeName || tenantDoc.payments.upiPayeeName || '';
+      inherited = true;
+    }
+  }
+  out.payments = isAdminRole
+    ? { upiId, upiPayeeName, upiIdMasked: maskVpa(effId), upiConfigured: !!effId, upiInherited: inherited }
+    : { upiConfigured: !!effId, upiIdMasked: maskVpa(effId), upiPayeeName: effName };
+  return out;
+}
+
+// Normalise the UPI payee fields that were sent (already shape-checked by
+// the route) and log the change with masked values only.
+function normalizePaymentsBody(src) {
+  const out = {};
+  if (src && src.upiId !== undefined && src.upiId !== null) out.upiId = normalizeVpa(src.upiId) ?? '';
+  if (src && src.upiPayeeName !== undefined && src.upiPayeeName !== null) out.upiPayeeName = normalizePayeeName(src.upiPayeeName) ?? '';
+  return out;
+}
+function logPaymentsChange(req, before, next) {
+  const oldId = (before && before.upiId) || '';
+  const oldName = (before && before.upiPayeeName) || '';
+  const changedId = next.upiId !== undefined && next.upiId !== oldId;
+  const changedName = next.upiPayeeName !== undefined && next.upiPayeeName !== oldName;
+  if (!changedId && !changedName) return;
+  logger.info(`settings: UPI payee changed by ${req.user?._id} (${req.user?.role}) tenant=${tenantId(req)} `
+    + `upiId ${maskVpa(oldId) || '(none)'} -> ${next.upiId !== undefined ? (maskVpa(next.upiId) || '(cleared)') : 'unchanged'}; `
+    + `payeeName ${next.upiPayeeName !== undefined ? (next.upiPayeeName ? 'set' : 'cleared') : 'unchanged'}`);
+}
 
 // ── Landing page (tenant-level section) ──────────────────────────────
 // `landingPage` lives on the TENANT-level Settings doc (branch: null) —
@@ -649,6 +704,8 @@ function sanitizePublicSettings(settings) {
   }
   // Printer hosts / agent state are staff-only infrastructure details.
   delete copy.printers;
+  // The restaurant's UPI payee is never customer-facing.
+  delete copy.payments;
   return copy;
 }
 
@@ -842,6 +899,19 @@ exports.updateSettings = async (req, res) => {
 
     let settings = await Settings.findOne(scope);
 
+    // UPI payee: only the two known fields, merged field-by-field so a
+    // partial PUT cannot blank the other one.
+    if (updateBody.payments !== undefined) {
+      const pay = normalizePaymentsBody(updateBody.payments);
+      delete updateBody.payments;
+      logPaymentsChange(req, settings?.payments, pay);
+      if (settings) {
+        for (const [k, v] of Object.entries(pay)) updateBody[`payments.${k}`] = v;
+      } else {
+        updateBody.payments = pay;
+      }
+    }
+
     if (settings) {
       settings = await Settings.findOneAndUpdate(scope, updateBody, {
         returnDocument: 'after',
@@ -878,7 +948,7 @@ exports.updateSettings = async (req, res) => {
 exports.updateSettingsSection = async (req, res) => {
   try {
     const { section } = req.params;
-    const validSections = ['general', 'operatingHours', 'taxes', 'notifications', 'reservation', 'wallet', 'branches', 'delivery', 'landingPage', 'printers'];
+    const validSections = ['general', 'operatingHours', 'taxes', 'notifications', 'reservation', 'wallet', 'branches', 'delivery', 'landingPage', 'printers', 'payments'];
 
     if (!validSections.includes(section)) {
       return res.status(400).json({ message: `Invalid section: ${section}. Valid sections: ${validSections.join(', ')}` });
@@ -930,6 +1000,12 @@ exports.updateSettingsSection = async (req, res) => {
     }
 
     if (section === 'printers') normalizePrinters(req.body, settings);
+    if (section === 'payments') {
+      const pay = normalizePaymentsBody(req.body);
+      logPaymentsChange(req, settings.payments, pay);
+      const cur = settings.payments && typeof settings.payments.toObject === 'function' ? settings.payments.toObject() : (settings.payments || {});
+      req.body = { upiId: cur.upiId || '', upiPayeeName: cur.upiPayeeName || '', ...pay };
+    }
 
     settings[section] = req.body;
 

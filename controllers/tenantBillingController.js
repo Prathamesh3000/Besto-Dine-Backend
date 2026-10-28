@@ -332,12 +332,34 @@ exports.upgradePlan = async (req, res) => {
         //    tenant. They'll be billed by whichever they pay first.
         if (restaurant.subscription?.pendingUpgrade?.planSlug) {
             const pu = restaurant.subscription.pendingUpgrade;
-            return res.status(409).json({
-                success: false,
-                code: 'UPGRADE_ALREADY_PENDING',
-                message: `You already have a pending upgrade to ${pu.planName}. Complete or cancel that payment before starting a new one.`,
-                data: { pendingUpgrade: { planName: pu.planName, shortUrl: pu.shortUrl || '' } },
-            });
+            // An abandoned checkout (card declined, tab closed) leaves the
+            // Razorpay subscription cancelled / expired while our stash
+            // still says "pending", and the tenant was stuck behind this
+            // 409 with no way out. Ask Razorpay first: a dead subscription
+            // is cleared here and the new upgrade proceeds. A live one
+            // (status created / authenticated / active) still blocks, and
+            // the tenant can clear it with DELETE /upgrade/pending.
+            let stale = false;
+            if (pu.razorpaySubscriptionId && isBillingConfigured()) {
+                try {
+                    const live = await fetchRazorpaySubscription(pu.razorpaySubscriptionId);
+                    stale = !!live && ['cancelled', 'expired', 'completed'].includes(live.status);
+                } catch (probeErr) {
+                    logger.warn(`tenantBilling.upgradePlan: pending subscription probe failed for ${pu.razorpaySubscriptionId}: ${probeErr.message}`);
+                }
+            }
+            if (stale) {
+                logger.info(`tenantBilling.upgradePlan[${restaurant.slug}]: clearing stale pending upgrade to ${pu.planSlug} (${pu.razorpaySubscriptionId})`);
+                restaurant.subscription.pendingUpgrade = undefined;
+                await restaurant.save();
+            } else {
+                return res.status(409).json({
+                    success: false,
+                    code: 'UPGRADE_ALREADY_PENDING',
+                    message: `You already have a pending upgrade to ${pu.planName}. Complete or cancel that payment before starting a new one.`,
+                    data: { pendingUpgrade: { planName: pu.planName, planSlug: pu.planSlug, shortUrl: pu.shortUrl || '' } },
+                });
+            }
         }
 
         // 2. Pending downgrade request awaiting Super Admin? Reject
@@ -1268,5 +1290,81 @@ exports.cancelScheduledDowngrade = async (req, res) => {
     } catch (err) {
         logger.error('tenantBilling.cancelScheduledDowngrade error: ' + err.message);
         return res.status(500).json({ success: false, message: 'Failed to cancel scheduled downgrade' });
+    }
+};
+
+/**
+ * DELETE /api/v1/tenant/billing/upgrade/pending
+ *
+ * Abandon an upgrade that never got paid. The "Complete or cancel that
+ * payment" 409 promised a cancel path that did not exist: a tenant whose
+ * card was declined kept their old plan AND could not start the upgrade
+ * again. This clears the stash (the live plan is untouched — it was never
+ * applied) and cancels the Razorpay subscription so the tenant can't be
+ * charged later for a plan they gave up on. A fallback Orders-API upgrade
+ * has nothing to cancel at Razorpay: an unpaid order simply expires.
+ *
+ * Razorpay cancel failures are tolerated (logged, razorpayCancelled false):
+ * the subscription may already be cancelled / expired on their side, and
+ * leaving the tenant stuck is the worse outcome.
+ */
+exports.cancelPendingUpgrade = async (req, res) => {
+    try {
+        if (!req.restaurant) {
+            return res.status(400).json({ success: false, message: 'No tenant context' });
+        }
+        const restaurant = await Restaurant.findById(req.restaurant._id);
+        if (!restaurant) {
+            return res.status(404).json({ success: false, message: 'Restaurant not found' });
+        }
+        const pu = restaurant.subscription?.pendingUpgrade;
+        if (!pu?.planSlug) {
+            return res.status(404).json({
+                success: false,
+                code: 'NO_PENDING_UPGRADE',
+                message: 'There is no pending upgrade to cancel.',
+            });
+        }
+
+        let razorpayCancelled = false;
+        if (pu.razorpaySubscriptionId && isBillingConfigured()) {
+            try {
+                await cancelRazorpaySubscription(pu.razorpaySubscriptionId, false);
+                razorpayCancelled = true;
+            } catch (cancelErr) {
+                logger.warn(`tenantBilling.cancelPendingUpgrade[${restaurant.slug}]: Razorpay cancel failed for ${pu.razorpaySubscriptionId}: ${cancelErr.message}`);
+            }
+        }
+
+        const cancelled = {
+            planName: pu.planName,
+            planSlug: pu.planSlug,
+            razorpaySubscriptionId: pu.razorpaySubscriptionId || '',
+        };
+        restaurant.subscription.pendingUpgrade = undefined;
+        await restaurant.save();
+
+        try {
+            await AuditLog.create({
+                actor: req.user?._id || null,
+                actorEmail: req.user?.email || '',
+                actorRole: req.user?.role || 'admin',
+                action: 'restaurant.self_upgrade_cancelled',
+                targetType: 'restaurant',
+                targetId: restaurant._id,
+                details: { to: cancelled.planSlug, razorpaySubscriptionId: cancelled.razorpaySubscriptionId, razorpayCancelled },
+            });
+        } catch (auditErr) {
+            logger.warn('tenantBilling.cancelPendingUpgrade: audit write failed: ' + auditErr.message);
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `Pending upgrade to ${cancelled.planName} cancelled. Your current plan is unchanged.`,
+            data: { cancelledPlanSlug: cancelled.planSlug, razorpayCancelled },
+        });
+    } catch (err) {
+        logger.error('tenantBilling.cancelPendingUpgrade error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to cancel the pending upgrade' });
     }
 };

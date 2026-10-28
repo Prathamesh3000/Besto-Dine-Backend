@@ -196,6 +196,18 @@ const settingsSchema = new mongoose.Schema({
     },
   },
 
+  // Where the restaurant receives UPI "pay at the table" money. The bill
+  // prints a QR for the exact amount due that pays straight into this UPI
+  // ID (no Razorpay); the captain confirms the payment manually. Edited
+  // via PATCH /settings/payments (admin / manager). Normalised (trim,
+  // lowercase VPA, control chars stripped) in settingsController. Staff
+  // roles other than admin/manager only ever see a masked id, and the
+  // public settings never include this section.
+  payments: {
+    upiId:        { type: String, default: '', trim: true, lowercase: true, maxlength: [100, 'UPI ID cannot exceed 100 characters'] },
+    upiPayeeName: { type: String, default: '', trim: true, maxlength: [60, 'Payee name cannot exceed 60 characters'] },
+  },
+
   // Thermal printers (KOT / bill) for THIS branch. Not inherited: each
   // location has its own printers and its own print agent (the small
   // program on the counter PC that talks to them — see print-agent/).

@@ -182,6 +182,43 @@ describe('renderBill', () => {
     });
 });
 
+describe('renderBill: UPI scan-to-pay block', () => {
+    const upi = { uri: 'upi://pay?pa=cafe@okaxis&pn=Cafe&am=120.00&cu=INR', amount: 120, payeeName: 'Tip Top Cafe' };
+
+    test('without `upi` the slip is unchanged (no qr line, no heading)', () => {
+        const doc = renderBill({ settings: settings(), order: order(), tableLabel: '5', paperWidth: '80' });
+        expect(doc.lines.some((l) => l.qr)).toBe(false);
+        expect(toPlainText(doc)).not.toContain('Scan to pay');
+    });
+
+    test('with `upi`: heading, qr line (size 6, centred, text marker), amount and payee - never the UPI id', () => {
+        const doc = renderBill({ settings: settings(), order: order(), tableLabel: '5', paperWidth: '80', upi });
+        const i = doc.lines.findIndex((l) => l.qr);
+        expect(i).toBeGreaterThan(0);
+        expect(doc.lines[i]).toMatchObject({ qr: upi.uri, size: 6, a: 'c' });
+        expect(doc.lines[i].t.trim()).toBe('[UPI QR: Rs 120.00]');
+        expect(doc.lines[i].t).toHaveLength(48);
+        expect(doc.lines[i - 1].t.trim()).toBe('Scan to pay');
+        const text = toPlainText(doc);
+        expect(text).toContain('Pay Rs 120.00');
+        expect(text).toContain('Tip Top Cafe');
+        expect(text).not.toContain('okaxis');
+        expect(text.indexOf('TOTAL')).toBeLessThan(text.indexOf('Scan to pay'));
+        expect(text.indexOf('Scan to pay')).toBeLessThan(text.indexOf('Thank you'));
+    });
+
+    test('58 mm: marker is centred in 32 columns', () => {
+        const doc = renderBill({ settings: settings(), order: order(), tableLabel: '5', paperWidth: '58', upi });
+        expect(doc.lines.find((l) => l.qr).t).toHaveLength(32);
+    });
+
+    test('a zero amount or missing uri adds nothing', () => {
+        for (const bad of [{ ...upi, amount: 0 }, { ...upi, uri: '' }]) {
+            expect(renderBill({ settings: settings(), order: order(), upi: bad }).lines.some((l) => l.qr)).toBe(false);
+        }
+    });
+});
+
 describe('renderTest', () => {
     test('test page carries the printer name, station, a full-width column ruler and a cut', () => {
         const doc = renderTest({ cafeName: 'The Coffee House', printer: { name: 'Kitchen 1', station: 'kitchen', paperWidth: '58' } });

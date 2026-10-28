@@ -14,6 +14,7 @@ const {
     getDowngradeRequest,
     cancelDowngradeRequest,
     cancelScheduledDowngrade,
+    cancelPendingUpgrade,
 } = require('../controllers/tenantBillingController');
 
 /**
@@ -39,6 +40,10 @@ router.post('/upgrade',        protect, adminExclusive, upgradePlan);
 // (local dev, missing webhook secret, etc.). Idempotent: the webhook
 // remains the safety net for tab-close-after-pay cases.
 router.post('/upgrade/verify', protect, adminExclusive, verifyUpgradePayment);
+
+// Abandon an unpaid upgrade (declined card, closed checkout). Clears the
+// stash and cancels the Razorpay subscription; the live plan is untouched.
+router.delete('/upgrade/pending', protect, adminExclusive, cancelPendingUpgrade);
 // Recovery path when the Razorpay webhook can't reach the server.
 // Pulls subscription state + payments directly from Razorpay's API
 // and materialises any missing SubscriptionInvoice rows.

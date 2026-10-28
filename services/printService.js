@@ -28,6 +28,7 @@ const { signTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware')
 const EVENTS = require('../realtime/events');
 const logger = require('../utils/logger');
 const { renderKot, renderBill, renderTest } = require('../utils/receiptRenderer');
+const { billUpiBlock } = require('./upiPayment');
 
 const DEFAULT_PRINTERS = Object.freeze({
     enabled: false,
@@ -170,7 +171,7 @@ async function createJob(fields) {
  * auto-print flag for `reason` is off, or a station has no printer.
  * @returns {Promise<PrintJob[]>}
  */
-async function enqueueKotJobs({ order, items, reason = 'create' }) {
+async function enqueueKotJobs({ order, items, reason = 'create', kot = null }) {
     try {
         if (!order) return [];
         const cfg = await resolvePrinters(order.restaurant, order.branch);
@@ -180,6 +181,11 @@ async function enqueueKotJobs({ order, items, reason = 'create' }) {
         if (reason === 'append' && !p.autoPrint.kotOnAppend) return [];
         const lines = (items && items.length ? items : order.items) || [];
         if (!lines.length) return [];
+        // KOT numbers for the slip header: passed by append / repeat /
+        // reprint; a fresh order carries its round-1 entry in kots[].
+        const kotInfo = kot || (reason === 'create' && order.kots && order.kots[0]
+            ? { kotNo: order.kots[0].kotNo, ticketNo: order.kots[0].ticketNo }
+            : null);
 
         const byStation = new Map();
         for (const it of lines) {
@@ -197,7 +203,7 @@ async function enqueueKotJobs({ order, items, reason = 'create' }) {
             }
             const document = renderKot({
                 cafeName: cfg.general.cafeName, order, items: stationItems, station, tableLabel, reason,
-                waiterName, paperWidth: printer.paperWidth, timezone: cfg.general.timezone,
+                waiterName, paperWidth: printer.paperWidth, timezone: cfg.general.timezone, kot: kotInfo,
             });
             jobs.push(await createJob({
                 restaurant: cfg.rid, branch: cfg.branchId, order: order._id, orderId: order.orderId,
@@ -215,17 +221,49 @@ async function enqueueKotJobs({ order, items, reason = 'create' }) {
  * Bill to the counter printer.
  * @returns {Promise<{job?: PrintJob, agentOnline?: boolean, skipped?: string}>}
  */
-async function enqueueBillJob({ order, reason = 'manual', openDrawer = false }) {
+/**
+ * THE bill document builder: the printed bill job and the staff preview
+ * (GET /orders/:id/bill/preview) both come through here, so what staff
+ * preview is exactly what the printer receives.
+ */
+async function buildBillDocument({ order, cfg, printer, openDrawer = false }) {
+    const { tableLabel } = await resolveNames(order, cfg.rid);
+    // UNPAID bill + restaurant UPI id configured -> "Scan to pay" QR for the
+    // exact amount due (null otherwise: paid / no UPI id print as before).
+    let upi = null;
+    try { upi = await billUpiBlock(order, { tableLabel }); } catch (err) { logger.warn(`print: UPI QR skipped for ${order?.orderId}: ${err.message}`); }
+    return renderBill({ settings: { general: cfg.general }, order, tableLabel, paperWidth: printer?.paperWidth, openDrawer, upi });
+}
+
+/** Bill document exactly as the counter printer would get it (no job is created). */
+async function previewBillDocument({ order, printerId = null }) {
+    const cfg = await resolvePrinters(order.restaurant, order.branch);
+    const list = cfg.printers.list || [];
+    const printer = (printerId ? list.find((x) => x && x.id === printerId && x.enabled !== false) : printerForStation(list, 'counter')) || null;
+    const document = await buildBillDocument({ order, cfg, printer });
+    return { document, printer: printer ? { id: printer.id, name: printer.name, paperWidth: printer.paperWidth || '80' } : null };
+}
+
+/**
+ * Bill to the counter printer, or to `printerId` (any enabled printer
+ * configured for the order's branch) when given.
+ */
+async function enqueueBillJob({ order, reason = 'manual', openDrawer = false, printerId = null }) {
     try {
         if (!order) return { skipped: 'NO_ORDER' };
         const cfg = await resolvePrinters(order.restaurant, order.branch);
         const p = cfg.printers;
         if (!p.enabled) return { skipped: 'PRINTING_DISABLED' };
         if (reason === 'paid' && !p.autoPrint.billOnPaid) return { skipped: 'AUTO_BILL_OFF' };
-        const printer = printerForStation(p.list, 'counter');
-        if (!printer) return { skipped: 'NO_COUNTER_PRINTER' };
-        const { tableLabel } = await resolveNames(order, cfg.rid);
-        const document = renderBill({ settings: { general: cfg.general }, order, tableLabel, paperWidth: printer.paperWidth, openDrawer });
+        let printer;
+        if (printerId) {
+            printer = (p.list || []).find((x) => x && x.id === printerId && x.enabled !== false);
+            if (!printer) return { skipped: 'PRINTER_NOT_FOUND' };
+        } else {
+            printer = printerForStation(p.list, 'counter');
+            if (!printer) return { skipped: 'NO_COUNTER_PRINTER' };
+        }
+        const document = await buildBillDocument({ order, cfg, printer, openDrawer });
         const job = await PrintJob.create({
             restaurant: cfg.rid, branch: cfg.branchId, order: order._id, orderId: order.orderId,
             kind: 'bill', station: 'counter', reason, printer: snapshot(printer), document,
@@ -289,6 +327,32 @@ async function agentPresence(restaurantId, branchId) {
     const cfg = await resolvePrinters(restaurantId, branchId);
     const sockets = await agentSockets(cfg.rid, cfg.branchId);
     return { online: sockets.length > 0, count: sockets.length, agentId: cfg.printers.agent.agentId || '', lastSeenAt: cfg.printers.agent.lastSeenAt || null, branch: cfg.branchId };
+}
+
+/**
+ * Staff-safe printer status for a branch: agent presence, printer names
+ * and the default counter printer. No hosts, ports or device paths.
+ */
+async function staffStatus(restaurantId, branchId) {
+    const cfg = await resolvePrinters(restaurantId, branchId);
+    const sockets = await agentSockets(cfg.rid, cfg.branchId);
+    const counter = printerForStation(cfg.printers.list, 'counter');
+    return {
+        agentOnline: sockets.length > 0,
+        printingEnabled: !!cfg.printers.enabled,
+        printers: (cfg.printers.list || []).filter(Boolean).map((p) => ({
+            _id: p.id, name: p.name, station: p.station, isDefault: !!counter && counter.id === p.id, enabled: p.enabled !== false,
+        })),
+        counterPrinter: counter ? { _id: counter.id, name: counter.name } : null,
+        branch: cfg.branchId,
+    };
+}
+
+/** One job of a tenant (optionally pinned to a branch), without its document. */
+async function getJobForStaff(restaurantId, jobId, branchId = null) {
+    const filter = { _id: jobId, restaurant: idOf(restaurantId) };
+    if (branchId) filter.branch = idOf(branchId);
+    return PrintJob.findOne(filter).select('-document').lean();
 }
 
 async function settingsDocForScope(scope) {
@@ -360,6 +424,7 @@ module.exports = {
     resolveScope, resolvePrinters, printerForStation,
     enqueueKotJobs, enqueueBillJob, enqueueTestJob,
     listPending, listRecent, ackJob, agentPresence,
+    previewBillDocument, buildBillDocument, staffStatus, getJobForStaff, resolveNames,
     issueAgentKey, revokeAgentKey, verifyAgentClaims, markAgentSeen,
     toWire, DEFAULT_PRINTERS,
 };

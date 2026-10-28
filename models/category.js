@@ -33,9 +33,12 @@ const categorySchema = new mongoose.Schema({
         default: 0,
         index: true
     },
+    // Empty when the admin never uploaded one: the UI shows a blank box.
+    // (Older rows still carry '/uploads/Thumbnil.png'; the healer and
+    // Seed/clearStockImages.js clear it.)
     image: {
         type: String,
-        default: '/uploads/Thumbnil.png'
+        default: ''
     },
     status: {
         type: String,

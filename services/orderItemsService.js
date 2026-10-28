@@ -34,6 +34,8 @@ const { scanSessionFromReq, orderAccessForCaller } = require('./orderAccess');
 const pricing = require('./orderPricingService');
 const { notifyCounterOrderReady } = require('./orderNotifications');
 const { nextTokenNumber, tokenModeFor, tablesDisabledError } = require('../utils/orderToken');
+const kotRounds = require('../utils/kotRounds');
+const { assertBillNotFinal, billFinalizedError } = require('../utils/billWorkspace');
 
 // Token-number mode (operations profile tables.useTables:false, design
 // §12.2): a repeat that creates a NEW dine-in order gets a token like
@@ -209,13 +211,19 @@ function repeatPartyFilter(sourceOrder) {
 // the same helper appendOrderItems uses (GST / service charge / additional
 // charges on the added items). Returns the change in order.total.
 async function appendRepeatItemsToOrder(req, order, items, bareDelta) {
+  // A finalised bill is locked (Save Bill, D4) — refuse before any round is claimed.
+  assertBillNotFinal(order);
   // Pin legacy items' addedAt before save (see appendOrderItems).
   for (const existing of order.items) {
     if (!existing.addedAt) existing.addedAt = order.createdAt;
   }
+  // Next KOT round for this send (stamps kotNo on `items` before the merge).
+  const kotRound = await kotRounds.beginAppendRound(order, items, { sentBy: req.user?._id || null });
   const subtotalBefore = lineItemsSubtotal(order.items);
   const totalBefore = Number(order.total) || 0;
   appendItemsMerging(order.items, items);
+  kotRounds.recordRound(order, kotRound, items);
+  order.__kotRound = kotRound; // read by the caller for the response / print; not persisted
   await pricing.applyAppendToBill(req, order, subtotalBefore, bareDelta);
   return Math.round((order.total - totalBefore) * 100) / 100;
 }
@@ -348,31 +356,38 @@ async function repeatOrderItem(req) {
       emitToKitchen(io, sourceOrder.branch || null, 'order:new', { orderId: sourceOrder.orderId });
     } catch { /* socket best-effort */ }
 
+    const repeatKot = { kotNo: sourceOrder.__kotRound.kotNo, ticketNo: sourceOrder.__kotRound.ticketNo };
     emitOrderEvent(
       'order:appended',
-      { orderId: sourceOrder.orderId, addedItems: [stampedItem], deltaTotal: repeatDelta },
+      { orderId: sourceOrder.orderId, addedItems: [stampedItem], deltaTotal: repeatDelta, ...repeatKot },
       sourceOrder
     );
     // Thermal "ADDED ITEMS" KOT for the repeated line (best-effort).
-    require('./printService').enqueueKotJobs({ order: sourceOrder, items: [stampedItem], reason: 'append' }).catch(() => {});
+    require('./printService').enqueueKotJobs({ order: sourceOrder, items: [stampedItem], reason: 'append', kot: repeatKot }).catch(() => {});
     emitOrderEvent(
       'order:updated',
       { orderId: sourceOrder.orderId, status: sourceOrder.status },
       sourceOrder
     );
 
-    return reply(200, { success: true, order: sourceOrder, message: 'Item added to existing order' });
+    return reply(200, { success: true, order: sourceOrder, ...repeatKot, message: 'Item added to existing order' });
   }
 
   // If source order is CLOSED, create a NEW order for the same table
   const newOrderId = sourceOrder.type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
 
+  // A repeat that opens a fresh order is that order's KOT round 1.
+  const repeatKotDoc = { items: [itemForKitchen] };
+  const repeatTicketNo = await kotRounds.nextTicketNo(tenantId(req), sourceOrder.branch || null);
+  kotRounds.stampFirstRound(repeatKotDoc, { ticketNo: repeatTicketNo, sentBy: req.user?._id || null });
   const newOrder = new Order({
     orderId: newOrderId,
     restaurant: tenantId(req),
     user: sourceOrder.user,
     type: sourceOrder.type,
     table: repeatTable,
+    kotRoundSeq: repeatKotDoc.kotRoundSeq,
+    kots: repeatKotDoc.kots,
     tokenNumber: await tokenFor(),
     customerName: sourceOrder.customerName,
     phone: sourceOrder.phone,
@@ -407,7 +422,7 @@ async function repeatOrderItem(req) {
     emitToAdmin(io, savedOrder.branch, 'notification:new', { title: 'New Order (Repeat)', description: `Order ${savedOrder.orderId} repeated from ${sourceOrder.orderId}` });
   } catch { }
 
-  return reply(200, { success: true, order: savedOrder, message: 'New order created from repeat' });
+  return reply(200, { success: true, order: savedOrder, kotNo: 1, ticketNo: repeatTicketNo, message: 'New order created from repeat' });
 }
 
 // ── Repeat a whole order: steps ─────────────────────────────────────
@@ -659,16 +674,18 @@ async function appendRepeatToActiveOrder(req, { target, sourceOrder, repeatKitch
     emitToKitchen(io, target.branch || null, 'order:new', { orderId: target.orderId });
   } catch { /* socket best-effort */ }
 
-  emitOrderEvent('order:appended', { orderId: target.orderId, addedItems: repeatKitchen, deltaTotal }, target);
+  const kot = { kotNo: target.__kotRound.kotNo, ticketNo: target.__kotRound.ticketNo };
+  emitOrderEvent('order:appended', { orderId: target.orderId, addedItems: repeatKitchen, deltaTotal, ...kot }, target);
   emitOrderEvent('order:updated', { orderId: target.orderId, status: target.status }, target);
   // Thermal "ADDED ITEMS" KOT for the repeated lines (best-effort).
-  require('./printService').enqueueKotJobs({ order: target, items: repeatKitchen, reason: 'append' }).catch(() => {});
+  require('./printService').enqueueKotJobs({ order: target, items: repeatKitchen, reason: 'append', kot }).catch(() => {});
 
   const isSource = target === sourceOrder;
   return reply(200, {
     success: true,
     order: target,
     appended: true,
+    ...kot,
     isSplit: !!counterSideOrder,
     splitOrder: counterSideOrder || null,
     message: counterSideOrder
@@ -683,9 +700,15 @@ async function appendRepeatToActiveOrder(req, { target, sourceOrder, repeatKitch
 async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf, tokenFor }) {
   // Source closed and no active order on the target table → create a fresh kitchen-side order.
   const newOrderId = sourceOrder.type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
+  // A repeat that opens a fresh order is that order's KOT round 1.
+  const kotDoc = { items: repeatKitchen };
+  const kotTicketNo = await kotRounds.nextTicketNo(tenantId(req), resolvedTargetBranch || null);
+  kotRounds.stampFirstRound(kotDoc, { ticketNo: kotTicketNo, sentBy: req.user?._id || null });
   const newOrder = new Order({
     orderId: newOrderId,
     restaurant: tenantId(req),
+    kotRoundSeq: kotDoc.kotRoundSeq,
+    kots: kotDoc.kots,
     branch: resolvedTargetBranch,
     user: sourceOrder.user,
     type: sourceOrder.type,
@@ -731,6 +754,8 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
   return reply(201, {
     success: true,
     order: savedOrder,
+    kotNo: 1,
+    ticketNo: kotTicketNo,
     isSplit: !!counterSideOrder,
     splitOrder: counterSideOrder || null,
     message: counterSideOrder
@@ -795,6 +820,8 @@ async function repeatOrderAllItems(req) {
   const kitchenTarget = repeatKitchen.length > 0
     ? await findRepeatAppendTarget(req, { sourceOrder, resolvedTargetTable, tf })
     : null;
+  // Refuse before the counter side is persisted: the target bill is final.
+  if (kitchenTarget) assertBillNotFinal(kitchenTarget);
   // Mixed repeat creating a fresh kitchen order → split like createOrder:
   // counter doc at its bare subtotal, kitchen doc carries the tax lines.
   const counterBare = repeatKitchen.length > 0 && !kitchenTarget;
@@ -899,6 +926,9 @@ async function appendOrderItems(req) {
     });
   }
 
+  // A finalised bill (Save Bill, D4) is locked until a captain reopens it.
+  assertBillNotFinal(order);
+
   // Branch-pinned staff cannot append to an order at another branch.
   const pinned = pinnedBranchId(req);
   if (pinned && order.branch && String(order.branch) !== String(pinned)) {
@@ -974,12 +1004,29 @@ async function appendOrderItems(req) {
   }
 
   // Bill before the append — the recompute applies the difference.
+  // Claim the next KOT round (atomic, see utils/kotRounds.js) and stamp it
+  // on the new lines BEFORE they are merged / pushed.
+  const kotRound = await kotRounds.beginAppendRound(order, enrichedItems, { sentBy: req.user?._id || null });
   const subtotalBefore = lineItemsSubtotal(order.items);
   appendItemsMerging(order.items, enrichedItems);
+  kotRounds.recordRound(order, kotRound, enrichedItems);
+  const kot = { kotNo: kotRound.kotNo, ticketNo: kotRound.ticketNo };
   // BUG FIX: recompute GST / service charge / additional charges over
   // the order's items instead of adding the bare item price to total.
   await pricing.applyAppendToBill(req, order, subtotalBefore, deltaTotal);
-  await order.save();
+  // Race guard: a Save Bill (final) may have landed after this order was
+  // loaded. `$where` adds the condition to save()'s update filter, so the
+  // append cannot persist onto a bill that became final in the DB meanwhile.
+  order.$where = { 'bill.status': { $ne: 'final' } };
+  try {
+    await order.save();
+  } catch (err) {
+    if (err && (err.name === 'DocumentNotFoundError' || err.name === 'VersionError')) {
+      const fresh = await Order.findOne({ _id: order._id, ...tenantFilter(req) }).select('bill orderId').lean();
+      if (fresh && fresh.bill && fresh.bill.status === 'final') throw billFinalizedError(fresh);
+    }
+    throw err;
+  }
   bumpMenuItemOrderCounts(enrichedItems, order.restaurant);
 
   // Emit an appended-specific event carrying just the delta so every
@@ -998,7 +1045,7 @@ async function appendOrderItems(req) {
     // sees it back in the live queue. Without this the card stays
     // in the Ready column and the new items are silently waiting.
     const io = getIO();
-    emitToKitchen(io, order.branch || null, 'order:new', { orderId: order.orderId });
+    emitToKitchen(io, order.branch || null, 'order:new', { orderId: order.orderId, ...kot });
 
     emitOrderEvent(
       'order:appended',
@@ -1006,11 +1053,12 @@ async function appendOrderItems(req) {
         orderId: order.orderId,
         addedItems: enrichedItems,
         deltaTotal,
+        ...kot,
       },
       order
     );
     // Thermal "ADDED ITEMS" KOT with only the new lines (best-effort).
-    require('./printService').enqueueKotJobs({ order, items: enrichedItems, reason: 'append' }).catch(() => {});
+    require('./printService').enqueueKotJobs({ order, items: enrichedItems, reason: 'append', kot }).catch(() => {});
     emitOrderEvent(
       'order:updated',
       { orderId: order.orderId, status: order.status },
@@ -1037,6 +1085,7 @@ async function appendOrderItems(req) {
     order,
     addedCount: enrichedItems.length,
     deltaTotal,
+    ...kot,
     message: `${enrichedItems.length} item(s) added to order`,
   });
 }

@@ -281,6 +281,26 @@ describe('POST /auth/login — staff', () => {
             expect(res.body.token).toBeUndefined();
         });
 
+        test('409 lists only {name, slug} of restaurants where the password matches', async () => {
+            const res = await login({ email, password: DEFAULT_PASSWORD, loginType: 'staff' });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('TENANT_DISAMBIGUATION_REQUIRED');
+            expect(res.body.restaurants).toHaveLength(2);
+            expect(res.body.restaurants).toEqual(expect.arrayContaining([
+                { name: A.restaurant.name, slug: A.slug },
+                { name: B.restaurant.name, slug: B.slug },
+            ]));
+            expect(res.body.token).toBeUndefined();
+        });
+
+        test('wrong password → generic 401 with no restaurants field', async () => {
+            const res = await login({ email, password: 'Wrong#Pass999', loginType: 'staff' });
+            expect(res.status).toBe(401);
+            expect(res.body.message).toBe('Invalid email or password');
+            expect(res.body.restaurants).toBeUndefined();
+            expect(res.body.code).toBeUndefined();
+        });
+
         test.each([
             ['X-Restaurant-Slug', (t) => ({ 'X-Restaurant-Slug': t.slug })],
             ['X-Restaurant', (t) => ({ 'X-Restaurant': t.slug.toUpperCase() })],

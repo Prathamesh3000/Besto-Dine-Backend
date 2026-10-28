@@ -19,6 +19,7 @@ const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
 const { publicOperationsOf } = require('../utils/operationsProfile');
 const { parseCsv } = require('../utils/csvParser');
 const logger = require('../utils/logger');
+const { billingStatesForTables } = require('../utils/paymentState');
 
 // Scan-session JWT — binds a guest's session to the physical table they
 // scanned, so a guest can't POST /orders with someone else's tableId.
@@ -39,7 +40,9 @@ const SCAN_TOKEN_TTL = process.env.SCAN_TOKEN_TTL || '4h';
 
 const { tenantFilter, tenantId, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const { getMainBranchId } = require('../utils/mainBranch');
-const { resolveMergeLeader, freeTableOrUnmergeGroup } = require('../utils/tableMerge');
+const { revokeTipsForOrder } = require('../utils/tipHelpers');
+const { resolveMergeLeader, freeTableOrUnmergeGroup, mergeGroupIdsOf } = require('../utils/tableMerge');
+const { endTableSessions } = require('../utils/tableSessions');
 const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
 
 // QA #14 — tell diners bound to these tables (they auto-join the
@@ -243,7 +246,11 @@ const getTables = async (req, res) => {
             .populate('currentDiner.user', 'name mobile email')
             .sort({ name: 1 });
 
-        res.status(200).json({ success: true, tables });
+        // Derived billing chip (Phase 4); table.status itself is untouched.
+        const billing = await billingStatesForTables(tables.map((t) => t._id), tenantFilter(req));
+        const out = tables.map((t) => ({ ...t.toJSON(), billingState: billing.get(String(t._id)) || null }));
+
+        res.status(200).json({ success: true, tables: out });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Error fetching tables', ...devError(error) });
     }
@@ -1031,6 +1038,29 @@ const unmergeTables = async (req, res) => {
     }
 };
 
+// GET /api/v1/tables/:id/assignments — who held this table (last 20,
+// newest first). Same tenant / branch scoping as assignWaiter.
+const getAssignmentHistory = async (req, res) => {
+    try {
+        const table = await Table.findOne({ _id: req.params.id, ...tenantFilter(req) })
+            .select('name branch assignedWaiter assignmentHistory')
+            .populate('assignedWaiter', 'name staffId')
+            .lean();
+        if (!table) return res.status(404).json({ success: false, message: 'Table not found' });
+        if (isOtherBranchTable(req, table)) {
+            return res.status(403).json({ success: false, code: 'BRANCH_MISMATCH', message: 'This table belongs to another branch.' });
+        }
+        const history = (table.assignmentHistory || []).slice().reverse();
+        res.status(200).json({
+            success: true,
+            table: { _id: table._id, name: table.name, assignedWaiter: table.assignedWaiter || null },
+            history,
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Error loading assignment history', ...devError(error) });
+    }
+};
+
 // Assign a waiter to a table
 const assignWaiter = async (req, res) => {
     try {
@@ -1070,28 +1100,91 @@ const assignWaiter = async (req, res) => {
         // waiters reassigning their floor), so don't trust a raw id from the
         // client — verify it resolves to a real floor-staff user in-tenant.
         // `waiterId` may be null/empty to CLEAR the assignment.
+        let waiter = null;
+        let overrideReason = '';
         if (waiterId) {
             if (!mongoose.isValidObjectId(waiterId)) {
                 return res.status(400).json({ success: false, message: 'Invalid waiter id' });
             }
-            const waiter = await User.findOne({
+            // Status is checked separately so an inactive account gets its
+            // own clear code instead of looking like "not found".
+            waiter = await User.findOne({
                 _id: waiterId,
                 role: { $in: ['waiter', 'captain'] },
-                status: 'active',
                 ...tenantFilter(req),
-            }).select('_id branch');
+            }).select('_id name branch status');
             if (!waiter) {
-                return res.status(404).json({ success: false, message: 'Waiter not found in this restaurant' });
+                return res.status(404).json({ success: false, code: 'WAITER_NOT_FOUND', message: 'Waiter not found in this restaurant' });
+            }
+            if (waiter.status !== 'active') {
+                return res.status(409).json({ success: false, code: 'STAFF_INACTIVE', message: `${waiter.name || 'That staff member'} is inactive and cannot be assigned tables.` });
             }
             // Don't hand a table to someone working a different branch.
             if (waiter.branch && table.branch && String(waiter.branch) !== String(table.branch)) {
                 return res.status(400).json({ success: false, code: 'BRANCH_MISMATCH', message: 'That waiter works at a different branch.' });
+            }
+
+            // Workload limit (D7): Operations `tables.maxTablesPerWaiter`
+            // (0 / absent = off). A new owner of the table over the limit
+            // needs an `overrideReason`, which is kept in the history.
+            const rawOverride = req.body.overrideReason;
+            overrideReason = typeof rawOverride === 'string' ? rawOverride.trim() : '';
+            if (rawOverride !== undefined && rawOverride !== null && rawOverride !== '' && overrideReason.length < 3) {
+                return res.status(400).json({ success: false, code: 'OVERRIDE_REASON_TOO_SHORT', message: 'overrideReason must be at least 3 characters.' });
+            }
+            const isNewOwner = String(table.assignedWaiter || '') !== String(waiter._id);
+            const limit = req.restaurant
+                ? Number(require('../utils/operationsProfile').resolveOperations(req.restaurant, { branchId: table.branch }).tables.maxTablesPerWaiter) || 0
+                : 0;
+            if (limit > 0 && isNewOwner) {
+                const current = await Table.countDocuments({
+                    assignedWaiter: waiter._id,
+                    isDeleted: { $ne: true },
+                    _id: { $ne: table._id },
+                    ...tenantFilter(req),
+                });
+                if (current + 1 > limit) {
+                    if (!overrideReason) {
+                        return res.status(409).json({
+                            success: false,
+                            code: 'WORKLOAD_LIMIT',
+                            message: `${waiter.name || 'That waiter'} already has ${current} tables (limit ${limit}). Send an overrideReason to assign anyway.`,
+                            current,
+                            limit,
+                        });
+                    }
+                    logger.info(`assignWaiter: workload limit ${limit} overridden for waiter ${waiter._id} on table ${table._id} by ${req.user?._id}: ${overrideReason}`);
+                } else {
+                    overrideReason = '';   // within the limit: nothing to record
+                }
+            } else {
+                overrideReason = '';
             }
         }
         const previousWaiterId = table.assignedWaiter ? String(table.assignedWaiter) : null;
 
         table.assignedWaiter = waiterId || null;
         await table.save();
+
+        // Assignment history (last 20). Recorded for assign, reassign and
+        // clear; skipped when nothing changed.
+        const newWaiterId = waiterId ? String(waiterId) : null;
+        if (newWaiterId !== previousWaiterId) {
+            try {
+                await Table.updateOne(
+                    { _id: table._id, ...tenantFilter(req) },
+                    { $push: { assignmentHistory: { $each: [{
+                        waiter: newWaiterId || null,
+                        waiterName: waiter?.name || '',
+                        assignedBy: req.user?._id || null,
+                        assignedByName: req.user?.name || '',
+                        at: new Date(),
+                        reason: overrideReason,
+                        cleared: !newWaiterId,
+                    }], $slice: -20 } } },
+                );
+            } catch (err) { logger.warn('assignWaiter: history write failed:', err.message); }
+        }
 
         const populatedTable = await Table.findById(table._id).populate('assignedWaiter', 'name staffId');
 
@@ -1144,6 +1237,41 @@ const assignWaiter = async (req, res) => {
     }
 };
 
+// Cancel every active-unpaid order on a table that staff are freeing (force
+// path writes off real bills; the no-force path only ever reaches here for
+// empty orders). Restores deducted inventory and notifies open views. Shared
+// by freeTable (one table) and freeAllTables (every table).
+async function cancelOpenOrdersForFree(req, openOrders, { force = false, reason = '' } = {}) {
+    if (!openOrders || openOrders.length === 0) return;
+    let restoreInventoryForOrder;
+    try { ({ restoreInventoryForOrder } = require('./inventoryController')); } catch { /* optional */ }
+    for (const o of openOrders) {
+        const hadItems = Array.isArray(o.items) && o.items.length > 0;
+        // AUDIT-EXEMPT: _id from the tenant-filtered openOrders query by the caller
+        const cancelRes = await Order.updateOne(
+            { _id: o._id, status: { $ne: 'cancelled' } },
+            { $set: {
+                status: 'cancelled',
+                cancelReason: hadItems ? 'walkout' : 'admin-void',
+                cancelReasonNote: 'Table closed by staff — open bill written off / reset for next diner',
+                cancelledAt: new Date(),
+                cancelledBy: req.user?._id || null,
+                ...(force ? { cancellationReason: String(reason).slice(0, 300) } : {}),
+            } }
+        );
+        // updateOne skips the status-transition hooks: reverse incentive
+        // entries (revokeTipsForOrder -> reverseIfVoidSafe) and pending tips.
+        if (cancelRes.modifiedCount) {
+            try { await revokeTipsForOrder(o, { reason: 'table force-freed (order cancelled)' }); } catch (err) { logger.warn(`freeTable tip/incentive reversal failed for ${o.orderId}: ${err.message}`); }
+        }
+        if (o.inventoryDeducted && restoreInventoryForOrder) {
+            restoreInventoryForOrder(o, tenantId(req), req.user?._id)
+                .catch(err => logger.warn(`freeTable inventory restore failed for ${o.orderId}: ${err.message}`));
+        }
+        try { getIO().to(`order:${o._id}`).emit(EVENTS.ORDER_UPDATED, { orderId: String(o._id), status: 'cancelled' }); } catch { /* best-effort */ }
+    }
+}
+
 // POST /api/v1/tables/:id/free
 // Force-free a table. Operates on EVERY still-active unpaid order on the
 // table (independent-orders model), not just the single `activeOrder`
@@ -1170,7 +1298,28 @@ const freeTable = async (req, res) => {
 
         if (tablesDisabled(req)) return tablesDisabledReply(res);
 
-        const table = await Table.findOne({ _id: id, ...tf }).select('_id status activeOrder branch restaurant');
+        // D1: force (write off an unpaid bill) is admin/manager only and
+        // needs a reason. Captains may free a table only when nothing is
+        // unpaid (the plain call below, which keeps the 409 preview).
+        const reason = String(req.body?.reason || '').trim();
+        if (force) {
+            if (!['admin', 'manager'].includes(req.user?.role)) {
+                return res.status(403).json({
+                    success: false,
+                    code: 'FORCE_REQUIRES_PRIVILEGE',
+                    message: 'Only an admin or manager can force-free a table with an unpaid bill.',
+                });
+            }
+            if (reason.length < 3) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'REASON_REQUIRED',
+                    message: 'A reason (at least 3 characters) is required to force-free a table.',
+                });
+            }
+        }
+
+        const table = await Table.findOne({ _id: id, ...tf }).select('_id status activeOrder branch restaurant name mergedWith');
         if (!table) {
             return res.status(404).json({ success: false, message: 'Table not found' });
         }
@@ -1204,39 +1353,39 @@ const freeTable = async (req, res) => {
             });
         }
 
+        // Sign out the diners seated here BEFORE the seats are wiped and BEFORE the open orders are
+        // cancelled (order owners are looked up among still-open orders): their
+        // scan sessions are revoked, logged-in customers are logged out and
+        // their open apps get `session:ended` (utils/tableSessions.js).
+        let io = null;
+        try { io = getIO(); } catch { /* socket best-effort */ }
+        const sessions = await endTableSessions({
+            tableIds: mergeGroupIdsOf(table),
+            tenantFilter: tf,
+            io,
+            reason: 'table-freed',
+        });
+
         // Cancel every active-unpaid order on the table (force path writes
         // off real bills; the no-force path only ever reaches here for
         // empty orders). Restore deducted inventory and notify open views.
-        if (openOrders.length > 0) {
-            let restoreInventoryForOrder;
-            try { ({ restoreInventoryForOrder } = require('./inventoryController')); } catch { /* optional */ }
-            for (const o of openOrders) {
-                const hadItems = Array.isArray(o.items) && o.items.length > 0;
-                // AUDIT-EXEMPT: _id from the tenant-filtered openOrders query above
-                await Order.updateOne(
-                    { _id: o._id, status: { $ne: 'cancelled' } },
-                    { $set: {
-                        status: 'cancelled',
-                        cancelReason: hadItems ? 'walkout' : 'admin-void',
-                        cancelReasonNote: 'Table closed by staff — open bill written off / reset for next diner',
-                        cancelledAt: new Date(),
-                    } }
-                );
-                if (o.inventoryDeducted && restoreInventoryForOrder) {
-                    restoreInventoryForOrder(o, tenantId(req), req.user?._id)
-                        .catch(err => logger.warn(`freeTable inventory restore failed for ${o.orderId}: ${err.message}`));
-                }
-                try { getIO().to(`order:${o._id}`).emit(EVENTS.ORDER_UPDATED, { orderId: String(o._id), status: 'cancelled' }); } catch { /* best-effort */ }
-            }
+        await cancelOpenOrdersForFree(req, openOrders, { force, reason });
+
+        if (force) {
+            logger.info('AUDIT table force-free', {
+                by: String(req.user?._id || ''), role: req.user?.role,
+                table: String(table._id), tableName: table.name,
+                orders: openOrders.map((o) => o.orderId),
+                reason: reason.slice(0, 300),
+            });
         }
 
         // Staff reset → every seat on the table / group is released.
         const { freedIds } = await freeTableOrUnmergeGroup(table._id, tf, { clearSeats: true });
 
         try {
-            const io = getIO();
             for (const freedId of freedIds) {
-                emitToStaff(io, table.branch, EVENTS.TABLE_UPDATED, { tableId: freedId, status: 'free' });
+                emitToStaff(io, table.branch, EVENTS.TABLE_UPDATED, { tableId: freedId, status: 'free', billingState: null });
             }
         } catch { /* socket best-effort */ }
 
@@ -1247,10 +1396,122 @@ const freeTable = async (req, res) => {
                 : 'Table freed',
             freedTableIds: freedIds,
             closedOrderCount: openOrders.length,
+            customersSignedOut: sessions.customersSignedOut,
         });
     } catch (error) {
         logger.error('freeTable error', { error: error.message });
         return res.status(500).json({ success: false, message: 'Failed to free table' });
+    }
+};
+
+// POST /api/v1/tables/free-all   (admin / manager)
+// "Close the floor": free every table in scope (the caller's pinned branch, or
+// the branch selected in the switcher, else the whole tenant) and sign out
+// every diner seated at them in the same moment.
+//   • no table has a real open bill → everything is freed.
+//   • some have items or money and `force` is NOT set → 409 ORDER_NOT_EMPTY
+//     with a PREVIEW ({ tableCount, orderCount, totalAmount }) so the operator
+//     sees exactly what a force-close writes off.
+//   • `force: true` + a reason (≥ 3 chars) → write off every open bill (same
+//     rules and audit as freeing one table), free all, sign everyone out.
+const freeAllTables = async (req, res) => {
+    try {
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
+        if (!['admin', 'manager'].includes(req.user?.role)) {
+            return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Only an admin or manager can free all tables.' });
+        }
+        const tf = tenantFilter(req);
+        const force = req.body?.force === true || String(req.query.force || '').toLowerCase() === 'true';
+        const reason = String(req.body?.reason || '').trim();
+        if (force && reason.length < 3) {
+            return res.status(400).json({
+                success: false,
+                code: 'REASON_REQUIRED',
+                message: 'A reason (at least 3 characters) is required to free all tables with unpaid bills.',
+            });
+        }
+
+        const scope = { ...tf, ...tableBranchFilter(req), isDeleted: { $ne: true } };
+        const tables = await Table.find({ ...scope, status: { $ne: 'disabled' } })
+            .select('_id status branch mergedWith name')
+            .lean();
+        // A branch-pinned caller never reaches another branch's tables (the
+        // filter above already scopes them); this is belt and braces.
+        const inScope = tables.filter((t) => !isOtherBranchTable(req, t));
+        const ids = inScope.map((t) => t._id);
+
+        const openOrders = ids.length === 0 ? [] : await Order.find({
+            table: { $in: ids },
+            status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready', 'served'] },
+            paymentStatus: { $ne: 'Paid' },
+            ...tf,
+        }).select('_id table status paymentStatus items amountPaid total inventoryDeducted restaurant branch orderId');
+
+        const isReal = (o) => (Array.isArray(o.items) && o.items.length > 0)
+            || o.paymentStatus === 'Partially Paid'
+            || Number(o.amountPaid || 0) > 0;
+        const realOrders = openOrders.filter(isReal);
+
+        if (realOrders.length > 0 && !force) {
+            const totalAmount = realOrders.reduce((s, o) => s + (Number(o.total) || 0), 0);
+            const realTables = new Set(realOrders.map((o) => String(o.table)));
+            return res.status(409).json({
+                success: false,
+                code: 'ORDER_NOT_EMPTY',
+                tableCount: realTables.size,
+                orderCount: realOrders.length,
+                totalAmount: Math.round(totalAmount * 100) / 100,
+                message: `${realTables.size} table(s) have ${realOrders.length} open order(s) totalling ₹${Math.round(totalAmount * 100) / 100}. Close or cancel the bills first, or force-close to write them off.`,
+            });
+        }
+
+        let io = null;
+        try { io = getIO(); } catch { /* socket best-effort */ }
+
+        // Sign everyone out first (needs the seats), in one pass over every
+        // table plus any merge-group sibling.
+        const everyId = new Set();
+        for (const t of inScope) for (const gid of mergeGroupIdsOf(t)) everyId.add(String(gid));
+        const sessions = await endTableSessions({
+            tableIds: [...everyId],
+            tenantFilter: tf,
+            io,
+            reason: 'all-tables-freed',
+        });
+
+        await cancelOpenOrdersForFree(req, openOrders, { force, reason });
+
+        if (force) {
+            logger.info('AUDIT free-all tables', {
+                by: String(req.user?._id || ''), role: req.user?.role,
+                tables: inScope.length, orders: openOrders.map((o) => o.orderId), reason: reason.slice(0, 300),
+            });
+        }
+
+        // Then free each table / group once.
+        const done = new Set();
+        const freedAll = [];
+        for (const t of inScope) {
+            if (done.has(String(t._id))) continue;
+            const { freedIds } = await freeTableOrUnmergeGroup(t._id, tf, { clearSeats: true });
+            for (const fid of freedIds) { done.add(String(fid)); freedAll.push(String(fid)); }
+            try {
+                for (const fid of freedIds) {
+                    emitToStaff(io, t.branch, EVENTS.TABLE_UPDATED, { tableId: fid, status: 'free', billingState: null });
+                }
+            } catch { /* socket best-effort */ }
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `${freedAll.length} table(s) freed${openOrders.length > 0 ? `, ${openOrders.length} open order(s) closed` : ''}`,
+            freedTableCount: freedAll.length,
+            closedOrderCount: openOrders.length,
+            customersSignedOut: sessions.customersSignedOut,
+        });
+    } catch (error) {
+        logger.error('freeAllTables error', { error: error.message });
+        return res.status(500).json({ success: false, message: 'Failed to free all tables' });
     }
 };
 
@@ -1664,7 +1925,9 @@ module.exports = {
     mergeTables,
     unmergeTables,
     assignWaiter,
+    getAssignmentHistory,
     freeTable,
+    freeAllTables,
     claimTable,
     downloadTablesTemplate,
     importTablesCsv,

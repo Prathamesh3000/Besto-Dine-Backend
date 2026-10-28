@@ -10,6 +10,16 @@
 jest.mock('../utils/idGenerator', () => ({ orderId: () => 'ORD-T', takeawayOrderId: () => 'TK-T' }));
 jest.mock('../utils/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
+// KOT round allocation needs the DB (atomic counter on the order); these
+// are pure bill-math tests on plain objects, so stub it out.
+jest.mock('../utils/kotRounds', () => ({
+  beginAppendRound: jest.fn(async (order, items) => {
+    for (const it of items) it.kotNo = 2;
+    return { kotNo: 2, ticketNo: 7, sentBy: null, sentAt: new Date() };
+  }),
+  recordRound: jest.fn(),
+}));
+
 const TAXES = {
   gst: { enabled: true, value: 5 },
   serviceCharge: { enabled: true, value: 10 },

@@ -640,3 +640,118 @@ describe('feature gates on real routes', () => {
         expect(res.status).toBe(403);
     });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Abandoned upgrades. Regression (fixed 2026-10-27): a declined card left
+// `pendingUpgrade` stashed forever; POST /upgrade answered 409 "complete or
+// cancel that payment" but no cancel route existed and the page never
+// showed the pending upgrade, so the tenant was stuck on the old plan.
+describe('DELETE /tenant/billing/upgrade/pending', () => {
+    async function stashPending(t, subId) {
+        rzp.instance.customers.create.mockResolvedValue({ id: `cust_${subId}` });
+        rzp.instance.subscriptions.create.mockResolvedValue({ id: subId, status: 'created', short_url: `https://rzp.io/i/${subId}` });
+        const res = await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.pro._id) });
+        expect(res.status).toBe(200);
+        expect((await sub(t)).pendingUpgrade.razorpaySubscriptionId).toBe(subId);
+    }
+
+    test('cancels the Razorpay subscription, clears the stash, keeps the live plan; second call → 404; a new upgrade is then accepted', async () => {
+        const t = await seedTenant({ label: 'cx1' });
+        await putOnPlan(t, plans.basic);
+        await stashPending(t, 'sub_cx1');
+        rzp.instance.subscriptions.cancel.mockResolvedValue({ id: 'sub_cx1', status: 'cancelled' });
+
+        const res = await owner(t).delete('/tenant/billing/upgrade/pending');
+        expect(res.status).toBe(200);
+        expect(res.body.data).toMatchObject({ cancelledPlanSlug: 'pro-sb', razorpayCancelled: true });
+        expect(rzp.instance.subscriptions.cancel).toHaveBeenCalledWith('sub_cx1', false);
+
+        const s = await sub(t);
+        expect(s.pendingUpgrade?.planSlug).toBeFalsy();
+        expect(s.planSlug).toBe('basic-sb');
+        expect(s.features.crm).toBe(false);
+
+        const audit = await AuditLog.findOne({ action: 'restaurant.self_upgrade_cancelled', targetId: t.restaurant._id }).lean();
+        expect(audit).toBeTruthy();
+        expect(audit.details).toMatchObject({ to: 'pro-sb', razorpayCancelled: true });
+
+        const again = await owner(t).delete('/tenant/billing/upgrade/pending');
+        expect(again.status).toBe(404);
+        expect(again.body.code).toBe('NO_PENDING_UPGRADE');
+
+        // The tenant can start over.
+        rzp.instance.subscriptions.create.mockResolvedValue({ id: 'sub_cx2', status: 'created', short_url: 'https://rzp.io/i/cx2' });
+        const retry = await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.pro._id) });
+        expect(retry.status).toBe(200);
+        expect((await sub(t)).pendingUpgrade.razorpaySubscriptionId).toBe('sub_cx2');
+    });
+
+    test('a Razorpay cancel failure is tolerated: the stash is still cleared (razorpayCancelled false)', async () => {
+        const t = await seedTenant({ label: 'cx2' });
+        await putOnPlan(t, plans.basic);
+        await stashPending(t, 'sub_cx2f');
+        rzp.instance.subscriptions.cancel.mockRejectedValue(new Error('already cancelled'));
+        const res = await owner(t).delete('/tenant/billing/upgrade/pending');
+        expect(res.status).toBe(200);
+        expect(res.body.data).toMatchObject({ cancelledPlanSlug: 'pro-sb', razorpayCancelled: false });
+        expect((await sub(t)).pendingUpgrade?.planSlug).toBeFalsy();
+    });
+
+    test('a fallback-order pending upgrade is cleared without calling Razorpay', async () => {
+        const t = await seedTenant({ label: 'cx3' });
+        await putOnPlan(t, plans.basic);
+        stubFallbackOrder('order_cx3');
+        const up = await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.premium._id) });
+        expect(up.status).toBe(200);
+        expect((await sub(t)).pendingUpgrade).toMatchObject({ planSlug: 'premium-sb', fallbackOrder: true });
+
+        const res = await owner(t).delete('/tenant/billing/upgrade/pending');
+        expect(res.status).toBe(200);
+        expect(res.body.data).toMatchObject({ cancelledPlanSlug: 'premium-sb', razorpayCancelled: false });
+        expect(rzp.instance.subscriptions.cancel).not.toHaveBeenCalled();
+        expect((await sub(t)).pendingUpgrade?.planSlug).toBeFalsy();
+    });
+
+    test('staff roles cannot cancel a tenant upgrade (403)', async () => {
+        const t = await seedTenant({ label: 'cx4' });
+        const res = await ctx.api.as(t.users.waiter).delete('/tenant/billing/upgrade/pending');
+        expect(res.status).toBe(403);
+    });
+});
+
+describe('POST /tenant/billing/upgrade — a pending upgrade whose Razorpay subscription died is cleared automatically', () => {
+    async function stashPending(t, subId) {
+        rzp.instance.customers.create.mockResolvedValue({ id: `cust_${subId}` });
+        rzp.instance.subscriptions.create.mockResolvedValue({ id: subId, status: 'created', short_url: `https://rzp.io/i/${subId}` });
+        expect((await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.pro._id) })).status).toBe(200);
+    }
+
+    test('cancelled on Razorpay → the new upgrade proceeds (200) and replaces the stash', async () => {
+        const t = await seedTenant({ label: 'st1' });
+        await putOnPlan(t, plans.basic);
+        await stashPending(t, 'sub_dead');
+        rzp.instance.subscriptions.fetch.mockResolvedValue({ id: 'sub_dead', status: 'cancelled' });
+        rzp.instance.subscriptions.create.mockResolvedValue({ id: 'sub_fresh', status: 'created', short_url: 'https://rzp.io/i/fresh' });
+
+        const res = await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.pro._id) });
+        expect(res.status).toBe(200);
+        expect(rzp.instance.subscriptions.fetch).toHaveBeenCalledWith('sub_dead');
+        expect((await sub(t)).pendingUpgrade.razorpaySubscriptionId).toBe('sub_fresh');
+    });
+
+    test('still "created" on Razorpay (or the probe fails) → 409 UPGRADE_ALREADY_PENDING with the plan slug for the UI', async () => {
+        const t = await seedTenant({ label: 'st2' });
+        await putOnPlan(t, plans.basic);
+        await stashPending(t, 'sub_live');
+        rzp.instance.subscriptions.fetch.mockResolvedValue({ id: 'sub_live', status: 'created' });
+        const res = await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.pro._id) });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('UPGRADE_ALREADY_PENDING');
+        expect(res.body.data.pendingUpgrade).toMatchObject({ planSlug: 'pro-sb', shortUrl: 'https://rzp.io/i/sub_live' });
+
+        // Probe failure (Razorpay unreachable) keeps the conservative 409.
+        rzp.instance.subscriptions.fetch.mockRejectedValue(new Error('network'));
+        expect((await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.pro._id) })).status).toBe(409);
+        expect((await sub(t)).pendingUpgrade.razorpaySubscriptionId).toBe('sub_live');
+    });
+});

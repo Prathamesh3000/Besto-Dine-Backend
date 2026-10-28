@@ -71,6 +71,7 @@ const FEATURE_LABELS = {
     whiteLabelBranding:  'own branding',
     revenueAnalytics:    'revenue analytics',
     kiosk:               'self-order kiosk',
+    incentives:          'staff incentives',
 };
 
 const TIER_LABELS = { basic: 'Basic', standard: 'Standard', advanced: 'Advanced' };

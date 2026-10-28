@@ -36,6 +36,20 @@ const shiftSchema = new mongoose.Schema({
         type: String,
         default: '',
     },
+    // Captain handover confirmation (POST /shifts/handover). A snapshot of
+    // what was open when the captain confirmed; it does NOT end the shift.
+    handover: {
+        type: new mongoose.Schema({
+            note: { type: String, default: '' },
+            cashCounted: { type: Number, default: null },
+            cashExpected: { type: Number, default: 0 },
+            variance: { type: Number, default: null },     // cashCounted - cashExpected
+            openTables: { type: [mongoose.Schema.Types.Mixed], default: [] },
+            unpaidBills: { type: [mongoose.Schema.Types.Mixed], default: [] },
+            confirmedAt: { type: Date, default: null },
+        }, { _id: false }),
+        default: undefined,
+    },
 }, { timestamps: true });
 
 // At most one active shift per staff member per tenant — makes clock-in

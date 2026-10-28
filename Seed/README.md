@@ -44,7 +44,7 @@ One-off data migrations / backfills live in [`../migrations/`](../migrations/REA
 |---|---|
 | `healCategoryImages.js` | Manual run of the scheduled category-image healer (`npm run heal:category-images`). |
 | `healMenuImages.js` | Manual run of the scheduled menu/combo image healer (`npm run heal:menu-images`). |
-| `applyMenuImages.js` | Refresh menu/combo photos from the curated pool (`--force`, `--dry`). |
+| `clearStockImages.js` | Clear stock-pool / placeholder images so un-photographed rows stay blank (dry run; `--apply`, `--restaurant <slug>`). |
 | `fetchMenuImagesGoogle.js` | Fetch dish photos via Google Custom Search (`GOOGLE_CSE_ID`/`GOOGLE_CSE_KEY`). |
 
 ## 5. Diagnostics (read-only)

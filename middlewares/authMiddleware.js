@@ -225,6 +225,33 @@ const captainOrAdmin = (req, res, next) => {
 };
 
 /**
+ * Product rule: bill + payment screens/actions belong to the captain (and
+ * admin/manager). A WAITER only takes orders. Role check only: a missing
+ * user (customer/guest on shared routes like /razorpay/*) passes through,
+ * and an admin-granted permission can never override it.
+ */
+const BILLING_CAPTAIN_ONLY = {
+    success: false,
+    code: 'BILLING_CAPTAIN_ONLY',
+    message: 'Billing and payment are handled by the captain',
+};
+const noWaiterBilling = (req, res, next) => {
+    if (req.user && req.user.role === 'waiter') {
+        return res.status(403).json({ ...BILLING_CAPTAIN_ONLY });
+    }
+    return next();
+};
+// Body keys that settle / discount / tip a bill through PATCH /orders/:id/status.
+const BILLING_STATUS_KEYS = ['paymentStatus', 'paymentMethod', 'amountPaid', 'cashReceived', 'manualDiscount', 'tipAmount'];
+const noWaiterBillingFields = (req, res, next) => {
+    const body = req.body || {};
+    if (req.user?.role === 'waiter' && BILLING_STATUS_KEYS.some((k) => body[k] !== undefined)) {
+        return res.status(403).json({ ...BILLING_CAPTAIN_ONLY });
+    }
+    return next();
+};
+
+/**
  * Any staff role — waiter, captain, chef, manager, admin
  */
 const staffOnly = (req, res, next) => {
@@ -440,6 +467,8 @@ module.exports = {
     adminOnly,
     adminExclusive,
     captainOrAdmin,
+    noWaiterBilling,
+    noWaiterBillingFields,
     staffOnly,
     optionalAuth,
     checkPermission,

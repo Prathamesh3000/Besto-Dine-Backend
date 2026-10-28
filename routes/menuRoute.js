@@ -17,6 +17,10 @@ const {
     downloadMenuItemTemplate,
 } = require('../controllers/menuController');
 const { protect, adminOnly, adminExclusive, checkPermission } = require('../middlewares/authMiddleware');
+const { makeLimiter } = require('../utils/rateLimitStore');
+const { ipKeyGenerator } = require('express-rate-limit');
+const { scanMenu } = require('../controllers/menuScanController');
+const { clearMenu } = require('../controllers/menuClearController');
 const { validate, body, isObjectIdLike, objectIdParam, optionalObjectId } = require('../middlewares/validate');
 
 // ── Request validation (BUGS_REPORT #33) ────────────────────────────────
@@ -110,6 +114,34 @@ const csvUpload = multer({
         cb(err, false);
     },
 });
+
+// Scan my menu — photos / PDF of a menu card in, DRAFT rows out (nothing is
+// saved; the owner confirms and the rows go through POST /import). Image and
+// PDF only, memory storage, and a small per-restaurant budget because every
+// scan is a paid AI call.
+const scanUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024, files: 6 },
+    fileFilter: (req, file, cb) => {
+        if (['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(file.mimetype)) return cb(null, true);
+        const err = new Error('Only JPG, PNG, WebP or PDF files are allowed');
+        err.status = 400;
+        err.expose = true;
+        cb(err, false);
+    },
+});
+const scanLimiter = makeLimiter({
+    name: 'menu-scan',
+    windowMs: 60 * 60 * 1000,
+    max: 15,
+    keyGenerator: (req) => String(req.restaurant?._id || req.user?.restaurant || ipKeyGenerator(req.ip)),
+    message: { success: false, code: 'SCAN_LIMIT', message: 'You have scanned a lot of menus this hour. Please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+router.post('/scan', protect, adminOnly, checkPermission('editMenu'), scanLimiter, scanUpload.array('files', 6), scanMenu);
+// Clear full menu — owner only, dry run for counts, typed confirmation to delete.
+router.post('/clear', protect, adminExclusive, checkPermission('editMenu'), clearMenu);
 
 // Public routes — specific paths BEFORE /:id param route
 router.get('/search', searchMenuItems);

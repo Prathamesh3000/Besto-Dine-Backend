@@ -11,7 +11,7 @@ const {
     verifyWalletRecharge,
     reconcilePayments,
 } = require('../controllers/razorpayController');
-const { optionalAuth, protect, adminOnly, checkPermission } = require('../middlewares/authMiddleware');
+const { optionalAuth, protect, adminOnly, checkPermission, noWaiterBilling } = require('../middlewares/authMiddleware');
 const { idempotency } = require('../middlewares/idempotency');
 const { featureGate } = require('../middlewares/featureGate');
 const { validate, body } = require('../middlewares/validate');
@@ -109,12 +109,12 @@ const refundLimiter = makeLimiter({ name: 'rzp-refund',
 // Verify / webhook / refund endpoints are deliberately left open so a
 // payment already in flight (or money already taken) can always settle.
 const gatewayGate = featureGate('paymentGateway');
-router.post('/create-order', paymentCreateLimiter, optionalAuth, gatewayGate, createOrderValidation, createRazorpayOrder);
+router.post('/create-order', paymentCreateLimiter, optionalAuth, noWaiterBilling, gatewayGate, createOrderValidation, createRazorpayOrder);
 // CRIT-16 — verify endpoints must be idempotent. Clients should send a
 // stable Idempotency-Key (e.g. the Razorpay order_id); retries replay the
 // cached response. Header is optional today for back-compat; tighten to
 // required once all callers are updated.
-router.post('/verify-payment', paymentVerifyLimiter, optionalAuth, verifyPaymentValidation, idempotency(), verifyPayment);
+router.post('/verify-payment', paymentVerifyLimiter, optionalAuth, noWaiterBilling, verifyPaymentValidation, idempotency(), verifyPayment);
 
 // Webhook — called by Razorpay server-to-server (no auth, signature verified in handler)
 router.post('/webhook', handleWebhook);

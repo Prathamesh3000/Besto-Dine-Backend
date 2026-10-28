@@ -20,7 +20,7 @@
  *   branch       the auto "Main" branch (utils/createMainBranch)
  *   settings     GST 5 %, service charge 0 (disabled), no extra charges,
  *                printers disabled; operations profile left absent
- *   users        admin / waiter / chef (tenant staff) + one customer,
+ *   users        admin / waiter / chef / captain (tenant staff) + one customer,
  *                all active, mustChangePassword: false, password Staging@123
  *   data         2 areas, 8 tables (QR tokens), 4 categories, 12 menu
  *                items, 5 orders in mixed statuses (incl. Paid + preparing),
@@ -71,6 +71,7 @@ const LOGINS = [
     { role: 'admin',    email: 'admin@staging.bestodine.test',    name: 'Staging Admin' },
     { role: 'waiter',   email: 'waiter@staging.bestodine.test',   name: 'Staging Waiter' },
     { role: 'chef',     email: 'chef@staging.bestodine.test',     name: 'Staging Chef' },
+    { role: 'captain',  email: 'captain@staging.bestodine.test',  name: 'Staging Captain' },
     { role: 'customer', email: 'customer@staging.bestodine.test', name: 'Staging Customer' },
 ];
 

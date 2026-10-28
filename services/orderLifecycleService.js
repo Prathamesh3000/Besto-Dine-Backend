@@ -166,6 +166,7 @@ async function cancelOrder(req) {
   }
   order.status = cancelled.status;
   order.note = cancelled.note;
+  require('./incentiveService').reverseIfVoidSafe(order, 'order cancelled by customer');
 
   // Free the table if it was dine-in (scoped). Unmerges the group if
   // the table is part of a merge so all siblings go back to 'free'

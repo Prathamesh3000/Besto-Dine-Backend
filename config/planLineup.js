@@ -29,6 +29,7 @@ const ALL_OFF = {
     multiBranch: false, staffPerformance: false, paymentGateway: false,
     dataExport: false, accountingExport: false, aggregatorOrders: false,
     eInvoice: false, webhooks: false, whiteLabelBranding: false, kiosk: false,
+    incentives: false,   // add-on only (utils/featureAccess ADDON_CATALOG)
 };
 
 const SILVER_FEATURES = {

@@ -142,7 +142,7 @@ describe('tables', () => {
 
     test.each([
         ['rename', (id) => adminA().put(`/tables/${id}`).send({ name: 'pwned' })],
-        ['free', (id) => adminA().post(`/tables/${id}/free`).send({ force: true })],
+        ['free', (id) => adminA().post(`/tables/${id}/free`).send({ force: true, reason: 'test reset' })],
         ['assign waiter', (id) => adminA().put(`/tables/${id}/assign`).send({ waiterId: String(A.users.waiter._id) })],
         ['rotate QR token', (id) => adminA().post(`/tables/${id}/qr-token`).send({})],
         ['delete', (id) => adminA().delete(`/tables/${id}`)],

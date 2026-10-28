@@ -32,6 +32,7 @@ const {
 } = require('../utils/planPaymentApply');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const AdvanceBooking = require('../models/advanceBooking');
+const paymentState = require('../utils/paymentState');
 const {
     checkWalletRechargePayment,
     checkOrderPaymentBinding,
@@ -297,6 +298,10 @@ async function markOrderPaidAtomically(order, { paymentId, razorpayOrderId, capt
         set.amountPaid = roundPaise(capturedAmount);
     }
     set.paidAt = order.paidAt || paidAt || new Date();
+    // Payment state block (Phase 4): verified path => 'paid'.
+    Object.assign(set, paymentState.paidSet({
+        method: set.paymentMethod, amount: capturedAmount, reference: paymentId,
+    }));
     const update = { $set: set };
     // Keep the settling checkout in the order's checkout history (4a).
     if (razorpayOrderId) update.$addToSet = { razorpayOrderIds: razorpayOrderId };
@@ -461,6 +466,26 @@ function buildReceipt(explicit, cafeOrderId) {
     return `${prefix}${id.slice(-budget)}_${stamp}`;
 }
 
+// Resolve a tenant-owned order by _id / orderId and mark its payment failed.
+// Best-effort; never throws.
+async function failOrderPayment(req, cafeOrderId, { reason, reference, requireReference = false }) {
+    try {
+        const tf = tenantFilter(req);
+        let order = null;
+        if (mongoose.Types.ObjectId.isValid(cafeOrderId)) order = await Order.findOne({ _id: cafeOrderId, ...tf }).select('_id table branch restaurant').lean();
+        if (!order) order = await Order.findOne({ orderId: cafeOrderId, ...tf }).select('_id table branch restaurant').lean();
+        if (!order) return false;
+        const filter = { _id: order._id, ...tf };
+        if (requireReference) filter['payment.reference'] = reference;
+        const changed = await paymentState.markPaymentFailed(filter, { reason, reference });
+        if (changed) paymentState.emitBillingState(order);
+        return changed;
+    } catch (err) {
+        logger.warn('failOrderPayment failed (non-fatal)', { error: err.message });
+        return false;
+    }
+}
+
 exports.createRazorpayOrder = async (req, res) => {
     try {
         const { amount, cafeOrderId, receipt } = req.body;
@@ -499,7 +524,7 @@ exports.createRazorpayOrder = async (req, res) => {
         let ownedOrder = null;
         if (cafeOrderId && cafeOrderId !== 'none') {
             const tf = tenantFilter(req);
-            const fields = '_id orderId total amountPaid paymentStatus status razorpayOrderId';
+            const fields = '_id orderId total amountPaid paymentStatus status razorpayOrderId table branch';
             if (mongoose.Types.ObjectId.isValid(cafeOrderId)) {
                 ownedOrder = await Order.findOne({ _id: cafeOrderId, ...tf }).select(fields).lean();
             }
@@ -604,6 +629,11 @@ exports.createRazorpayOrder = async (req, res) => {
         // same order is still accepted by verify / webhook. A legacy
         // order's single razorpayOrderId is carried into the history.
         if (ownedOrder) {
+            await paymentState.markPaymentPending(
+                { _id: ownedOrder._id, ...tenantFilter(req) },
+                { amount, method: 'online', reference: razorpayOrder.id, userId: req.user?._id || null },
+            );
+            paymentState.emitBillingState({ ...ownedOrder, restaurant: tenantId(req) });
             try {
                 const history = [ownedOrder.razorpayOrderId, razorpayOrder.id].filter(Boolean);
                 await Order.updateOne(
@@ -685,6 +715,14 @@ exports.verifyPayment = async (req, res) => {
                 .digest('hex');
 
             if (!safeEqual(expectedSignature, razorpay_signature)) {
+                // Phase 4: surface the failure on the order, but only when
+                // the caller names the checkout that is pending on it (an
+                // unauthenticated forged call cannot fail an unrelated order).
+                if (cafeOrderId) {
+                    await failOrderPayment(req, cafeOrderId, {
+                        reason: 'Invalid signature', reference: razorpay_order_id, requireReference: true,
+                    });
+                }
                 return res.status(400).json({ success: false, message: 'Payment verification failed — invalid signature' });
             }
         }
@@ -762,6 +800,11 @@ exports.verifyPayment = async (req, res) => {
                 razorpay_order_id,
                 razorpay_payment_id,
             });
+            await paymentState.markPaymentFailed(
+                { _id: order._id, ...tf },
+                { reason: binding.code, reference: razorpay_order_id },
+            );
+            paymentState.emitBillingState(order);
             return res.status(binding.status).json({ success: false, code: binding.code, message: binding.message });
         }
 
@@ -1197,6 +1240,10 @@ exports.handleWebhook = async (req, res) => {
                     total: order.total,
                     amountPaid: order.amountPaid,
                 });
+                if (await paymentState.markPaymentFailed(
+                    { _id: order._id, ...(order.restaurant ? { restaurant: order.restaurant } : {}) },
+                    { reason: 'AMOUNT_MISMATCH', reference: rzpOrderId || '', amount: capturedAmount },
+                )) paymentState.emitBillingState(order);
                 return res.status(200).json({ status: 'ok' });
             }
 
@@ -1282,6 +1329,15 @@ exports.handleWebhook = async (req, res) => {
                 errorCode: payment.error_code || null,
                 errorDescription: payment.error_description || null,
             });
+            // Phase 4: reflect it on the payment state block (never
+            // downgrades an already-paid order).
+            if (await paymentState.markPaymentFailed(
+                // Reference-bound: a late failure for an older checkout must not
+                // overwrite a newer pending attempt.
+                { _id: order._id, ...(order.restaurant ? { restaurant: order.restaurant } : {}),
+                    ...(payment.order_id ? { 'payment.reference': payment.order_id } : {}) },
+                { reason: payment.error_code || 'payment.failed', reference: payment.order_id || '' },
+            )) paymentState.emitBillingState(order);
             // A pay-first order held from the kitchen on an 'online'
             // promise (operations profile) now has a 15-minute retry
             // window before the sweeper may cancel it. No-op for every

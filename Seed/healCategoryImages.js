@@ -3,9 +3,10 @@
  * auto-healer (the same logic that runs on a 24h schedule in server.js).
  *
  * Does a LIVE HEAD check on every category's image across all tenants and
- * re-points any dead (HTTP 404/410), empty, or placeholder image to an
- * accurate, name-matched, HEAD-verified replacement. Never overwrites a
- * working image, and never writes a URL it couldn't verify is alive.
+ * CLEARS any dead (HTTP 404/410) or legacy-placeholder image so the admin
+ * UI shows a blank box. Empty images are left alone and nothing is ever
+ * filled in (no stock photos since 2026-10-28). Never touches a working
+ * image or an admin upload.
  *
  * Usage:
  *   cd Backend

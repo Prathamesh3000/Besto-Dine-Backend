@@ -90,6 +90,11 @@ const ADVANCED_PATHS = {
     'tables.useTables': 'boolean',
     'tables.assignWaiters': 'boolean',
     'tables.mergeTables': 'boolean',
+    // Workload limit (CAPTAIN_FLOW_UPDATE_PLAN D7): most tables one waiter
+    // may hold before the captain must give an override reason. Integer
+    // >= 0; 0 = off (the default, so nothing changes until a restaurant
+    // opts in).
+    'tables.maxTablesPerWaiter': 'count',
 };
 
 const ALL_MODULES_ON = Object.freeze({
@@ -238,6 +243,9 @@ function normaliseProfile(input, { warnings } = {}) {
                 } else if (type === 'number') {
                     if (typeof v !== 'number' || !Number.isFinite(v)) errors.push(`${path} must be a number`);
                     else advanced[path] = clampExpiry(v);
+                } else if (type === 'count') {
+                    if (!Number.isInteger(v) || v < 0 || v > 1000) errors.push(`${path} must be a whole number from 0 to 1000 (0 = off)`);
+                    else advanced[path] = v;
                 } else if (typeof v !== 'boolean') {
                     errors.push(`${path} must be true or false`);
                 } else advanced[path] = v;
@@ -310,6 +318,7 @@ function deriveFlow(profile) {
             useTables: a.useTables == null ? true : a.useTables,
             assignWaiters: floorStaff,
             mergeTables: true,
+            maxTablesPerWaiter: 0,   // D7: 0 = no limit
         },
         // Informational (onboarding): where KOTs / bills print. Nothing in
         // the print path reads this yet (printers: Settings → Printers).

@@ -37,7 +37,63 @@ const orderItemSchema = new mongoose.Schema({
   // chef card can split "Original order" from "Added later" instead of
   // merging everything into one indistinguishable list.
   addedAt: { type: Date, default: Date.now },
+  // KOT round this line was sent in (1 = the original send, 2, 3 ... for
+  // each later append / repeat). Optional: legacy lines have none and are
+  // treated as round 1 (utils/kotRounds.js).
+  kotNo: { type: Number, min: 1 },
 });
+
+// One entry per KOT send (create = round 1, every append / repeat = the
+// next round). `items` is a snapshot of what that send added; it exists
+// because appends MERGE into an identical existing line (quantity bump),
+// so the item rows alone cannot tell which round added what.
+const kotSchema = new mongoose.Schema({
+  kotNo: { type: Number, required: true, min: 1 },       // per-order round
+  ticketNo: { type: Number, default: null },             // daily per-branch ticket number
+  sentAt: { type: Date, default: Date.now },
+  sentBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  itemCount: { type: Number, default: 0 },               // sum of quantities sent
+  items: [{
+    itemId: { type: mongoose.Schema.Types.ObjectId },    // the order line it landed on
+    name: String,
+    quantity: Number,
+  }],
+}, { _id: false });
+
+// Bill workspace (CAPTAIN_FLOW_UPDATE_PLAN.md Phase 3, D4). Optional: an
+// order that was never "saved" has no bill block. `final` locks the items
+// and discount; a captain+ reopens it with a reason.
+const billSchema = new mongoose.Schema({
+  status:       { type: String, enum: ['draft', 'final'], default: 'draft' },
+  billNo:       { type: Number, default: null },       // sequential per restaurant+branch (models/billCounter.js)
+  savedAt:      { type: Date, default: null },
+  savedBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  reopenedAt:   { type: Date, default: null },
+  reopenedBy:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  reopenReason: { type: String, default: '', maxlength: 300 },
+  total:        { type: Number, default: 0 },          // payable snapshot at the last save
+  // Small audit trail (no AuditLog for tenant staff actions exists: models/auditLog.js is super-admin only).
+  history:      { type: [new mongoose.Schema({
+    action: { type: String, enum: ['save', 'finalize', 'reopen'] },
+    at: Date, by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, reason: String, total: Number,
+  }, { _id: false })], default: undefined },
+}, { _id: false });
+
+// Payment state block (CAPTAIN_FLOW_UPDATE_PLAN.md Phase 4). ADDITIVE: it
+// mirrors what the existing flows do and never replaces paymentStatus.
+// 'paid' is only written by a verified path (Razorpay verify / webhook /
+// reconciliation) or a staff settle - never inferred.
+const paymentStateSchema = new mongoose.Schema({
+  state:        { type: String, enum: ['none', 'pending', 'paid', 'failed'], default: 'none' },
+  method:       { type: String, default: '' },
+  amount:       { type: Number, default: 0 },          // payable the attempt was opened / settled for
+  reference:    { type: String, default: '' },         // razorpay order id (pending/failed) or payment id (paid)
+  cashReceived: { type: Number, default: null },
+  changeDue:    { type: Number, default: null },
+  failureReason:{ type: String, default: '' },
+  updatedAt:    { type: Date, default: null },
+  updatedBy:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+}, { _id: false });
 
 const orderSchema = new mongoose.Schema({
     // Tenant link — added by Phase 1 SaaS migration. Required for all
@@ -61,6 +117,13 @@ const orderSchema = new mongoose.Schema({
         index: true,
     },
   orderId: { type: String, required: true, unique: true }, // e.g., ORD-0001
+  // KOT rounds (utils/kotRounds.js). `kotRoundSeq` is the atomic counter
+  // behind item.kotNo; `kots` is the per-send log. Both optional — legacy
+  // orders have neither.
+  kotRoundSeq: { type: Number, default: undefined },
+  kots: { type: [kotSchema], default: undefined },
+  bill: { type: billSchema, default: undefined },
+  payment: { type: paymentStateSchema, default: undefined },
   type: { type: String, enum: ['dine-in', 'takeaway'], default: 'dine-in' },
 
   // Channel that produced this order. Lets dashboards split kiosk vs

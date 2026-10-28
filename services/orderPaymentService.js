@@ -235,6 +235,8 @@ async function applyCouponToOrder(req) {
       message: 'Cannot modify coupon on a paid or cancelled order',
     });
   }
+  // A finalised bill (Save Bill, D4) is locked until a captain reopens it.
+  require('../utils/billWorkspace').assertBillNotFinal(order);
 
   // order.total already has the current coupon subtracted, and GST is
   // levied on (subtotal − coupon) (utils/billing.computeBill). A coupon

@@ -7,7 +7,7 @@ const Branch = require('../models/branch');
 const { isStaffCaller } = require('../utils/menuAvailability');
 const logger = require('../utils/logger');
 const { parseCsv } = require('../utils/csvParser');
-const { pickDishImage, isDeadImage } = require('../utils/dishImagePicker');
+const { isDeadImage } = require('../utils/deadImage');
 
 const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
 
@@ -597,15 +597,12 @@ exports.importCombosCsv = async (req, res) => {
                     startTime: get('startTime') || '',
                     endTime: get('endTime') || '',
                     status: statusRaw,
-                    // Same resolution as menu importer — trust real
-                    // URLs from CSV but fall through to dishImagePicker
-                    // when the row is missing or carries a known-dead
-                    // placeholder source (picsum / source.unsplash).
-                    images: (() => {
-                        const raw = splitList(get('images'));
-                        const usable = raw.filter(u => u && !isDeadImage(u));
-                        return usable.length ? usable : [pickDishImage(name)];
-                    })(),
+                    // Same resolution as the menu importer — trust real
+                    // URLs from CSV, drop known-dead placeholder sources
+                    // (picsum / source.unsplash), and leave the combo
+                    // WITHOUT an image when nothing usable remains (no
+                    // stock photo, per the admin's 2026-10-28 request).
+                    images: splitList(get('images')).filter(u => u && !isDeadImage(u)),
                     restaurant: restaurantId,
                     branch: branchId,
                 });

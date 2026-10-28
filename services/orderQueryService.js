@@ -5,6 +5,7 @@
  * Extracted from controllers/orderController.js (BUGS_REPORT #31). Query
  * logic unchanged; response rows are shaped by services/orderFormatters.js.
  */
+const { publicPayment, billingStatesForTables } = require('../utils/paymentState');
 const mongoose = require('mongoose');
 const Order = require('../models/order');
 const logger = require('../utils/logger');
@@ -39,7 +40,34 @@ function customerOpsFor(req, order) {
     return null;        // a broken profile never hides an order — fail open
   }
 }
-const forCustomer = (req, order, payload) => applyCustomerTrackingPolicy(payload, customerOpsFor(req, order));
+/**
+ * Customer / guest payloads must not carry staff internals: payment
+ * reference / cash tendered / failure text / actor, bill audit history,
+ * who sent a KOT and the KOT round sequence. Returns a shallow copy.
+ */
+function stripStaffFields(order) {
+  if (!order || typeof order !== 'object') return order;
+  const out = { ...order };
+  if (out.payment && typeof out.payment === 'object') {
+    const { state, method, amount, updatedAt } = out.payment;
+    out.payment = { state, method, amount, updatedAt };
+  }
+  if (out.bill && typeof out.bill === 'object') {
+    const { history, savedBy, reopenReason, reopenedBy, ...rest } = out.bill;
+    out.bill = rest;
+  }
+  if (Array.isArray(out.kots)) {
+    out.kots = out.kots.map((k) => {
+      if (!k || typeof k !== 'object') return k;
+      const { sentBy, kotRoundSeq, ...rest } = k;
+      return rest;
+    });
+  }
+  delete out.kotRoundSeq;
+  return out;
+}
+const forCustomer = (req, order, payload) =>
+  stripStaffFields(applyCustomerTrackingPolicy(payload, customerOpsFor(req, order)));
 
 // ─── Kiosk order tracking ────────────────────────────────────────────
 // Lightweight, polling-friendly endpoint that returns just the fields
@@ -552,7 +580,8 @@ async function getActiveOrdersListByTable(req) {
   if (isGuestOrCustomer) {
     return reply(200, { success: true, orders: orders.map((o) => forCustomer(req, o, o)) });
   }
-  return reply(200, { success: true, orders });
+  const billingState = (await billingStatesForTables([tableId], tenantFilter(req))).get(String(tableId)) || null;
+  return reply(200, { success: true, billingState, orders: orders.map((o) => ({ ...o, payment: publicPayment(o) })) });
 }
 
 // Get active order for a specific table (includes served but unpaid orders)
@@ -617,7 +646,9 @@ async function getActiveOrderByTable(req) {
     throw httpError(403, { success: false, message: 'Not authorized to view this order' });
   }
 
-  return reply(200, { success: true, order: isGuestOrCustomer ? forCustomer(req, order, order) : order });
+  if (isGuestOrCustomer) return reply(200, { success: true, order: forCustomer(req, order, order) });
+  const billingState = (await billingStatesForTables([tableId], tenantFilter(req))).get(String(tableId)) || null;
+  return reply(200, { success: true, billingState, order: { ...order, payment: publicPayment(order) } });
 }
 
 // Get single order by ID (for customer tracking)
@@ -745,6 +776,35 @@ async function getOrderById(req) {
   return reply(200, { success: true, order: isStaffCaller(req) ? formatted : forCustomer(req, order, formatted) });
 }
 
+// GET /orders/:id/kots — the KOT rounds of an order (staff only; tenant and
+// branch scoped like getOrderById, with the same 404-not-403 on a miss).
+// Round status is the order's status: the order carries the only status
+// machine there is (no per-line status exists), so every round shows the
+// same value. Legacy lines without kotNo are grouped as round 1.
+async function getOrderKots(req) {
+  const { id } = req.params;
+  const tf = tenantFilter(req);
+  let order = mongoose.Types.ObjectId.isValid(id) ? await Order.findOne({ _id: id, ...tf }).lean() : null;
+  if (!order) order = await Order.findOne({ orderId: id, ...tf }).lean();
+  if (!order) throw httpError(404, { success: false, message: 'Order not found' });
+
+  const pinned = pinnedBranchId(req);
+  if (pinned && order.branch && String(order.branch) !== String(pinned)) {
+    throw httpError(404, { success: false, message: 'Order not found' });
+  }
+
+  const kotRounds = require('../utils/kotRounds');
+  const kots = kotRounds.roundsOf(order).map((r) => ({
+    kotNo: r.kotNo,
+    ticketNo: r.ticketNo,
+    sentAt: r.sentAt,
+    sentBy: r.sentBy || null,
+    items: r.lines.map((l) => ({ _id: l._id, name: l.name, quantity: l.quantity })),
+    status: order.status,
+  }));
+  return reply(200, { success: true, orderId: order.orderId, kots });
+}
+
 // Get orders for the logged-in customer
 async function getMyOrders(req) {
   const userId = req.user.id;
@@ -785,5 +845,6 @@ module.exports = {
   getActiveOrdersListByTable,
   getActiveOrderByTable,
   getOrderById,
+  getOrderKots,
   getMyOrders,
 };

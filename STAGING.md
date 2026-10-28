@@ -40,6 +40,7 @@ harness only crawls when `appEnv === "staging"`.
 | admin (tenant owner) | `admin@staging.bestodine.test` |
 | waiter | `waiter@staging.bestodine.test` |
 | chef | `chef@staging.bestodine.test` |
+| captain | `captain@staging.bestodine.test` |
 | customer | `customer@staging.bestodine.test` |
 
 Tenant: **Staging Cafe**, slug `staging-cafe`, Premium plan with every module

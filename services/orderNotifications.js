@@ -185,6 +185,8 @@ function buildCreateOrderNotificationTasks({
         area: resolvedAreaId,
         tableName: resolvedTableName,
         items: summariseItems(savedOrder.items),
+        kotNo: savedOrder.kots?.[0]?.kotNo ?? 1,
+        ticketNo: savedOrder.kots?.[0]?.ticketNo ?? null,
       };
       // Only ping the kitchen when there's actual kitchen work to do.
       if (hasKitchenWork) {

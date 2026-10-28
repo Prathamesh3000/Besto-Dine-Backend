@@ -336,9 +336,9 @@ describe('POST /print/orders/:id/bill and /print/test', () => {
     beforeAll(async () => { agent = await pairAgent(A); });
     afterAll(() => agent.socket.close());
 
-    test('prints a GST bill on the counter printer for a waiter', async () => {
+    test('prints a GST bill on the counter printer for a captain', async () => {
         const { order } = await placeDineIn(A, [paneerLine(A), coffeeLine()]);
-        const res = await ctx.api.as(A.users.waiter, A).post(`/print/orders/${order._id}/bill`).send({});
+        const res = await ctx.api.as(A.users.captain, A).post(`/print/orders/${order._id}/bill`).send({});
         expect(res.status).toBe(202);
         expect(res.body.agentOnline).toBe(true);
         const bill = await waitFor(agent.events, (e) => e.event === 'print:job' && e.payload.jobId === res.body.jobId);

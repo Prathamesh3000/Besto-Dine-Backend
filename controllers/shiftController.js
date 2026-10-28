@@ -4,7 +4,11 @@ const { runShiftAutoClose } = require('../utils/shiftAutoCloser');
 const { getIO, emitToAdmin } = require('../utils/socket');
 
 const User = require('../models/user');
-const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const Order = require('../models/order');
+const Table = require('../models/table');
+const Request = require('../models/request');
+const logger = require('../utils/logger');
 const EVENTS = require('../realtime/events');
 
 // Roles that own attendance (mirrors authMiddleware.staffOnly, which
@@ -307,5 +311,173 @@ exports.clockOut = async (req, res) => {
         res.status(200).json({ success: true, shift });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Failed to clock out' });
+    }
+};
+
+// ── Captain shift handover (CAPTAIN_FLOW_UPDATE_PLAN Phase 6) ───────────
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+// Orders that are live and can still owe money / hold a table. A held
+// pay-first order ('awaiting-payment') is not on the floor yet.
+const HANDOVER_OPEN = ['new', 'preparing', 'ready', 'served'];
+const KITCHEN_ACTIVE = ['new', 'preparing', 'ready'];
+const dueOf = (o) => round2(Math.max(0,
+    (Number(o.total) || 0) - (Number(o.manualDiscount) || 0) - (Number(o.amountPaid) || 0)));
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+/**
+ * Build the handover summary for the caller. `shift` may be null for the
+ * GET preview (cash is then 0).
+ *
+ * Scope: tenant + branch pin (+ the captain's assignedAreas; none = whole
+ * branch). The open sections are the CURRENT floor state; only `cash` is
+ * windowed to the shift (clockIn .. now).
+ *
+ * cash.expected rule: sum of `payment.amount` (fallback `amountPaid`) over
+ * orders with payment.state 'paid', a cash method (payment.method, else
+ * paymentMethod, matches /cash/i), payment.updatedBy = the caller and
+ * payment.updatedAt >= shift.clockIn. Orders settled by someone else, or
+ * online / wallet, never count.
+ */
+async function buildHandover(req, shift) {
+    const tf = tenantFilter(req);
+    const bf = strictBranchFilter(req);
+    const areaIds = (req.user?.assignedAreas || []).map((a) => String(a?._id || a));
+
+    let tables = await Table.find({ ...tf, ...bf, isDeleted: { $ne: true } }).select('name area').lean();
+    if (areaIds.length) tables = tables.filter((t) => t.area && areaIds.includes(String(t.area)));
+    const tableById = new Map(tables.map((t) => [String(t._id), t]));
+
+    const orderBranchScope = Object.keys(bf).length ? { $or: [bf, { type: 'takeaway', branch: null }] } : {};
+    const inScope = (o) => (o.table ? tableById.has(String(o.table)) : !areaIds.length);
+    const tableName = (o) => (o.table ? (tableById.get(String(o.table))?.name || '') : 'Takeaway');
+
+    const open = (await Order.find({ status: { $in: HANDOVER_OPEN }, paymentStatus: { $nin: ['Paid', 'Refunded'] }, ...tf, ...orderBranchScope })
+        .select('orderId table status total manualDiscount amountPaid bill.status kots createdAt')
+        .sort({ createdAt: 1 }).lean()).filter(inScope);
+
+    // One row per occupied table (its newest open order), dine-in only.
+    const byTable = new Map();
+    for (const o of open) {
+        if (!o.table) continue;
+        const k = String(o.table);
+        const row = byTable.get(k) || { tableId: o.table, name: tableName(o), orderId: o.orderId, due: 0 };
+        row.orderId = o.orderId;
+        row.due = round2(row.due + dueOf(o));
+        byTable.set(k, row);
+    }
+    const openTables = [...byTable.values()];
+
+    const unpaidBills = open
+        .filter((o) => o.status === 'served' || o.bill?.status === 'final')
+        .map((o) => ({ orderId: o.orderId, tableName: tableName(o), due: dueOf(o), billStatus: o.bill?.status || 'none' }));
+
+    const now = Date.now();
+    const activeKots = [];
+    for (const o of open.filter((x) => KITCHEN_ACTIVE.includes(x.status))) {
+        const kots = Array.isArray(o.kots) && o.kots.length
+            ? o.kots
+            : [{ kotNo: 1, sentAt: o.createdAt }];     // legacy order = a single round 1
+        for (const k of kots) {
+            activeKots.push({
+                orderId: o.orderId,
+                tableName: tableName(o),
+                kotNo: Number(k.kotNo) || 1,
+                status: o.status,
+                ageMin: Math.max(0, Math.round((now - new Date(k.sentAt || o.createdAt).getTime()) / 60000)),
+            });
+        }
+    }
+
+    const reqRows = await Request.find({ status: { $in: ['pending', 'accepted'] }, ...tf, ...bf })
+        .select('table type status priority createdAt').sort({ createdAt: 1 }).lean();
+    const openRequests = reqRows.filter((r) => tableById.has(String(r.table))).map((r) => ({
+        _id: r._id,
+        tableId: r.table,
+        tableName: tableById.get(String(r.table)).name,
+        type: r.type,
+        status: r.status,
+        priority: r.priority,
+        ageMin: Math.max(0, Math.round((now - new Date(r.createdAt).getTime()) / 60000)),
+    }));
+
+    let expected = 0;
+    if (shift) {
+        const paid = await Order.find({
+            'payment.state': 'paid',
+            'payment.updatedBy': req.user._id,
+            'payment.updatedAt': { $gte: shift.clockIn },
+            ...tf, ...orderBranchScope,
+        }).select('payment paymentMethod amountPaid').lean();
+        for (const o of paid) {
+            if (!/cash/i.test(String(o.payment?.method || o.paymentMethod || ''))) continue;
+            expected += Number(o.payment?.amount) || Number(o.amountPaid) || 0;
+        }
+    }
+
+    const warnings = [];
+    if (unpaidBills.length) warnings.push(plural(unpaidBills.length, 'unpaid bill'));
+    if (activeKots.length) warnings.push(plural(activeKots.length, 'active KOT'));
+    if (openRequests.length) warnings.push(plural(openRequests.length, 'open request'));
+    if (openTables.length) warnings.push(`${plural(openTables.length, 'table')} still open`);
+
+    return {
+        shift: shift ? { _id: shift._id, clockIn: shift.clockIn, status: shift.status, handover: shift.handover || null } : null,
+        openTables,
+        unpaidBills,
+        activeKots,
+        openRequests,
+        cash: { expected: round2(expected) },
+        incentive: null,   // placeholder: filled once the incentive summary is wired in
+        warnings,
+    };
+}
+
+// GET /api/shifts/handover — preview (works with or without an active shift)
+exports.getHandover = async (req, res) => {
+    try {
+        const shift = await Shift.findOne({ staff: req.user._id, status: 'active', ...tenantFilter(req) }).lean();
+        res.status(200).json({ success: true, ...(await buildHandover(req, shift)) });
+    } catch (error) {
+        logger.error('shift.handover failed:', error);
+        res.status(500).json({ success: false, message: 'Failed to load handover' });
+    }
+};
+
+// POST /api/shifts/handover — confirm with a note; does NOT clock out.
+exports.confirmHandover = async (req, res) => {
+    try {
+        const { note, cashCounted } = req.body || {};
+        let counted = null;
+        if (cashCounted !== undefined && cashCounted !== null && cashCounted !== '') {
+            counted = Number(cashCounted);
+            if (!Number.isFinite(counted) || counted < 0) {
+                return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'cashCounted must be a non-negative number.' });
+            }
+            counted = round2(counted);
+        }
+        if (note !== undefined && note !== null && typeof note !== 'string') {
+            return res.status(400).json({ success: false, message: 'note must be text' });
+        }
+
+        const shift = await Shift.findOne({ staff: req.user._id, status: 'active', ...tenantFilter(req) });
+        if (!shift) {
+            return res.status(409).json({ success: false, code: 'NO_ACTIVE_SHIFT', message: 'Clock in before confirming a handover.' });
+        }
+        const summary = await buildHandover(req, shift);
+        shift.handover = {
+            note: String(note || '').trim().slice(0, 500),
+            cashCounted: counted,
+            cashExpected: summary.cash.expected,
+            variance: counted === null ? null : round2(counted - summary.cash.expected),
+            openTables: summary.openTables,
+            unpaidBills: summary.unpaidBills,
+            confirmedAt: new Date(),
+        };
+        await shift.save();
+        res.status(200).json({ success: true, handover: shift.handover, warnings: summary.warnings });
+    } catch (error) {
+        logger.error('shift.handover confirm failed:', error);
+        res.status(500).json({ success: false, message: 'Failed to confirm handover' });
     }
 };

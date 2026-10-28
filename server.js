@@ -179,9 +179,9 @@ require('./utils/menuAutoRestoreScheduler').startScheduledMenuAutoRestore();
 // CATEGORY_IMAGE_HEAL_DISABLED=true on multi-instance setups.
 require('./utils/categoryImageHealer').startScheduledCategoryImageHeal();
 
-// Same live-HEAD auto-heal for menu-item + combo images. Re-points any
-// image that 404/410s (or is empty/placeholder) to an accurate, name-
-// matched, HEAD-verified replacement. Runs every MENU_IMAGE_HEAL_HOURS
+// Same live-HEAD auto-heal for menu-item + combo images. Clears any image
+// that 404/410s or is the legacy placeholder so the UI shows a blank box;
+// never fills a stock photo in. Runs every MENU_IMAGE_HEAL_HOURS
 // (default 24h). Disable via MENU_IMAGE_HEAL_DISABLED=true.
 require('./utils/menuItemImageHealer').startScheduledMenuItemImageHeal();
 
@@ -238,6 +238,13 @@ require('./utils/emptyOrderSweeper').startScheduledEmptyOrderSweep();
 // cash at the counter that never arrives is cancelled at its deadline and
 // its table released. See utils/heldOrderSweeper.js.
 require('./utils/heldOrderSweeper').startScheduledHeldOrderSweep();
+
+// ─── Incentive reconcile — hourly safety net for staff incentives ──────────
+// Reverses entries of cancelled / refunded orders and re-runs the (idempotent)
+// accrual for recently served-or-paid orders of tenants that have campaigns,
+// covering paths that bypass the request-time hooks. See
+// services/incentiveService.js. INCENTIVE_RECONCILE_DISABLED=true to turn off.
+require('./services/incentiveService').startScheduledIncentiveReconcile();
 
 // ─── Shift auto-closer — closes abandoned waiter shifts ────────────────────
 // A shift left in status='active' for longer than SHIFT_AUTOCLOSE_HOURS

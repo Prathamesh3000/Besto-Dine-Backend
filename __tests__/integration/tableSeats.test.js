@@ -177,7 +177,7 @@ describe('seat release', () => {
         await scanTable(ctx.api, table);
         expect((await scanTable(ctx.api, table)).res.status).toBe(409);
 
-        const free = await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true });
+        const free = await ctx.api.as(A.users.admin).post(`/tables/${table._id}/free`).send({ force: true, reason: 'test reset' });
         expect(free.status).toBe(200);
         expect(await seatsOf(table._id)).toHaveLength(0);
         expect((await scanTable(ctx.api, table)).res.status).toBe(200);

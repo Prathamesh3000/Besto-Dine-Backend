@@ -1,8 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const shiftController = require('../controllers/shiftController');
-const { protect, adminOnly, staffOnly } = require('../middlewares/authMiddleware');
+const { protect, adminOnly, staffOnly, captainOrAdmin } = require('../middlewares/authMiddleware');
 
+// Captain shift handover (Phase 6): summary, then confirm with a note.
+router.get('/handover', protect, captainOrAdmin, shiftController.getHandover);
+router.post('/handover', protect, captainOrAdmin, shiftController.confirmHandover);
 router.get('/my', protect, shiftController.getMyShifts);
 // Attendance is for staff only — customers / superadmins are refused.
 router.post('/clock-in', protect, staffOnly, shiftController.clockIn);

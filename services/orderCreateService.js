@@ -35,6 +35,7 @@ const pricing = require('./orderPricingService');
 const { claimPayment, releaseClaim } = require('../utils/paymentClaim');
 const { buildCreateOrderNotificationTasks } = require('./orderNotifications');
 const { nextTokenNumber, isTokenMode, resolveRequestOps } = require('../utils/orderToken');
+const { nextTicketNo, stampFirstRound } = require('../utils/kotRounds');
 const { issueGuestAccess } = require('../utils/guestAccess');
 
 // Channels we accept on createOrder. Kept narrow so a tampered client
@@ -120,6 +121,8 @@ async function checkIdempotency(req, rawIdempotencyKey) {
             success: true,
             order: existing,
             idempotent: true,
+            kotNo: existing.kots?.[0]?.kotNo ?? 1,
+            ticketNo: existing.kots?.[0]?.ticketNo ?? null,
             trackingToken,
           }),
         };
@@ -1036,6 +1039,8 @@ async function persistOrderDocs(req, ctx) {
             success: true,
             order: existing,
             idempotent: true,
+            kotNo: existing.kots?.[0]?.kotNo ?? 1,
+            ticketNo: existing.kots?.[0]?.ticketNo ?? null,
             trackingToken,
           }),
         };
@@ -1414,6 +1419,13 @@ async function createOrder(req) {
       if (counterDocData) counterDocData.guestAccess = { ...stored };
     }
   }
+  // KOT round 1 + the daily branch ticket number (utils/kotRounds.js). One
+  // send = one ticket, shared by a mixed cart's two docs. Allocated before
+  // the write, so a failed save only skips a number.
+  const kotTicketNo = await nextTicketNo(tenantId(req), inheritedBranchId || null);
+  const kotSentBy = req.user?._id || null;
+  stampFirstRound(primaryDocData, { ticketNo: kotTicketNo, sentBy: kotSentBy });
+  if (counterDocData) stampFirstRound(counterDocData, { ticketNo: kotTicketNo, sentBy: kotSentBy });
   if (hold) holdOrderDocs([primaryDocData, counterDocData], { hold, ops });
   const held = !!hold;
 
@@ -1548,6 +1560,8 @@ async function createOrder(req) {
     order: finalOrder,                   // primary (kitchen) doc
     splitOrder: finalSplit || null,      // counter-side doc when cart was mixed
     isSplit: !!counterSideOrder,
+    kotNo: 1,
+    ticketNo: kotTicketNo,
     trackingToken,
     // Guest counter order (token mode): the raw access token, this once.
     // The order itself only carries its hash, so a retry / replay cannot

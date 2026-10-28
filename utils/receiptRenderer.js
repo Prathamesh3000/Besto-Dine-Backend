@@ -12,6 +12,7 @@
  *       { feed: 3 },                                       // blank lines
  *       { cut: true },                                     // paper cut
  *       { drawer: true },                                  // cash-drawer kick
+ *       { qr: 'upi://pay?...', size: 6, a: 'c', t: '[UPI QR: Rs 120.00]' }, // QR code (agent: GS ( k; `t` = text fallback)
  *   ] }
  *
  * Text is pre-padded to the column width (48 cols on 80 mm paper, 32 on
@@ -87,6 +88,8 @@ function pushWrapped(lines, s, w, a = 'l', extra = {}) {
     for (const t of wrap(s, w)) lines.push(L(a === 'c' ? center(t, w) : a === 'r' ? padLeft(t, w) : padRight(t, w), a, extra));
 }
 const HR = Object.freeze({ hr: true });
+const UPI_QR_SIZE = 6; // ESC/POS QR module size (dots) used on the bill
+
 
 function formatDateTime(d, timezone) {
     const date = d instanceof Date ? d : new Date(d || Date.now());
@@ -125,6 +128,15 @@ function vegMark(item) {
     return '';
 }
 
+/** "KOT #12 (Round 2)"; legacy / unnumbered slips return ''. */
+function kotHeaderText(kot) {
+    if (!kot) return '';
+    const hasTicket = kot.ticketNo != null;
+    if (kot.kotNo != null) return hasTicket ? `KOT #${kot.ticketNo} (Round ${kot.kotNo})` : `KOT Round ${kot.kotNo}`;
+    if (kot.rounds > 1) return `KOT Rounds 1-${kot.rounds} (all)`;
+    return '';
+}
+
 const STATION_TITLE = Object.freeze({ kitchen: 'KITCHEN KOT', bar: 'BAR KOT', counter: 'COUNTER KOT' });
 
 /**
@@ -139,13 +151,17 @@ const STATION_TITLE = Object.freeze({ kitchen: 'KITCHEN KOT', bar: 'BAR KOT', co
  * @param {string}  [p.waiterName]
  * @param {string}  [p.paperWidth] '58' | '80'
  * @param {string}  [p.timezone]
+ * @param {object}  [p.kot]        { ticketNo, kotNo, rounds? } — header "KOT #<ticketNo> (Round <kotNo>)".
+ *                                 `rounds` > 1 with no kotNo = whole-order reprint ("Rounds 1-N").
  */
-function renderKot({ cafeName, order, items, station, tableLabel, reason, waiterName, paperWidth, timezone }) {
+function renderKot({ cafeName, order, items, station, tableLabel, reason, waiterName, paperWidth, timezone, kot }) {
     const w = columnsFor(paperWidth);
     const lines = [];
     const title = STATION_TITLE[station] || 'KOT';
     lines.push(L(center(`*** ${title} ***`, w), 'c', { b: true, s: 2 }));
     if (cafeName) lines.push(L(center(text(cafeName), w), 'c'));
+    const kotHeader = kotHeaderText(kot);
+    if (kotHeader) lines.push(L(center(kotHeader, w), 'c', { b: true }));
     if (reason === 'append') lines.push(L(center('--- ADDED ITEMS ---', w), 'c', { b: true }));
     if (reason === 'reprint') lines.push(L(center('** REPRINT **', w), 'c', { b: true }));
     lines.push(HR);
@@ -172,6 +188,40 @@ function renderKot({ cafeName, order, items, station, tableLabel, reason, waiter
 }
 
 /**
+ * The money lines of a bill, derived once for everything that shows or
+ * stores a bill total: the printed slip (renderBill), the preview and the
+ * Save Bill snapshot all read this, so they cannot disagree.
+ * `payable` = total - manual discount (never below 0); tip is shown on
+ * the slip but is not part of it (it is collected separately).
+ */
+function billTotals(order) {
+    const items = order?.items || [];
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    const total = Number(order?.total) || 0;
+    const manualDiscount = Number(order?.manualDiscount) || 0;
+    const paid = Number(order?.amountPaid) || 0;
+    return {
+        subtotal: round2(lineItemsSubtotal(items)),
+        coupon: Number(order?.couponDiscount) || 0,
+        couponCode: order?.couponCode || '',
+        gst: Number(order?.gst) || 0,
+        gstPercentage: Number(order?.gstPercentage) || 0,
+        serviceCharge: Number(order?.serviceCharge) || 0,
+        serviceChargePercentage: Number(order?.serviceChargePercentage) || 0,
+        additionalCharges: (order?.additionalCharges || [])
+            .filter((c) => c && Number(c.amount) > 0)
+            .map((c) => ({ name: text(c.name || 'Charge'), amount: Number(c.amount) })),
+        deliveryFee: Number(order?.delivery?.fee) || 0,
+        total,
+        manualDiscount,
+        payable: Math.max(0, round2(total - manualDiscount)),
+        tip: Number(order?.tipAmount) || 0,
+        paid,
+        due: paid > 0 ? Math.max(0, round2(total - manualDiscount - paid)) : 0,
+    };
+}
+
+/**
  * Customer bill (GST invoice layout).
  * @param {object} p
  * @param {object}  p.settings     { general: { cafeName, address, contactNumber, legal: { gstin, fssaiLicense, legalBusinessName }, timezone } }
@@ -179,8 +229,11 @@ function renderKot({ cafeName, order, items, station, tableLabel, reason, waiter
  * @param {string|null} p.tableLabel
  * @param {string}  [p.paperWidth]
  * @param {boolean} [p.openDrawer] kick the cash drawer (cash settlement at the counter)
+ * @param {{uri:string, amount:number, payeeName?:string}|null} [p.upi] UNPAID bill + configured UPI id:
+ *        adds a centred "Scan to pay" block (QR for the exact amount due, the amount, the payee name).
+ *        Never carries the raw UPI id as text.
  */
-function renderBill({ settings, order, tableLabel, paperWidth, openDrawer }) {
+function renderBill({ settings, order, tableLabel, paperWidth, openDrawer, upi = null }) {
     const w = columnsFor(paperWidth);
     const g = settings?.general || {};
     const legal = g.legal || {};
@@ -196,6 +249,8 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer }) {
     lines.push(HR);
 
     pushRow(lines, `Bill ${order?.orderId || ''}`, formatDateTime(order?.createdAt || Date.now(), timezone), w, { b: true });
+    // Saved bill number (order.bill.billNo), when the bill has been saved.
+    if (order?.bill?.billNo != null) pushRow(lines, `Bill No: ${order.bill.billNo}`, '', w, { b: true });
     const typeLabel = orderTypeLabel(order);
     pushRow(lines, tableLabel ? `Table ${tableLabel}` : typeLabel, tableLabel ? typeLabel : '', w);
     if (order?.customerName) pushRow(lines, `Customer: ${text(order.customerName)}`, '', w);
@@ -233,9 +288,9 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer }) {
     }
     lines.push(HR);
 
-    const subtotal = lineItemsSubtotal(items);
-    pushRow(lines, 'Subtotal', money(subtotal), w);
-    const coupon = Number(order?.couponDiscount) || 0;
+    const tot = billTotals(order);
+    pushRow(lines, 'Subtotal', money(lineItemsSubtotal(items)), w);
+    const coupon = tot.coupon;
     if (coupon > 0) pushRow(lines, `Coupon${order.couponCode ? ` ${text(order.couponCode)}` : ''}`, `-${money(coupon)}`, w);
     const gst = Number(order?.gst) || 0;
     if (gst > 0) {
@@ -252,10 +307,10 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer }) {
     const deliveryFee = Number(order?.delivery?.fee) || 0;
     if (deliveryFee > 0) pushRow(lines, 'Delivery', money(deliveryFee), w);
 
-    const total = Number(order?.total) || 0;
+    const total = tot.total;
     pushRow(lines, 'TOTAL', money(total), w, { b: true, s: 2 });
 
-    const manual = Number(order?.manualDiscount) || 0;
+    const manual = tot.manualDiscount;
     if (manual > 0) {
         pushRow(lines, 'Discount', `-${money(manual)}`, w);
         pushRow(lines, 'AMOUNT PAYABLE', money(total - manual), w, { b: true });
@@ -271,6 +326,16 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer }) {
         if (due > 0.005) pushRow(lines, 'Balance due', money(due), w, { b: true });
     } else if (order?.paymentStatus === 'Pending') {
         pushRow(lines, 'Payment', 'PENDING', w, { b: true });
+    }
+    if (upi && upi.uri && Number(upi.amount) > 0) {
+        const amt = money(upi.amount);
+        lines.push(HR);
+        lines.push(L(center('Scan to pay', w), 'c', { b: true }));
+        // `t` doubles as the preview marker and as the text an agent without
+        // QR support (or an old agent that ignores `qr`) prints instead.
+        lines.push({ qr: upi.uri, size: UPI_QR_SIZE, a: 'c', t: center(`[UPI QR: Rs ${amt}]`, w) });
+        lines.push(L(center(`Pay Rs ${amt}`, w), 'c', { b: true }));
+        if (upi.payeeName) pushWrapped(lines, text(upi.payeeName), w, 'c');
     }
     lines.push(HR);
     lines.push(L(center('All amounts in INR', w), 'c'));
@@ -314,6 +379,6 @@ function toPlainText(doc) {
 
 module.exports = {
     columnsFor, money, wrap, row, center,
-    renderKot, renderBill, renderTest, toPlainText,
+    renderKot, renderBill, renderTest, toPlainText, billTotals,
     orderTypeLabel,
 };

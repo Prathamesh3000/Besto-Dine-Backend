@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const { parseCsv } = require('../utils/csvParser');
-const { pickDishImage, isDeadImage } = require('../utils/dishImagePicker');
+const { isDeadImage } = require('../utils/deadImage');
 
 // File-based master template for the bulk-import flow. Same pattern as
 // the Halls / Packages / Decorations templates so admins encounter one
@@ -648,18 +648,12 @@ exports.importMenuItemsCsv = async (req, res) => {
                 // Resolve images. Trust CSV-provided URLs only if they
                 // look real (not the deprecated source.unsplash.com or
                 // the random-photo picsum CDN — those return the same
-                // generic placeholder for every dish). Otherwise call
-                // dishImagePicker(name, category) which returns a hand-
-                // curated Unsplash photo matching the dish or, if the
-                // dish isn't in NAME_MAP, the best keyword-pool fallback.
-                // Result: every imported menu item lands with a usable,
-                // dish-relevant thumbnail without the admin having to
-                // touch each row.
+                // generic placeholder for every dish). A row without a
+                // usable image is saved with NO image: the admin asked
+                // (2026-10-28) that items they never gave a photo stay
+                // blank instead of getting a stock Unsplash picture.
                 const rawImages = splitList(get('images'));
-                const usableImages = rawImages.filter(u => u && !isDeadImage(u));
-                const resolvedImages = usableImages.length
-                    ? usableImages
-                    : [pickDishImage(name, categoryName)];
+                const resolvedImages = rawImages.filter(u => u && !isDeadImage(u));
 
                 await MenuItem.create({
                     name,

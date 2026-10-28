@@ -515,6 +515,20 @@ describe('payment.failed', () => {
         expect(errors).toEqual([]);
         expect((await reload(order)).paymentStatus).not.toBe('Paid');
     });
+
+    test('a late failure for an older checkout does not overwrite a newer pending state', async () => {
+        const newer = `order_new_${rid()}`;
+        const order = await makeOrder(A, {
+            razorpayOrderId: newer,
+            payment: { state: 'pending', method: 'online', amount: 500, reference: newer, updatedAt: new Date() },
+        });
+        const stale = { ...order, razorpayOrderId: `order_old_${rid()}` };
+        expectOk(await deliver(failedEvent(stale)));
+        expect((await reload(order)).payment.state).toBe('pending');
+
+        expectOk(await deliver(failedEvent(order)));
+        expect((await reload(order)).payment.state).toBe('failed');
+    });
 });
 
 // ── refund.processed ─────────────────────────────────────────────────

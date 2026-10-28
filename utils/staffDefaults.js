@@ -30,6 +30,9 @@ const PERMISSION_KEYS = [
     'viewTips', 'viewPayments', 'refund',
     // Admin tools
     'editMenu', 'manageStaff', 'manageRecipe', 'manageStock',
+    // Staff incentives: campaign setup + report. Admin only by default
+    // (admins bypass checkPermission); grant to a manager explicitly.
+    'incentives',
 ];
 
 // Internal helper — builds `{ tables: false, ... }` for every catalog key.
@@ -42,28 +45,28 @@ const DEFAULT_PERMISSIONS_BY_ROLE = {
         viewOrders: true, addOrders: true, updateOrderStatus: true, accessKitchen: false,
         viewCustomerRequests: true, reservation: true, crm: true,
         viewTips: true, viewPayments: true, refund: true,
-        editMenu: true, manageStaff: true, manageRecipe: true, manageStock: true,
+        editMenu: true, manageStaff: true, manageRecipe: true, manageStock: true, incentives: false,
     },
     captain: {
         tables: true, viewTableDetails: true, mergeTables: true,
         viewOrders: true, addOrders: true, updateOrderStatus: true, accessKitchen: false,
         viewCustomerRequests: true, reservation: true, crm: false,
         viewTips: true, viewPayments: true, refund: false,
-        editMenu: false, manageStaff: false, manageRecipe: false, manageStock: false,
+        editMenu: false, manageStaff: false, manageRecipe: false, manageStock: false, incentives: false,
     },
     chef: {
         tables: false, viewTableDetails: false, mergeTables: false,
         viewOrders: true, addOrders: false, updateOrderStatus: true, accessKitchen: true,
         viewCustomerRequests: false, reservation: false, crm: false,
         viewTips: false, viewPayments: false, refund: false,
-        editMenu: false, manageStaff: false, manageRecipe: true, manageStock: true,
+        editMenu: false, manageStaff: false, manageRecipe: true, manageStock: true, incentives: false,
     },
     waiter: {
         tables: true, viewTableDetails: true, mergeTables: true,
         viewOrders: true, addOrders: true, updateOrderStatus: false, accessKitchen: false,
         viewCustomerRequests: true, reservation: false, crm: false,
         viewTips: true, viewPayments: false, refund: false,
-        editMenu: false, manageStaff: false, manageRecipe: false, manageStock: false,
+        editMenu: false, manageStaff: false, manageRecipe: false, manageStock: false, incentives: false,
     },
     // role 'admin' deliberately omitted — checkPermission auto-bypasses
     // admins, so any default here would be dead code. Sub Admins inherit

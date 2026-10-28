@@ -1,26 +1,23 @@
-// Menu-item + combo image auto-heal — the scheduled, live-checking
-// counterpart to Seed/applyMenuImages.js.
+// Menu-item + combo image auto-heal — scheduled, live-checking.
 //
-// applyMenuImages.js only refreshes images matching a HARDCODED list of
-// known-bad URL patterns (DEAD_IMAGE_PATTERNS), so a photo that 404s
-// *after* it shipped stays broken until a human adds the id. This module
-// does a LIVE HTTP HEAD check on every menu-item and combo image, so ANY
-// dead URL (present or future) is detected automatically and re-pointed
-// to an accurate, name-matched, HEAD-verified replacement.
+// Does a LIVE HTTP HEAD check on every menu-item and combo image and
+// CLEARS any that are definitively dead (404/410) or still the legacy
+// '/uploads/Thumbnil.png' placeholder, so the admin UI shows a blank box
+// instead of a broken picture.
 //
-// Shares its curated image pool with applyMenuImages.js
-// (utils/menuImagePool.js) and its liveness check with the category
-// healer (utils/imageLiveness.js).
+// It no longer writes stock Unsplash photos. Until 2026-10-28 an empty,
+// placeholder or dead image was re-pointed to a name-matched pool photo
+// (a curated pool, since removed); the admin asked that items they never
+// gave a photo stay blank, so an EMPTY image is now left alone and nothing
+// is ever filled in. The pool and its seed script no longer exist;
+// Seed/clearStockImages.js removes pool photos written before the change.
 //
 // Safety (identical to the category healer):
-//   - Only HTTP 404 / 410 triggers a heal. Timeouts / rate-limits / 5xx
-//     are 'unknown' and left untouched — a flaky scan never overwrites a
+//   - Only HTTP 404 / 410 triggers a clear. Timeouts / rate-limits / 5xx
+//     are 'unknown' and left untouched — a flaky scan never erases a
 //     working image.
 //   - Admin-uploaded local images (/uploads/… not the placeholder) are
 //     assumed alive and never touched.
-//   - The replacement is itself HEAD-verified before being written, so a
-//     dead exact-name match degrades to the next-best keyword candidate
-//     rather than swapping one broken URL for another.
 //
 // Wired into server.js as a setInterval scheduler. Disable on multi-
 // instance setups via MENU_IMAGE_HEAL_DISABLED=true and poke
@@ -32,16 +29,16 @@ const Combo = require('../models/combo');
 require('../models/category'); // register schema for populate('category')
 const logger = require('./logger');
 const { urlStatus, resetLivenessCache } = require('./imageLiveness');
-const { pickImageCandidates, pickComboCandidates } = require('./menuImagePool');
 
 const PLACEHOLDER = '/uploads/Thumbnil.png';
 
-// Does the current first image need healing? True only when we're
-// confident it won't render: empty, the bare placeholder, or an external
-// URL that returns a definitive 404/410. Local uploads are assumed alive.
-async function needsHeal(image) {
+// Does the current first image need clearing? True only when we're
+// confident it won't render as a real photo: the legacy placeholder, or
+// an external URL that returns a definitive 404/410. Empty is left alone
+// (blank box is the intended state) and local uploads are assumed alive.
+async function needsClear(image) {
     const img = (image || '').trim();
-    if (!img) return true;
+    if (!img) return false;
     if (img === PLACEHOLDER) return true;
     if (img.startsWith('/uploads/')) return false;
     if (/^https?:\/\//i.test(img)) {
@@ -50,47 +47,33 @@ async function needsHeal(image) {
     return false;
 }
 
-// First HEAD-verified-alive candidate from the ordered list, else the
-// placeholder (so the field stays consistent if nothing verifies this run).
-async function firstAlive(candidates) {
-    for (const url of candidates) {
-        if (url === PLACEHOLDER) return PLACEHOLDER;
-        if ((await urlStatus(url)) === 'alive') return url;
-    }
-    return PLACEHOLDER;
-}
-
 /**
- * Scan every menu item + combo (all tenants) and heal dead / empty /
- * placeholder images. Idempotent and safe to run repeatedly.
+ * Scan every menu item + combo (all tenants) and clear dead / placeholder
+ * images. Idempotent and safe to run repeatedly. Never fills an image in.
  *
  * @param {{ dry?: boolean }} opts
  */
 async function runMenuItemImageHeal({ dry = false } = {}) {
     resetLivenessCache();
 
-    const items = await MenuItem.find({}).populate('category', 'name').select('name images vegType category').lean();
+    const items = await MenuItem.find({}).select('name images').lean();
     let itemsHealed = 0, itemsSkipped = 0;
     for (const item of items) {
         const current = (item.images?.[0] || '').trim();
-        if (!(await needsHeal(current))) { itemsSkipped++; continue; }
-        const newUrl = await firstAlive(pickImageCandidates(item));
-        if (newUrl === current) { itemsSkipped++; continue; }
-        if (!dry) await MenuItem.updateOne({ _id: item._id }, { $set: { images: [newUrl] } });
+        if (!(await needsClear(current))) { itemsSkipped++; continue; }
+        if (!dry) await MenuItem.updateOne({ _id: item._id }, { $set: { images: [] } });
         itemsHealed++;
-        logger.info(`menu image heal: item "${item.name}" ${current || '(empty)'} → ${newUrl}`);
+        logger.info(`menu image heal: item "${item.name}" ${current} → (cleared)`);
     }
 
-    const combos = await Combo.find({}).select('name images vegType').lean();
+    const combos = await Combo.find({}).select('name images').lean();
     let combosHealed = 0, combosSkipped = 0;
     for (const combo of combos) {
         const current = (combo.images?.[0] || '').trim();
-        if (!(await needsHeal(current))) { combosSkipped++; continue; }
-        const newUrl = await firstAlive(pickComboCandidates(combo));
-        if (newUrl === current) { combosSkipped++; continue; }
-        if (!dry) await Combo.updateOne({ _id: combo._id }, { $set: { images: [newUrl] } });
+        if (!(await needsClear(current))) { combosSkipped++; continue; }
+        if (!dry) await Combo.updateOne({ _id: combo._id }, { $set: { images: [] } });
         combosHealed++;
-        logger.info(`menu image heal: combo "${combo.name}" ${current || '(empty)'} → ${newUrl}`);
+        logger.info(`menu image heal: combo "${combo.name}" ${current} → (cleared)`);
     }
 
     const healed = itemsHealed + combosHealed;

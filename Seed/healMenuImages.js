@@ -3,13 +3,13 @@
  * auto-healer (the same logic that runs on a 24h schedule in server.js).
  *
  * Does a LIVE HEAD check on every menu item's and combo's first image
- * across all tenants and re-points any dead (HTTP 404/410), empty, or
- * placeholder image to an accurate, name-matched, HEAD-verified
- * replacement. Never overwrites a working image, and never writes a URL
- * it couldn't verify is alive.
+ * across all tenants and CLEARS any dead (HTTP 404/410) or legacy-
+ * placeholder image so the admin UI shows a blank box. Empty images are
+ * left alone and nothing is ever filled in (no stock photos since
+ * 2026-10-28). Never touches a working image or an admin upload.
  *
- * For the legacy pattern-based refresh (with --force to overwrite every
- * item), see Seed/applyMenuImages.js — they share utils/menuImagePool.js.
+ * To strip the stock pool photos written before 2026-10-28, see
+ * Seed/clearStockImages.js (dry run by default).
  *
  * Usage:
  *   cd Backend

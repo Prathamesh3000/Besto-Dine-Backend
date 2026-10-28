@@ -14,6 +14,8 @@ const {
 } = require('../utils/pickupTime');
 
 // GET /orders/live — one row of the staff live board.
+const { publicPayment } = require('../utils/paymentState');
+
 function formatLiveOrder(o) {
   // isUrgent: ready order that has been waiting more than 10 minutes
   const minutesWaiting = (Date.now() - new Date(o.updatedAt)) / 60000;
@@ -47,6 +49,7 @@ function formatLiveOrder(o) {
     paymentStatus: o.paymentStatus,
     paymentMethod: o.paymentMethod,
     amountPaid: o.amountPaid,
+    payment: publicPayment(o),
     items: o.items.map(i => ({
       name: i.name,
       price: i.price,
@@ -152,6 +155,7 @@ function formatOrderDetail(order) {
     paymentStatus: order.paymentStatus,
     paymentMethod: order.paymentMethod,
     amountPaid: order.amountPaid,
+    payment: publicPayment(order),
     // Refund snapshot so the customer-facing tracking page can render
     // "₹X refunded to your wallet/original payment method on <date>"
     // when an admin issues a refund. Without these the tracker had
