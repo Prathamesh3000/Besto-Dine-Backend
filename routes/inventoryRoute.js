@@ -6,6 +6,7 @@ const ic = require('../controllers/inventoryController');
 const { protect, adminOnly } = require('../middlewares/authMiddleware');
 const { attachTenant } = require('../middlewares/tenantContext');
 const { featureGate } = require('../middlewares/featureGate');
+const ov = require('../validators/ops');
 
 // All inventory endpoints require login + the `inventory` plan feature.
 // adminOnly is applied PER-ROUTE below rather than as a blanket here, so
@@ -80,8 +81,8 @@ router.get('/recipes/template',  adminOnly, ic.downloadRecipesTemplate);
 router.post('/recipes/import',   adminOnly, csvUpload.single('file'), ic.importRecipesCsv);
 router.get('/recipes',               recipeAccess, ic.getRecipes);
 router.get('/recipes/:menuItemId',   recipeAccess, ic.getRecipeByMenuItem);
-router.post('/recipes',              recipeAccess, ic.saveRecipe);
-router.delete('/recipes/:menuItemId', adminOnly, ic.deleteRecipe);
+router.post('/recipes',              recipeAccess, ov.recipeSave, ic.saveRecipe);
+router.delete('/recipes/:menuItemId', adminOnly, ov.recipeDelete, ic.deleteRecipe);
 
 // ── Analytics ──────────────────────────────────────────────────────
 router.get('/food-cost',             adminOnly, ic.getFoodCostReport);
@@ -98,12 +99,12 @@ router.post('/import', adminOnly, csvUpload.single('file'), ic.importItemsCsv);
 
 // ── Single item (must come after named routes) ─────────────────────
 router.get('/:id',       adminOnly, ic.getItemById);
-router.post('/',         adminOnly, ic.createItem);
-router.put('/:id',       adminOnly, ic.updateItem);
+router.post('/',         adminOnly, ov.inventoryCreate, ic.createItem);
+router.put('/:id',       adminOnly, ov.inventoryUpdate, ic.updateItem);
 // Stock adjustment (usage / waste / restock) — adminOnly. Chefs get a
 // read-only stock view via manageStock; changing quantities is reserved
 // for admins / managers.
-router.patch('/:id/adjust', adminOnly, ic.adjustStock);
-router.delete('/:id',    adminOnly, ic.deleteItem);
+router.patch('/:id/adjust', adminOnly, ov.inventoryAdjust, ic.adjustStock);
+router.delete('/:id',    adminOnly, ov.inventoryIdOnly, ic.deleteItem);
 
 module.exports = router;

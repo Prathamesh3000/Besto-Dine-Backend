@@ -1,0 +1,3907 @@
+{
+  "description": "Golden vectors for computeBill, generated from the backend implementation. Do not hand-edit; see packages/types/README.md.",
+  "fields": [
+    "subtotal",
+    "gst",
+    "gstPct",
+    "serviceCharge",
+    "serviceChargePct",
+    "serviceChargeApplies",
+    "additionalCharges",
+    "additionalChargesTotal",
+    "total"
+  ],
+  "vectors": [
+    {
+      "name": "no tax config, plain subtotal",
+      "input": {
+        "subtotal": 100
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 100
+      }
+    },
+    {
+      "name": "empty input",
+      "input": {},
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "5% gst only, dine-in",
+      "input": {
+        "subtotal": 1000,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "orderType": "dine-in"
+      },
+      "expected": {
+        "subtotal": 1000,
+        "gst": 50,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 1050
+      }
+    },
+    {
+      "name": "18% gst + 10% service, dine-in",
+      "input": {
+        "subtotal": 500,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "dine-in"
+      },
+      "expected": {
+        "subtotal": 500,
+        "gst": 90,
+        "gstPct": 18,
+        "serviceCharge": 50,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 640
+      }
+    },
+    {
+      "name": "18% gst + 10% service, takeaway has no service charge",
+      "input": {
+        "subtotal": 500,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "takeaway"
+      },
+      "expected": {
+        "subtotal": 500,
+        "gst": 90,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 590
+      }
+    },
+    {
+      "name": "delivery has no service charge",
+      "input": {
+        "subtotal": 500,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "delivery",
+        "deliveryFee": 40
+      },
+      "expected": {
+        "subtotal": 500,
+        "gst": 90,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 630
+      }
+    },
+    {
+      "name": "kiosk has no service charge",
+      "input": {
+        "subtotal": 250,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "kiosk"
+      },
+      "expected": {
+        "subtotal": 250,
+        "gst": 45,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 295
+      }
+    },
+    {
+      "name": "order type spelling: Dine In",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "Dine In"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 128
+      }
+    },
+    {
+      "name": "order type spelling: DINE_IN",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "DINE_IN"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 128
+      }
+    },
+    {
+      "name": "order type spelling: dinein",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "dinein"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 128
+      }
+    },
+    {
+      "name": "order type spelling: PickUp",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "PickUp"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 118
+      }
+    },
+    {
+      "name": "order type spelling: Home Delivery",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "Home Delivery"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 118
+      }
+    },
+    {
+      "name": "unknown order type passes through, no service charge",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "catering"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 118
+      }
+    },
+    {
+      "name": "empty-string order type defaults to dine-in",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": ""
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 128
+      }
+    },
+    {
+      "name": "null order type defaults to dine-in",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": null
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 128
+      }
+    },
+    {
+      "name": "0% rates",
+      "input": {
+        "subtotal": 750,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 0
+        }
+      },
+      "expected": {
+        "subtotal": 750,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 750
+      }
+    },
+    {
+      "name": "fractional gst 2.5%",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 2.5
+        }
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 8.33,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 341.66
+      }
+    },
+    {
+      "name": "28% gst",
+      "input": {
+        "subtotal": 1999.99,
+        "taxConfig": {
+          "gstPct": 28
+        }
+      },
+      "expected": {
+        "subtotal": 1999.99,
+        "gst": 560,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 2559.99
+      }
+    },
+    {
+      "name": "gst rate given as numeric string",
+      "input": {
+        "subtotal": 200,
+        "taxConfig": {
+          "gstPct": "12"
+        }
+      },
+      "expected": {
+        "subtotal": 200,
+        "gst": 24,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 224
+      }
+    },
+    {
+      "name": "junk gst rate reads as 0",
+      "input": {
+        "subtotal": 200,
+        "taxConfig": {
+          "gstPct": "abc"
+        }
+      },
+      "expected": {
+        "subtotal": 200,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 200
+      }
+    },
+    {
+      "name": "coupon reduces the gst base: 1000 @5% less 100 = 945",
+      "input": {
+        "subtotal": 1000,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "orderType": "takeaway",
+        "couponDiscount": 100
+      },
+      "expected": {
+        "subtotal": 1000,
+        "gst": 45,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 945
+      }
+    },
+    {
+      "name": "coupon with full config",
+      "input": {
+        "subtotal": 400,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "dine-in",
+        "couponDiscount": 50
+      },
+      "expected": {
+        "subtotal": 400,
+        "gst": 63,
+        "gstPct": 18,
+        "serviceCharge": 50,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 8
+          }
+        ],
+        "additionalChargesTotal": 8,
+        "total": 471
+      }
+    },
+    {
+      "name": "coupon larger than the taxes",
+      "input": {
+        "subtotal": 400,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "takeaway",
+        "couponDiscount": 150,
+        "tipAmount": 10
+      },
+      "expected": {
+        "subtotal": 400,
+        "gst": 45,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 8
+          }
+        ],
+        "additionalChargesTotal": 8,
+        "total": 313
+      }
+    },
+    {
+      "name": "coupon exactly cancelling the bill",
+      "input": {
+        "subtotal": 400,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "takeaway",
+        "couponDiscount": 418,
+        "tipAmount": 10
+      },
+      "expected": {
+        "subtotal": 400,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 8
+          }
+        ],
+        "additionalChargesTotal": 8,
+        "total": 0
+      }
+    },
+    {
+      "name": "coupon larger than the whole bill floors total at 0",
+      "input": {
+        "subtotal": 400,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "couponDiscount": 10000
+      },
+      "expected": {
+        "subtotal": 400,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 40,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "coupon equal to subtotal leaves zero gst base",
+      "input": {
+        "subtotal": 200,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "couponDiscount": 200
+      },
+      "expected": {
+        "subtotal": 200,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "negative coupon raises the bill",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "couponDiscount": -10
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 5.5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 115.5
+      }
+    },
+    {
+      "name": "points redeemed do not reduce gst base",
+      "input": {
+        "subtotal": 1000,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "pointsRedeemed": 100
+      },
+      "expected": {
+        "subtotal": 1000,
+        "gst": 50,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 950
+      }
+    },
+    {
+      "name": "coupon and points together",
+      "input": {
+        "subtotal": 1000,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "couponDiscount": 100,
+        "pointsRedeemed": 50
+      },
+      "expected": {
+        "subtotal": 1000,
+        "gst": 45,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 895
+      }
+    },
+    {
+      "name": "points larger than bill floors at 0",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "pointsRedeemed": 9999
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "coupon, points, tip, delivery all together",
+      "input": {
+        "subtotal": 640,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "delivery",
+        "couponDiscount": 64,
+        "pointsRedeemed": 25.5,
+        "tipAmount": 30,
+        "deliveryFee": 45
+      },
+      "expected": {
+        "subtotal": 640,
+        "gst": 103.68,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 12.8
+          }
+        ],
+        "additionalChargesTotal": 12.8,
+        "total": 741.98
+      }
+    },
+    {
+      "name": "tip is not taxed",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "tipAmount": 50
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 178
+      }
+    },
+    {
+      "name": "delivery fee is not taxed",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        },
+        "orderType": "delivery",
+        "deliveryFee": 30
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 148
+      }
+    },
+    {
+      "name": "junk tip reads as 0",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "tipAmount": "abc"
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 105
+      }
+    },
+    {
+      "name": "null tip and delivery read as 0",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "tipAmount": null,
+        "deliveryFee": null
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 105
+      }
+    },
+    {
+      "name": "service charge on gross subtotal even with a coupon",
+      "input": {
+        "subtotal": 500,
+        "taxConfig": {
+          "servicePct": 10
+        },
+        "couponDiscount": 100
+      },
+      "expected": {
+        "subtotal": 500,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 50,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 450
+      }
+    },
+    {
+      "name": "service charge 7.5%",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "servicePct": 7.5
+        }
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 25,
+        "serviceChargePct": 7.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 358.33
+      }
+    },
+    {
+      "name": "service charge rate given as string",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "servicePct": "10"
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 10,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 110
+      }
+    },
+    {
+      "name": "flat packaging charge",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 120
+      }
+    },
+    {
+      "name": "percentage green tax",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 6.67
+          }
+        ],
+        "additionalChargesTotal": 6.67,
+        "total": 340
+      }
+    },
+    {
+      "name": "flat + percentage together",
+      "input": {
+        "subtotal": 250,
+        "taxConfig": {
+          "gstPct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 250,
+        "gst": 12.5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 5
+          }
+        ],
+        "additionalChargesTotal": 25,
+        "total": 287.5
+      }
+    },
+    {
+      "name": "additional charges are not taxed and not discounted",
+      "input": {
+        "subtotal": 200,
+        "taxConfig": {
+          "gstPct": 18,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        },
+        "couponDiscount": 50
+      },
+      "expected": {
+        "subtotal": 200,
+        "gst": 27,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 197
+      }
+    },
+    {
+      "name": "0% percentage charge is dropped",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "Zero",
+              "type": "Percentage",
+              "value": 0
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 100
+      }
+    },
+    {
+      "name": "zero flat charge is dropped",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "Free bag",
+              "type": "Flat",
+              "value": 0
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 100
+      }
+    },
+    {
+      "name": "percentage charge that rounds to nothing is dropped",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "Tiny",
+              "type": "Percentage",
+              "value": 0.001
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 100
+      }
+    },
+    {
+      "name": "flat charge with 3 decimals rounds",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "P",
+              "type": "Flat",
+              "value": 25.555
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "P",
+            "type": "Flat",
+            "value": 25.555,
+            "amount": 25.56
+          }
+        ],
+        "additionalChargesTotal": 25.56,
+        "total": 125.56
+      }
+    },
+    {
+      "name": "unknown charge type is treated as flat",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "additionalCharges": [
+            {
+              "name": "X",
+              "type": "Weird",
+              "value": 7
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "X",
+            "type": "Weird",
+            "value": 7,
+            "amount": 7
+          }
+        ],
+        "additionalChargesTotal": 7,
+        "total": 107
+      }
+    },
+    {
+      "name": "flat charge on a zero cart is suppressed",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "flat charge on a negative cart is suppressed",
+      "input": {
+        "subtotal": -100,
+        "taxConfig": {
+          "gstPct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": -100,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "zero subtotal, all config",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "zero subtotal with tip and delivery still bills them",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "tipAmount": 10,
+        "deliveryFee": 20
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 30
+      }
+    },
+    {
+      "name": "negative subtotal never goes negative",
+      "input": {
+        "subtotal": -50,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": -50,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "subtotal as numeric string",
+      "input": {
+        "subtotal": "123.45",
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 123.45,
+        "gst": 6.17,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 129.62
+      }
+    },
+    {
+      "name": "junk subtotal reads as 0",
+      "input": {
+        "subtotal": "abc",
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "one paisa subtotal",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10
+        }
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0.01
+      }
+    },
+    {
+      "name": "large subtotal",
+      "input": {
+        "subtotal": 1234567.89,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 1234567.89,
+        "gst": 222222.22,
+        "gstPct": 18,
+        "serviceCharge": 154320.99,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 24691.36
+          }
+        ],
+        "additionalChargesTotal": 24691.36,
+        "total": 1635802.46
+      }
+    },
+    {
+      "name": "subtotal 0.004 rounds to 0 before tax",
+      "input": {
+        "subtotal": 0.004,
+        "taxConfig": {
+          "gstPct": 18,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "subtotal 0.005 boundary",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0.01
+      }
+    },
+    {
+      "name": "subtotal 1.005 boundary (float x.005)",
+      "input": {
+        "subtotal": 1.005,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 1,
+        "gst": 0.05,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 1.05
+      }
+    },
+    {
+      "name": "subtotal 2.675 boundary",
+      "input": {
+        "subtotal": 2.675,
+        "taxConfig": {
+          "gstPct": 12
+        }
+      },
+      "expected": {
+        "subtotal": 2.68,
+        "gst": 0.32,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 3
+      }
+    },
+    {
+      "name": "gst of x.5 paise: 10.10 @5% = 0.505",
+      "input": {
+        "subtotal": 10.1,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 10.1,
+        "gst": 0.51,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 10.61
+      }
+    },
+    {
+      "name": "gst of x.5 paise: 30.10 @5% = 1.505",
+      "input": {
+        "subtotal": 30.1,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 30.1,
+        "gst": 1.51,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 31.61
+      }
+    },
+    {
+      "name": "gst 1.005 boundary: 20.10 @5%",
+      "input": {
+        "subtotal": 20.1,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 20.1,
+        "gst": 1.01,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 21.11
+      }
+    },
+    {
+      "name": "service charge boundary 2.5% of 20.10",
+      "input": {
+        "subtotal": 20.1,
+        "taxConfig": {
+          "servicePct": 2.5
+        }
+      },
+      "expected": {
+        "subtotal": 20.1,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0.5,
+        "serviceChargePct": 2.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 20.6
+      }
+    },
+    {
+      "name": "each component rounds on its own: 333.33 full config",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "dine-in"
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 60,
+        "gstPct": 18,
+        "serviceCharge": 41.67,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 6.67
+          }
+        ],
+        "additionalChargesTotal": 6.67,
+        "total": 441.67
+      }
+    },
+    {
+      "name": "coupon with float dust: 0.1 + 0.2 style",
+      "input": {
+        "subtotal": 0.3,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "couponDiscount": 0.1
+      },
+      "expected": {
+        "subtotal": 0.3,
+        "gst": 0.01,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0.21
+      }
+    },
+    {
+      "name": "subtotal 99.99, 18% + 12.5%",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 18,
+        "gstPct": 18,
+        "serviceCharge": 12.5,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 2
+          }
+        ],
+        "additionalChargesTotal": 2,
+        "total": 132.49
+      }
+    },
+    {
+      "name": "subtotal 1.15, 5%",
+      "input": {
+        "subtotal": 1.15,
+        "taxConfig": {
+          "gstPct": 5
+        }
+      },
+      "expected": {
+        "subtotal": 1.15,
+        "gst": 0.06,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 1.21
+      }
+    },
+    {
+      "name": "coupon x.005",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "couponDiscount": 10.005
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 4.5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 94.5
+      }
+    },
+    {
+      "name": "tip x.005",
+      "input": {
+        "subtotal": 100,
+        "taxConfig": {
+          "gstPct": 5
+        },
+        "tipAmount": 1.005
+      },
+      "expected": {
+        "subtotal": 100,
+        "gst": 5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 106.01
+      }
+    },
+    {
+      "name": "generated 0",
+      "input": {
+        "subtotal": 125.06,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 5,
+          "additionalCharges": []
+        },
+        "orderType": "",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 125.06,
+        "gst": 22.51,
+        "gstPct": 18,
+        "serviceCharge": 6.25,
+        "serviceChargePct": 5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 153.82
+      }
+    },
+    {
+      "name": "generated 1",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 0,
+          "additionalCharges": []
+        },
+        "orderType": "dine-in",
+        "couponDiscount": 0,
+        "pointsRedeemed": 6.14,
+        "tipAmount": 53.91,
+        "deliveryFee": 76.69
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 124.47
+      }
+    },
+    {
+      "name": "generated 2",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 0,
+        "pointsRedeemed": 1.73,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 18.28
+      }
+    },
+    {
+      "name": "generated 3",
+      "input": {
+        "subtotal": 89.62,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "kiosk",
+        "couponDiscount": 0,
+        "pointsRedeemed": 19.26,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 89.62,
+        "gst": 16.13,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 1.79
+          }
+        ],
+        "additionalChargesTotal": 21.79,
+        "total": 108.28
+      }
+    },
+    {
+      "name": "generated 4",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 12.5,
+          "additionalCharges": []
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 8.72,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 0,
+        "gstPct": 28,
+        "serviceCharge": 41.67,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 5",
+      "input": {
+        "subtotal": 2605.72,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 0,
+        "pointsRedeemed": 43.95,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 2605.72,
+        "gst": 65.14,
+        "gstPct": 2.5,
+        "serviceCharge": 130.29,
+        "serviceChargePct": 5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 52.11
+          }
+        ],
+        "additionalChargesTotal": 72.11,
+        "total": 2829.31
+      }
+    },
+    {
+      "name": "generated 6",
+      "input": {
+        "subtotal": -50,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "pickup",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": -50,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 7",
+      "input": {
+        "subtotal": 24.85,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "pickup",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 60.52,
+        "deliveryFee": 14.3
+      },
+      "expected": {
+        "subtotal": 24.85,
+        "gst": 2.98,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 0.5
+          }
+        ],
+        "additionalChargesTotal": 20.5,
+        "total": 123.15
+      }
+    },
+    {
+      "name": "generated 8",
+      "input": {
+        "subtotal": 2438.08,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2.75
+            }
+          ]
+        },
+        "orderType": "pickup",
+        "couponDiscount": 0,
+        "pointsRedeemed": 20.98,
+        "tipAmount": "abc",
+        "deliveryFee": 17.6
+      },
+      "expected": {
+        "subtotal": 2438.08,
+        "gst": 292.57,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2.75,
+            "amount": 67.05
+          }
+        ],
+        "additionalChargesTotal": 67.05,
+        "total": 2794.32
+      }
+    },
+    {
+      "name": "generated 9",
+      "input": {
+        "subtotal": 176.69,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 25.555
+            }
+          ]
+        },
+        "orderType": "dine-in",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 81.89,
+        "deliveryFee": 79.62
+      },
+      "expected": {
+        "subtotal": 176.69,
+        "gst": 49.47,
+        "gstPct": 28,
+        "serviceCharge": 13.25,
+        "serviceChargePct": 7.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 25.555,
+            "amount": 25.56
+          }
+        ],
+        "additionalChargesTotal": 25.56,
+        "total": 426.48
+      }
+    },
+    {
+      "name": "generated 10",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 0
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 154.85,
+        "pointsRedeemed": 14.43,
+        "tipAmount": 0,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 11",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 0
+            }
+          ]
+        },
+        "orderType": "pickup",
+        "couponDiscount": 206.08,
+        "pointsRedeemed": 0,
+        "tipAmount": 65.98,
+        "deliveryFee": 67.46
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 12",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 41.24,
+        "pointsRedeemed": 7.24,
+        "tipAmount": 0,
+        "deliveryFee": 23.55
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 13",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 0
+            }
+          ]
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 239.15,
+        "pointsRedeemed": 0,
+        "tipAmount": 0,
+        "deliveryFee": 26.72
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 14",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 5,
+          "additionalCharges": []
+        },
+        "orderType": "pickup",
+        "couponDiscount": 218.71,
+        "pointsRedeemed": 44.57,
+        "tipAmount": "abc",
+        "deliveryFee": 42.18
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 2.87,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 115.1
+      }
+    },
+    {
+      "name": "generated 15",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "pickup",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 17.75,
+        "tipAmount": 0,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 6.67
+          }
+        ],
+        "additionalChargesTotal": 6.67,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 16",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 5,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 30.27
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 50.28
+      }
+    },
+    {
+      "name": "generated 17",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 10,
+          "additionalCharges": []
+        },
+        "orderType": "pickup",
+        "couponDiscount": 193.58,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 11.26
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 18",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 5,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 0,
+        "pointsRedeemed": 11.57,
+        "tipAmount": 57.19,
+        "deliveryFee": 54.35
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 2
+          }
+        ],
+        "additionalChargesTotal": 22,
+        "total": 226.96
+      }
+    },
+    {
+      "name": "generated 19",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 69.98,
+        "deliveryFee": 74.17
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 144.15
+      }
+    },
+    {
+      "name": "generated 20",
+      "input": {
+        "subtotal": 111.07,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "kiosk",
+        "couponDiscount": 29.75,
+        "pointsRedeemed": 0,
+        "tipAmount": 5.17,
+        "deliveryFee": 71.85
+      },
+      "expected": {
+        "subtotal": 111.07,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 2.22
+          }
+        ],
+        "additionalChargesTotal": 22.22,
+        "total": 180.56
+      }
+    },
+    {
+      "name": "generated 21",
+      "input": {
+        "subtotal": -50,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 10
+            }
+          ]
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 12.02,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": -50,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": -5,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 22",
+      "input": {
+        "subtotal": 3908,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        },
+        "orderType": "takeaway",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 3908,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 23",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 12.5,
+          "additionalCharges": []
+        },
+        "orderType": "dine-in",
+        "couponDiscount": 0,
+        "pointsRedeemed": 17.74,
+        "tipAmount": 63.06,
+        "deliveryFee": 68.14
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 12.5,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 225.95
+      }
+    },
+    {
+      "name": "generated 24",
+      "input": {
+        "subtotal": 1424.66,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 192.36,
+        "pointsRedeemed": 0,
+        "tipAmount": 89.83,
+        "deliveryFee": 32.25
+      },
+      "expected": {
+        "subtotal": 1424.66,
+        "gst": 221.81,
+        "gstPct": 18,
+        "serviceCharge": 106.85,
+        "serviceChargePct": 7.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 28.49
+          }
+        ],
+        "additionalChargesTotal": 28.49,
+        "total": 1711.53
+      }
+    },
+    {
+      "name": "generated 25",
+      "input": {
+        "subtotal": 4113.45,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": []
+        },
+        "orderType": "takeaway",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 31.25
+      },
+      "expected": {
+        "subtotal": 4113.45,
+        "gst": 740.42,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 4885.12
+      }
+    },
+    {
+      "name": "generated 26",
+      "input": {
+        "subtotal": 74.02,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 10,
+          "additionalCharges": []
+        },
+        "orderType": "",
+        "couponDiscount": 0,
+        "pointsRedeemed": 38.84,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 74.02,
+        "gst": 1.85,
+        "gstPct": 2.5,
+        "serviceCharge": 7.4,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 44.43
+      }
+    },
+    {
+      "name": "generated 27",
+      "input": {
+        "subtotal": 143.15,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 35.19,
+        "pointsRedeemed": 30.15,
+        "tipAmount": 4.74,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 143.15,
+        "gst": 2.7,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 2.86
+          }
+        ],
+        "additionalChargesTotal": 2.86,
+        "total": 88.11
+      }
+    },
+    {
+      "name": "generated 28",
+      "input": {
+        "subtotal": 193.83,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 1
+            }
+          ]
+        },
+        "orderType": "takeaway",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 0,
+        "deliveryFee": 16.77
+      },
+      "expected": {
+        "subtotal": 193.83,
+        "gst": 34.89,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 1,
+            "amount": 1.94
+          }
+        ],
+        "additionalChargesTotal": 1.94,
+        "total": 247.43
+      }
+    },
+    {
+      "name": "generated 29",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 50.12,
+        "pointsRedeemed": 9.7,
+        "tipAmount": "abc",
+        "deliveryFee": 63.97
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 10,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 24.16
+      }
+    },
+    {
+      "name": "generated 30",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 42.84,
+        "tipAmount": 68.04,
+        "deliveryFee": 30.65
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 0,
+        "gstPct": 2.5,
+        "serviceCharge": 25,
+        "serviceChargePct": 7.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 6.67
+          }
+        ],
+        "additionalChargesTotal": 26.67,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 31",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 1
+            }
+          ]
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 197.82,
+        "pointsRedeemed": 0,
+        "tipAmount": 0,
+        "deliveryFee": 72.73
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 32",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 59.5
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 59.5
+      }
+    },
+    {
+      "name": "generated 33",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 10,
+          "additionalCharges": []
+        },
+        "orderType": "delivery",
+        "couponDiscount": 0,
+        "pointsRedeemed": 38.39,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 34",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 47.37,
+        "tipAmount": 72.42,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 35",
+      "input": {
+        "subtotal": -50,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 0,
+          "additionalCharges": []
+        },
+        "orderType": "pickup",
+        "couponDiscount": 0,
+        "pointsRedeemed": 35.81,
+        "tipAmount": 0,
+        "deliveryFee": 48.79
+      },
+      "expected": {
+        "subtotal": -50,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 36",
+      "input": {
+        "subtotal": 3026.62,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2.75
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 233.79,
+        "pointsRedeemed": 37.46,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 3026.62,
+        "gst": 335.14,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2.75,
+            "amount": 83.23
+          }
+        ],
+        "additionalChargesTotal": 83.23,
+        "total": 3173.74
+      }
+    },
+    {
+      "name": "generated 37",
+      "input": {
+        "subtotal": 9.1,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 12.5,
+          "additionalCharges": []
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 257.46,
+        "pointsRedeemed": 0,
+        "tipAmount": 0,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 9.1,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 1.14,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 38",
+      "input": {
+        "subtotal": 1880.04,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "kiosk",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 1880.04,
+        "gst": 526.41,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 37.6
+          }
+        ],
+        "additionalChargesTotal": 37.6,
+        "total": 2444.05
+      }
+    },
+    {
+      "name": "generated 39",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 0,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 28,
+        "gstPct": 28,
+        "serviceCharge": 5,
+        "serviceChargePct": 5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 152.99
+      }
+    },
+    {
+      "name": "generated 40",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 10,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            }
+          ]
+        },
+        "orderType": "pickup",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 41",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "kiosk",
+        "couponDiscount": 247.43,
+        "pointsRedeemed": 0,
+        "tipAmount": 0.95,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          }
+        ],
+        "additionalChargesTotal": 20,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 42",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 73.14,
+        "pointsRedeemed": 25.46,
+        "tipAmount": "abc",
+        "deliveryFee": 3.63
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 43",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 10,
+          "additionalCharges": []
+        },
+        "orderType": "catering",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 66.2,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 66.21
+      }
+    },
+    {
+      "name": "generated 44",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "kiosk",
+        "couponDiscount": 67.89,
+        "pointsRedeemed": 17.36,
+        "tipAmount": 54.25,
+        "deliveryFee": 39.22
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 0.8,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 2
+          }
+        ],
+        "additionalChargesTotal": 22,
+        "total": 131.01
+      }
+    },
+    {
+      "name": "generated 45",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 0,
+          "additionalCharges": []
+        },
+        "orderType": "",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 48.63
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 48.63
+      }
+    },
+    {
+      "name": "generated 46",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 20
+            },
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 0,
+        "pointsRedeemed": 38.32,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 93.33,
+        "gstPct": 28,
+        "serviceCharge": 41.67,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 20,
+            "amount": 20
+          },
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2,
+            "amount": 6.67
+          }
+        ],
+        "additionalChargesTotal": 26.67,
+        "total": 456.68
+      }
+    },
+    {
+      "name": "generated 47",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 10,
+          "additionalCharges": []
+        },
+        "orderType": "pickup",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 0,
+        "tipAmount": 84.05,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 0,
+        "gstPct": 18,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 48",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 0
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 0,
+        "pointsRedeemed": 32.95,
+        "tipAmount": 73.65,
+        "deliveryFee": 13.66
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 40,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 427.69
+      }
+    },
+    {
+      "name": "generated 49",
+      "input": {
+        "subtotal": 4127.6,
+        "taxConfig": {
+          "gstPct": 18,
+          "servicePct": 5,
+          "additionalCharges": []
+        },
+        "orderType": "",
+        "couponDiscount": 251.95,
+        "pointsRedeemed": 37.37,
+        "tipAmount": 0,
+        "deliveryFee": 42.71
+      },
+      "expected": {
+        "subtotal": 4127.6,
+        "gst": 697.62,
+        "gstPct": 18,
+        "serviceCharge": 206.38,
+        "serviceChargePct": 5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 4784.99
+      }
+    },
+    {
+      "name": "generated 50",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 0
+            }
+          ]
+        },
+        "orderType": "delivery",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 45.95,
+        "tipAmount": 0,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 51",
+      "input": {
+        "subtotal": 4751.39,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 12.5,
+          "additionalCharges": []
+        },
+        "orderType": "Dine In",
+        "couponDiscount": 78.43,
+        "pointsRedeemed": 5.71,
+        "tipAmount": "abc",
+        "deliveryFee": 32.75
+      },
+      "expected": {
+        "subtotal": 4751.39,
+        "gst": 1308.43,
+        "gstPct": 28,
+        "serviceCharge": 593.92,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 6602.35
+      }
+    },
+    {
+      "name": "generated 52",
+      "input": {
+        "subtotal": 0.005,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 7.5,
+          "additionalCharges": []
+        },
+        "orderType": "delivery",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 16.33,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 16.34
+      }
+    },
+    {
+      "name": "generated 53",
+      "input": {
+        "subtotal": 99.99,
+        "taxConfig": {
+          "gstPct": 5,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 10
+            }
+          ]
+        },
+        "orderType": "kiosk",
+        "couponDiscount": 0,
+        "pointsRedeemed": 0,
+        "tipAmount": 0,
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 99.99,
+        "gst": 5,
+        "gstPct": 5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 10,
+            "amount": 10
+          }
+        ],
+        "additionalChargesTotal": 10,
+        "total": 114.99
+      }
+    },
+    {
+      "name": "generated 54",
+      "input": {
+        "subtotal": 3952.29,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 25.555
+            }
+          ]
+        },
+        "orderType": "dine-in",
+        "couponDiscount": 92.82,
+        "pointsRedeemed": 40.48,
+        "tipAmount": "abc",
+        "deliveryFee": 23.68
+      },
+      "expected": {
+        "subtotal": 3952.29,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 494.04,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [
+          {
+            "name": "Packaging",
+            "type": "Flat",
+            "value": 25.555,
+            "amount": 25.56
+          }
+        ],
+        "additionalChargesTotal": 25.56,
+        "total": 4362.27
+      }
+    },
+    {
+      "name": "generated 55",
+      "input": {
+        "subtotal": 333.33,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 7.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2.75
+            }
+          ]
+        },
+        "orderType": "delivery",
+        "couponDiscount": 44.97,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 333.33,
+        "gst": 80.74,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [
+          {
+            "name": "Green Tax",
+            "type": "Percentage",
+            "value": 2.75,
+            "amount": 9.17
+          }
+        ],
+        "additionalChargesTotal": 9.17,
+        "total": 378.27
+      }
+    },
+    {
+      "name": "generated 56",
+      "input": {
+        "subtotal": 0.01,
+        "taxConfig": {
+          "gstPct": 12,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Green Tax",
+              "type": "Percentage",
+              "value": 2
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 0.01,
+        "gst": 0,
+        "gstPct": 12,
+        "serviceCharge": 0,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 57",
+      "input": {
+        "subtotal": 4922.57,
+        "taxConfig": {
+          "gstPct": 2.5,
+          "servicePct": 0,
+          "additionalCharges": []
+        },
+        "orderType": "pickup",
+        "couponDiscount": 296.79,
+        "pointsRedeemed": 0,
+        "tipAmount": "abc",
+        "deliveryFee": 0
+      },
+      "expected": {
+        "subtotal": 4922.57,
+        "gst": 115.64,
+        "gstPct": 2.5,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 4741.42
+      }
+    },
+    {
+      "name": "generated 58",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 0,
+          "servicePct": 0,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 10
+            }
+          ]
+        },
+        "orderType": "catering",
+        "couponDiscount": 229.6,
+        "pointsRedeemed": 29.21,
+        "tipAmount": "abc",
+        "deliveryFee": 22.63
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 0,
+        "serviceCharge": 0,
+        "serviceChargePct": 0,
+        "serviceChargeApplies": false,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    },
+    {
+      "name": "generated 59",
+      "input": {
+        "subtotal": 0,
+        "taxConfig": {
+          "gstPct": 28,
+          "servicePct": 12.5,
+          "additionalCharges": [
+            {
+              "name": "Packaging",
+              "type": "Flat",
+              "value": 0
+            }
+          ]
+        },
+        "orderType": "",
+        "couponDiscount": 10000,
+        "pointsRedeemed": 10.82,
+        "tipAmount": "abc",
+        "deliveryFee": 30.08
+      },
+      "expected": {
+        "subtotal": 0,
+        "gst": 0,
+        "gstPct": 28,
+        "serviceCharge": 0,
+        "serviceChargePct": 12.5,
+        "serviceChargeApplies": true,
+        "additionalCharges": [],
+        "additionalChargesTotal": 0,
+        "total": 0
+      }
+    }
+  ]
+}

@@ -240,3 +240,29 @@ describe('toPlainText', () => {
         expect(text).toBe('a\n----------\n\n\n--- cut ---\n--- drawer ---');
     });
 });
+
+describe('renderBill: Bill No carries the financial year', () => {
+    const billText = (bill) => toPlainText(renderBill({ settings: settings(), order: { ...order(), bill }, tableLabel: '5', paperWidth: '80' }));
+    test('FY bill prints 2026-27/5', () => {
+        expect(billText({ billNo: 5, financialYear: '2026-27' })).toContain('Bill No: 2026-27/5');
+    });
+    test('pre-FY bill prints the plain number', () => {
+        const t = billText({ billNo: 5 });
+        expect(t).toContain('Bill No: 5');
+        expect(t).not.toContain('/5');
+    });
+    test('no bill number -> no Bill No row', () => {
+        expect(billText(undefined)).not.toContain('Bill No');
+    });
+});
+
+describe('HSN/SAC on the bill tax block', () => {
+    const { renderBill } = require('../utils/receiptRenderer');
+    const base = { orderId: 'O1', items: [{ name: 'Tea', price: 100, quantity: 1 }], total: 105, gst: 5, gstPercentage: 5, createdAt: new Date('2026-10-10T08:00:00Z') };
+    const dump = (order) => JSON.stringify(renderBill({ settings: { general: {} }, order, paperWidth: '80mm' }));
+    test('printed only when the bill data carries an HSN', () => {
+        expect(dump(base)).not.toContain('HSN/SAC');
+        expect(dump({ ...base, hsnCode: '996331' })).toContain('HSN/SAC');
+        expect(dump({ ...base, items: [{ ...base.items[0], hsnCode: '1905' }] })).toContain('1905');
+    });
+});

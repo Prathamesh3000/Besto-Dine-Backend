@@ -53,6 +53,33 @@ const settingsSchema = new mongoose.Schema({
     end: { type: String, default: '23:00' },
     isOpen: { type: Boolean, default: true }
   }],
+  // GST / Tally export aid (routes/reportsRoute.js). Export helper only,
+  // not a tax filing tool. Ledger names are the Tally ledgers the
+  // exported vouchers post to; empty = built-in defaults
+  // (utils/tallyExport.DEFAULT_LEDGERS).
+  taxExport: {
+    defaultHsn: { type: String, default: '996331', trim: true, maxlength: 8 },
+    ledgers: {
+      sales:        { type: String, default: '', trim: true, maxlength: 80 },
+      outputCgst:   { type: String, default: '', trim: true, maxlength: 80 },
+      outputSgst:   { type: String, default: '', trim: true, maxlength: 80 },
+      serviceCharge:{ type: String, default: '', trim: true, maxlength: 80 },
+      otherCharges: { type: String, default: '', trim: true, maxlength: 80 },
+      tips:         { type: String, default: '', trim: true, maxlength: 80 },
+      roundOff:     { type: String, default: '', trim: true, maxlength: 80 },
+      discount:     { type: String, default: '', trim: true, maxlength: 80 },
+      partyCash:    { type: String, default: '', trim: true, maxlength: 80 },
+      partyDebtors: { type: String, default: '', trim: true, maxlength: 80 },
+      cash:         { type: String, default: '', trim: true, maxlength: 80 },
+      upi:          { type: String, default: '', trim: true, maxlength: 80 },
+      card:         { type: String, default: '', trim: true, maxlength: 80 },
+      wallet:       { type: String, default: '', trim: true, maxlength: 80 },
+      online:       { type: String, default: '', trim: true, maxlength: 80 },
+      other:        { type: String, default: '', trim: true, maxlength: 80 },
+    },
+    // 'cash' = party 'Cash' ledger; 'debtors' = 'Sundry Debtors'.
+    partyMode: { type: String, enum: ['cash', 'debtors'], default: 'cash' },
+  },
   taxes: {
     serviceCharge: {
       enabled: { type: Boolean, default: true },

@@ -10,6 +10,7 @@ const Request = require('../models/request');
 const logger = require('../utils/logger');
 
 const { tenantFilter, analyticsBranchFilter, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const { tenantLookup } = require('../utils/tenantSafe');
 const { sendServerError } = require('../utils/httpErrors');
 const { featureTier } = require('../utils/featureAccess');
 
@@ -244,12 +245,10 @@ exports.getStats = async (req, res) => {
         const branchObj = new mongoose.Types.ObjectId(String(activeBranch));
         const rows = await Order.aggregate([
           { $match: base },
-          { $lookup: {
-              from: 'tables',
-              localField: 'table',
-              foreignField: '_id',
-              as: 'tableDoc',
-          }},
+          // Tenant-matched inside the $lookup sub-pipeline (tenantFilter(req) carries the restaurant).
+          tf.restaurant
+            ? tenantLookup({ from: 'tables', localField: 'table', foreignField: '_id', as: 'tableDoc' }, tf.restaurant)
+            : { $lookup: { from: 'tables', localField: 'table', foreignField: '_id', as: 'tableDoc' } }, // AUDIT-EXEMPT: no tenant on this request (superadmin); base $match is unscoped too
           { $addFields: { tableDoc: { $arrayElemAt: ['$tableDoc', 0] } } },
           { $match: {
               $or: [

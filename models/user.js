@@ -318,6 +318,17 @@ const userSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
+    // Optional TOTP 2FA (admin / superadmin only — see utils/totp.js and
+    // controllers/twoFactorController.js). The secret is AES-256-GCM
+    // encrypted and, with the recovery-code hashes, excluded from queries
+    // unless explicitly selected.
+    twoFactor: {
+        enabled: { type: Boolean, default: false },
+        secretEnc: { type: String, select: false },
+        recoveryHashes: { type: [String], select: false, default: undefined },
+        verifiedAt: { type: Date },
+        lastUsedStep: { type: Number, default: 0 },
+    },
     // Granular feature flags per staff member.
     // Stored as a plain Object so JSON.stringify() round-trips correctly
     // (Map serialises to {} which loses all entries in localStorage).
@@ -430,6 +441,10 @@ userSchema.pre('save', async function () {
 userSchema.set('toJSON', {
     transform(_doc, ret) {
         delete ret.password;
+        if (ret.twoFactor) {
+            delete ret.twoFactor.secretEnc;
+            delete ret.twoFactor.recoveryHashes;
+        }
         return ret;
     },
 });

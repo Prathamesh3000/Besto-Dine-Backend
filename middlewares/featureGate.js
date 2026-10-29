@@ -72,6 +72,7 @@ const FEATURE_LABELS = {
     revenueAnalytics:    'revenue analytics',
     kiosk:               'self-order kiosk',
     incentives:          'staff incentives',
+    publicApi:           'API keys and webhooks',
 };
 
 const TIER_LABELS = { basic: 'Basic', standard: 'Standard', advanced: 'Advanced' };

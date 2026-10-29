@@ -1,0 +1,1987 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "BestoDine Public API",
+    "version": "1.0.0",
+    "description": "Read-only API for a restaurant's own orders, menu, sales, low-stock inventory and bookings. Available on Gold and above or as the \"API keys & webhooks\" add-on (feature key `publicApi`); otherwise every call returns 403 FEATURE_LOCKED. Field names are snake_case and stable within v1: new fields may be added, existing ones are not renamed or removed. The public API is read-only: any non-GET method returns 405 METHOD_NOT_ALLOWED. Never exposed: customer phone numbers and e-mails, staff data, payment gateway ids, tokens, password hashes, idempotency keys, other restaurants' data. Webhooks are described under `webhooks`."
+  },
+  "servers": [
+    {
+      "url": "/api/public/v1",
+      "description": "Relative to your API host, e.g. https://api.example.com/api/public/v1"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Orders"
+    },
+    {
+      "name": "Menu"
+    },
+    {
+      "name": "Sales"
+    },
+    {
+      "name": "Inventory"
+    },
+    {
+      "name": "Bookings"
+    },
+    {
+      "name": "Webhooks"
+    },
+    {
+      "name": "Meta"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "apiKeyHeader": []
+    }
+  ],
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "listOrders",
+        "summary": "List orders (newest first)",
+        "tags": [
+          "Orders"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyHeader": []
+          }
+        ],
+        "x-required-scope": "read:orders",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "awaiting-payment",
+                "new",
+                "preparing",
+                "ready",
+                "served",
+                "cancelled"
+              ]
+            },
+            "description": "Filter by order status."
+          },
+          {
+            "name": "payment_status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "Pending",
+                "Partially Paid",
+                "Paid",
+                "Refunded"
+              ]
+            },
+            "description": "Filter by payment status."
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "RateLimit-Limit": {
+                "$ref": "#/components/headers/RateLimit-Limit"
+              },
+              "RateLimit-Remaining": {
+                "$ref": "#/components/headers/RateLimit-Remaining"
+              },
+              "RateLimit-Reset": {
+                "$ref": "#/components/headers/RateLimit-Reset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/orders/{id}": {
+      "get": {
+        "operationId": "getOrder",
+        "summary": "Get one order",
+        "tags": [
+          "Orders"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyHeader": []
+          }
+        ],
+        "x-required-scope": "read:orders",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Order number, e.g. ORD-0412."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "RateLimit-Limit": {
+                "$ref": "#/components/headers/RateLimit-Limit"
+              },
+              "RateLimit-Remaining": {
+                "$ref": "#/components/headers/RateLimit-Remaining"
+              },
+              "RateLimit-Reset": {
+                "$ref": "#/components/headers/RateLimit-Reset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/menu": {
+      "get": {
+        "operationId": "listMenu",
+        "summary": "List active menu items",
+        "tags": [
+          "Menu"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyHeader": []
+          }
+        ],
+        "x-required-scope": "read:menu",
+        "parameters": [
+          {
+            "name": "in_stock",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            },
+            "description": "Only items that are in stock."
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "RateLimit-Limit": {
+                "$ref": "#/components/headers/RateLimit-Limit"
+              },
+              "RateLimit-Remaining": {
+                "$ref": "#/components/headers/RateLimit-Remaining"
+              },
+              "RateLimit-Reset": {
+                "$ref": "#/components/headers/RateLimit-Reset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MenuList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/sales/summary": {
+      "get": {
+        "operationId": "getSalesSummary",
+        "summary": "Sales summary",
+        "tags": [
+          "Sales"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyHeader": []
+          }
+        ],
+        "x-required-scope": "read:sales",
+        "description": "Paid, non-cancelled orders in the range (same definition as the admin analytics). Default range: last 30 days. Days are bucketed in the restaurant timezone.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "RateLimit-Limit": {
+                "$ref": "#/components/headers/RateLimit-Limit"
+              },
+              "RateLimit-Remaining": {
+                "$ref": "#/components/headers/RateLimit-Remaining"
+              },
+              "RateLimit-Reset": {
+                "$ref": "#/components/headers/RateLimit-Reset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SalesSummaryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/inventory/low-stock": {
+      "get": {
+        "operationId": "listLowStock",
+        "summary": "Items at or below minimum stock",
+        "tags": [
+          "Inventory"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyHeader": []
+          }
+        ],
+        "x-required-scope": "read:inventory",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BranchId"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "RateLimit-Limit": {
+                "$ref": "#/components/headers/RateLimit-Limit"
+              },
+              "RateLimit-Remaining": {
+                "$ref": "#/components/headers/RateLimit-Remaining"
+              },
+              "RateLimit-Reset": {
+                "$ref": "#/components/headers/RateLimit-Reset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InventoryList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/bookings": {
+      "get": {
+        "operationId": "listBookings",
+        "summary": "List table and hall bookings",
+        "tags": [
+          "Bookings"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "apiKeyHeader": []
+          }
+        ],
+        "x-required-scope": "read:bookings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "Pending",
+                "Confirmed",
+                "Completed",
+                "Cancelled"
+              ]
+            },
+            "description": "Filter by booking status."
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "table",
+                "hall"
+              ]
+            },
+            "description": "Filter by booking type."
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "RateLimit-Limit": {
+                "$ref": "#/components/headers/RateLimit-Limit"
+              },
+              "RateLimit-Remaining": {
+                "$ref": "#/components/headers/RateLimit-Remaining"
+              },
+              "RateLimit-Reset": {
+                "$ref": "#/components/headers/RateLimit-Reset"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookingList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApiDocument",
+        "summary": "This OpenAPI document",
+        "tags": [
+          "Meta"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "order.created": {
+      "post": {
+        "operationId": "receive_order_created",
+        "summary": "An order is placed",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "order.created"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderCreatedEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    },
+    "order.paid": {
+      "post": {
+        "operationId": "receive_order_paid",
+        "summary": "An order becomes fully paid",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "order.paid"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderPaidEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    },
+    "order.cancelled": {
+      "post": {
+        "operationId": "receive_order_cancelled",
+        "summary": "An order is cancelled",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "order.cancelled"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderCancelledEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    },
+    "refund.created": {
+      "post": {
+        "operationId": "receive_refund_created",
+        "summary": "A refund is processed",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "refund.created"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefundCreatedEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    },
+    "booking.created": {
+      "post": {
+        "operationId": "receive_booking_created",
+        "summary": "A booking is made",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "booking.created"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BookingCreatedEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    },
+    "stock.low": {
+      "post": {
+        "operationId": "receive_stock_low",
+        "summary": "An inventory item is low or out of stock",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "stock.low"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StockLowEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    },
+    "webhook.test": {
+      "post": {
+        "operationId": "receive_webhook_test",
+        "summary": "Test event (\"Send test\" button)",
+        "tags": [
+          "Webhooks"
+        ],
+        "description": "BestoDine POSTs a signed JSON event to your HTTPS endpoint. Delivery is at-least-once with retries (up to 6 attempts, backoff 1m, 5m, 30m, 2h, 6h); de-duplicate on the event `id`. Respond with any 2xx to acknowledge. An endpoint is switched off after repeated consecutive failures.",
+        "parameters": [
+          {
+            "name": "X-BestoDine-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "t=1761700000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+            },
+            "description": "Format `t=<unix seconds>,v1=<hex>`. v1 = HMAC-SHA256(secret, t + \".\" + rawBody), hex. secret is the endpoint signing secret (whsec_...). Compare in constant time; reject timestamps older than about 5 minutes."
+          },
+          {
+            "name": "X-BestoDine-Event",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "webhook.test"
+            }
+          },
+          {
+            "name": "X-BestoDine-Delivery",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Delivery row id (not the event id)."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookTestEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "bd_live_<prefix>_<secret>",
+        "description": "Create a key in Admin > Developers (owner only). Shown once; only a hash is stored. Keys in the query string are NOT accepted. Scopes: read:orders, read:menu, read:sales, read:inventory, read:bookings; a call outside the key's scopes returns 403 INSUFFICIENT_SCOPE."
+      },
+      "apiKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Alternative to the Bearer header. Same key, same scopes."
+      }
+    },
+    "schemas": {
+      "Order": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "type",
+          "source",
+          "status",
+          "payment_status",
+          "payment_method",
+          "branch_id",
+          "table_id",
+          "token_number",
+          "customer_name",
+          "items",
+          "total",
+          "gst",
+          "service_charge",
+          "additional_charges_total",
+          "amount_paid",
+          "refunded_amount",
+          "cancel_reason",
+          "created_at",
+          "paid_at",
+          "cancelled_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Order number, e.g. ORD-0412.",
+            "example": "ORD-0412"
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "dine-in or takeaway.",
+            "example": "dine-in"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "staff"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "awaiting-payment",
+              "new",
+              "preparing",
+              "ready",
+              "served",
+              "cancelled"
+            ]
+          },
+          "payment_status": {
+            "type": "string",
+            "enum": [
+              "Pending",
+              "Partially Paid",
+              "Paid",
+              "Refunded"
+            ]
+          },
+          "payment_method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "cash"
+          },
+          "branch_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch id, null for single-location restaurants."
+          },
+          "table_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_number": {
+            "type": [
+              "integer",
+              "string",
+              "null"
+            ],
+            "description": "Token number when token mode is enabled."
+          },
+          "customer_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderItem"
+            }
+          },
+          "total": {
+            "type": "number"
+          },
+          "gst": {
+            "type": "number"
+          },
+          "service_charge": {
+            "type": "number"
+          },
+          "additional_charges_total": {
+            "type": "number"
+          },
+          "amount_paid": {
+            "type": "number"
+          },
+          "refunded_amount": {
+            "type": "number"
+          },
+          "cancel_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "paid_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "cancelled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "description": "Order. Fields are an explicit allow-list (utils/publicApiSerializers.js: serializeOrder)."
+      },
+      "OrderItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "quantity",
+          "price",
+          "category"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          },
+          "price": {
+            "type": "number"
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "MenuItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "category_id",
+          "category",
+          "description",
+          "veg_type",
+          "base_price",
+          "offer_percentage",
+          "final_price",
+          "unit",
+          "in_stock",
+          "branch_id",
+          "images",
+          "sizes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "category_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Category name."
+          },
+          "description": {
+            "type": "string"
+          },
+          "veg_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "veg"
+          },
+          "base_price": {
+            "type": "number"
+          },
+          "offer_percentage": {
+            "type": "number"
+          },
+          "final_price": {
+            "type": "number"
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "in_stock": {
+            "type": "boolean"
+          },
+          "branch_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "images": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "string"
+            }
+          },
+          "sizes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MenuItemSize"
+            }
+          }
+        },
+        "description": "Active menu item (serializeMenuItem)."
+      },
+      "MenuItemSize": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "price"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "price": {
+            "type": "number"
+          }
+        }
+      },
+      "InventoryItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "category",
+          "unit",
+          "current_stock",
+          "min_stock",
+          "status",
+          "branch_id",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "INV-014"
+          },
+          "name": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "current_stock": {
+            "type": "number"
+          },
+          "min_stock": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "example": "low-stock"
+          },
+          "branch_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "description": "Inventory item (serializeInventoryItem)."
+      },
+      "Booking": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "type",
+          "status",
+          "date",
+          "time",
+          "time_slot",
+          "guest_count",
+          "special_event",
+          "branch_id",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "TBL-031"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "table",
+              "hall"
+            ],
+            "description": "Defaults to table."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "Pending",
+              "Confirmed",
+              "Completed",
+              "Cancelled"
+            ]
+          },
+          "date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Event date."
+          },
+          "time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "7:00 PM"
+          },
+          "time_slot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "example": "Dinner"
+          },
+          "guest_count": {
+            "type": "number"
+          },
+          "special_event": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "description": "Table or hall booking (serializeBooking)."
+      },
+      "SalesSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "timezone",
+          "from",
+          "to",
+          "revenue",
+          "orders",
+          "refunded",
+          "average_order_value",
+          "daily",
+          "top_items"
+        ],
+        "properties": {
+          "timezone": {
+            "type": "string",
+            "example": "Asia/Kolkata"
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Start of range (default: 30 days ago, 00:00 UTC)."
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "End of range, null when open-ended."
+          },
+          "revenue": {
+            "type": "number"
+          },
+          "orders": {
+            "type": "integer"
+          },
+          "refunded": {
+            "type": "number"
+          },
+          "average_order_value": {
+            "type": "number"
+          },
+          "daily": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "date",
+                "revenue",
+                "orders"
+              ],
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "format": "date"
+                },
+                "revenue": {
+                  "type": "number"
+                },
+                "orders": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "top_items": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "quantity",
+                "revenue"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "quantity": {
+                  "type": "number"
+                },
+                "revenue": {
+                  "type": "number"
+                }
+              }
+            }
+          }
+        },
+        "description": "Paid, non-cancelled orders in the range."
+      },
+      "Pagination": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "page",
+          "limit",
+          "total",
+          "has_more"
+        ],
+        "properties": {
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "has_more": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "success": {
+            "const": false
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code.",
+            "examples": [
+              "INSUFFICIENT_SCOPE"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "RefundCreatedData": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "order_id",
+          "amount",
+          "mode",
+          "refund_request_id"
+        ],
+        "properties": {
+          "order_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "amount": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refund_request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "WebhookTestData": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "WebhookEnvelopeBase": {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "created",
+          "data"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Event id (evt_...). Deliveries are at-least-once: de-duplicate on this."
+          },
+          "type": {
+            "type": "string"
+          },
+          "created": {
+            "type": "integer",
+            "description": "Unix seconds."
+          },
+          "data": {}
+        }
+      },
+      "OrderCreatedEvent": {
+        "description": "An order is placed.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "order.created"
+              },
+              "data": {
+                "$ref": "#/components/schemas/Order"
+              }
+            }
+          }
+        ]
+      },
+      "OrderPaidEvent": {
+        "description": "An order becomes fully paid.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "order.paid"
+              },
+              "data": {
+                "$ref": "#/components/schemas/Order"
+              }
+            }
+          }
+        ]
+      },
+      "OrderCancelledEvent": {
+        "description": "An order is cancelled.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "order.cancelled"
+              },
+              "data": {
+                "$ref": "#/components/schemas/Order"
+              }
+            }
+          }
+        ]
+      },
+      "RefundCreatedEvent": {
+        "description": "A refund is processed.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "refund.created"
+              },
+              "data": {
+                "$ref": "#/components/schemas/RefundCreatedData"
+              }
+            }
+          }
+        ]
+      },
+      "BookingCreatedEvent": {
+        "description": "A table or hall booking is made.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "booking.created"
+              },
+              "data": {
+                "$ref": "#/components/schemas/Booking"
+              }
+            }
+          }
+        ]
+      },
+      "StockLowEvent": {
+        "description": "An inventory item drops to low / out of stock.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "stock.low"
+              },
+              "data": {
+                "$ref": "#/components/schemas/InventoryItem"
+              }
+            }
+          }
+        ]
+      },
+      "WebhookTestEvent": {
+        "description": "Sent when you press \"Send test\".",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookEnvelopeBase"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "webhook.test"
+              },
+              "data": {
+                "$ref": "#/components/schemas/WebhookTestData"
+              }
+            }
+          }
+        ]
+      },
+      "OrderList": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Order"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "MenuList": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MenuItem"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "InventoryList": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InventoryItem"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "BookingList": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Booking"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        }
+      },
+      "OrderResponse": {
+        "type": "object",
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/Order"
+          }
+        }
+      },
+      "SalesSummaryResponse": {
+        "type": "object",
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "success": {
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/SalesSummary"
+          }
+        }
+      }
+    },
+    "parameters": {
+      "Page": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "description": "Page number."
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        },
+        "description": "Page size (max 100)."
+      },
+      "From": {
+        "name": "from",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "description": "ISO date (YYYY-MM-DD) or full ISO timestamp. Max range 366 days."
+      },
+      "To": {
+        "name": "to",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "description": "ISO date or timestamp. A bare date includes that whole day (UTC)."
+      },
+      "BranchId": {
+        "name": "branch_id",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{24}$"
+        },
+        "description": "Narrow to one branch."
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "401. Codes: API_KEY_REQUIRED, API_KEY_INVALID, API_KEY_REVOKED, API_KEY_EXPIRED.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "403. Codes: INSUFFICIENT_SCOPE, FEATURE_LOCKED, TENANT_SUSPENDED, TENANT_MISSING.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "400. Codes: INVALID_DATE, INVALID_RANGE, RANGE_TOO_LARGE, INVALID_FILTER, INVALID_BRANCH.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "404. Codes: ORDER_NOT_FOUND, ROUTE_NOT_FOUND.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "429 RATE_LIMITED. Wait and retry.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          "RateLimit-Limit": {
+            "$ref": "#/components/headers/RateLimit-Limit"
+          },
+          "RateLimit-Remaining": {
+            "$ref": "#/components/headers/RateLimit-Remaining"
+          },
+          "RateLimit-Reset": {
+            "$ref": "#/components/headers/RateLimit-Reset"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "success": false,
+              "code": "RATE_LIMITED",
+              "message": "Rate limit exceeded for this API key. Slow down and retry."
+            }
+          }
+        }
+      }
+    },
+    "headers": {
+      "RateLimit-Limit": {
+        "description": "Requests allowed per window for this key (default 120 per minute).",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "RateLimit-Remaining": {
+        "description": "Requests left in the current window.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "RateLimit-Reset": {
+        "description": "Seconds until the window resets.",
+        "schema": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

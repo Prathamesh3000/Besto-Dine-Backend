@@ -5,6 +5,7 @@ const ctrl = require('../controllers/staffWalletController');
 const { protect, adminOnly, restrictTo } = require('../middlewares/authMiddleware');
 const { attachTenant } = require('../middlewares/tenantContext');
 const { featureGate } = require('../middlewares/featureGate');
+const v = require('../validators/money');
 
 // Strict limiter on the withdraw endpoint — a buggy / malicious client
 // shouldn't be able to spam the admin's pending queue. 5 / min / IP is
@@ -24,11 +25,11 @@ const staffGate = [protect, restrictTo('waiter', 'captain'), attachTenant, featu
 
 // ─── Waiter / Captain ────────────────────────────────────────────────────
 router.get('/me',                             ...staffGate, ctrl.getMyWallet);
-router.post('/withdraw',     withdrawLimiter, ...staffGate, ctrl.requestWithdrawal);
+router.post('/withdraw',     withdrawLimiter, ...staffGate, v.staffWalletWithdraw, ctrl.requestWithdrawal);
 
 // ─── Admin ───────────────────────────────────────────────────────────────
 router.get('/withdrawals',                    ...adminGate, ctrl.listWithdrawals);
-router.post('/withdrawals/:id/approve',       ...adminGate, ctrl.approveWithdrawal);
-router.post('/withdrawals/:id/reject',        ...adminGate, ctrl.rejectWithdrawal);
+router.post('/withdrawals/:id/approve',       ...adminGate, v.staffWalletApprove, ctrl.approveWithdrawal);
+router.post('/withdrawals/:id/reject',        ...adminGate, v.staffWalletReject, ctrl.rejectWithdrawal);
 
 module.exports = router;

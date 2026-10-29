@@ -201,7 +201,7 @@ describe('plan line-up (config/planLineup.js)', () => {
             'multiBranch', 'paymentGateway', 'takeaway', 'tipManagement', 'waiterDashboard',
         ]);
         expect(on(GOLD_FEATURES).filter(k => !SILVER_FEATURES[k]).sort()).toEqual([
-            'advanceBookingTable', 'campaigns', 'couponPromotions', 'crm', 'staffPerformance', 'walletLoyalty',
+            'advanceBookingTable', 'campaigns', 'couponPromotions', 'crm', 'publicApi', 'staffPerformance', 'walletLoyalty',
         ]);
         expect(on(PREMIUM_FEATURES).filter(k => !GOLD_FEATURES[k]).sort()).toEqual([
             'advanceBookingHall', 'eInvoice', 'kiosk', 'webhooks', 'whiteLabelBranding',

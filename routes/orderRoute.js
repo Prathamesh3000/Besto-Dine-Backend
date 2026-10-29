@@ -6,6 +6,7 @@ const orderController = require('../controllers/orderController');
 const { protect, staffOnly, optionalAuth, checkPermission, restrictTo, adminOnly, noWaiterBilling, noWaiterBillingFields } = require('../middlewares/authMiddleware');
 const { featureGate } = require('../middlewares/featureGate');
 const { idempotency } = require('../middlewares/idempotency');
+const ov = require('../validators/ops');
 
 // Phase 2.5: createOrder accepts both dine-in and takeaway, so the
 // feature gate is picked dynamically from `req.body.type`. Tenants on a
@@ -37,7 +38,7 @@ const { orderCreateLimiter } = require('../middlewares/orderCreateLimiter');
 // Bug #13 — `Idempotency-Key` header replays the first response on a
 // retry (placed after optionalAuth so the key can be scoped per caller).
 // The body `clientIdempotencyKey` is the second, DB-level safety net.
-router.post('/', optionalAuth, orderCreateLimiter, idempotency(), dynamicOrderGate, orderController.createOrder);
+router.post('/', optionalAuth, orderCreateLimiter, ov.orderCreate, idempotency({ required: true }), dynamicOrderGate, orderController.createOrder);
 
 // Home-delivery distance + fee quote for the takeaway checkout. Guests
 // allowed (takeaway supports guest checkout); rate-limited because an
@@ -51,7 +52,7 @@ const deliveryQuoteLimiter = makeLimiter({
     keyGenerator: (req) => (req.user?._id ? 'user:' + String(req.user._id) : 'ip:' + ipKeyGenerator(req.ip)),
     message: { success: false, code: 'DELIVERY_QUOTE_RATE_LIMIT', message: 'Too many delivery checks. Please wait a moment.' },
 });
-router.post('/delivery-quote', optionalAuth, deliveryQuoteLimiter, featureGate('takeaway'), require('../controllers/deliveryController').getDeliveryQuote);
+router.post('/delivery-quote', optionalAuth, deliveryQuoteLimiter, ov.orderDeliveryQuote, featureGate('takeaway'), require('../controllers/deliveryController').getDeliveryQuote);
 
 // Staff-only routes
 router.get('/live', protect, staffOnly, orderController.getLiveOrders);
@@ -78,20 +79,27 @@ const allowStatusUpdateOrFloorCancel = (req, res, next) => {
     if (isPureCancel && ['waiter', 'captain'].includes(req.user?.role)) return next();
     return checkPermission('updateOrderStatus')(req, res, next);
 };
-router.patch('/:id/status', protect, staffOnly, noWaiterBillingFields, allowStatusUpdateOrFloorCancel, orderController.updateOrderStatus);
+// Marking an order Paid (paymentStatus / amountPaid in the body) moves money, so
+// it needs an Idempotency-Key (enforced once IDEMPOTENCY_ENFORCE is on).
+// Ordinary status changes (preparing/ready/served/cancel) stay key-optional.
+const settlesPaymentViaStatus = (req) => {
+    const b = req.body || {};
+    return b.paymentStatus !== undefined || b.amountPaid !== undefined || b.payments !== undefined;
+};
+router.patch('/:id/status', protect, staffOnly, noWaiterBillingFields, allowStatusUpdateOrFloorCancel, ov.orderStatus, idempotency({ requiredWhen: settlesPaymentViaStatus }), orderController.updateOrderStatus);
 // Pickup is a waiter/captain duty (ready → served). It's not order creation,
 // so `addOrders` was semantically wrong — waiters without that flag ticked
 // were locked out of their core serving workflow. Role-gate instead, matching
 // the /append route below.
-router.patch('/:id/pickup', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), orderController.pickupOrder);
+router.patch('/:id/pickup', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), ov.orderIdOnly, orderController.pickupOrder);
 
 // Home-delivery dispatch lifecycle (assign partner, mark out-for-delivery
 // / delivered). Supervisory task — captain/admin/manager, not plain waiter.
-router.patch('/:id/delivery', protect, restrictTo('captain', 'admin', 'manager'), orderController.updateDeliveryStatus);
+router.patch('/:id/delivery', protect, restrictTo('captain', 'admin', 'manager'), ov.orderDelivery, orderController.updateDeliveryStatus);
 
 // Admin-only: bulk-cancel takeaway orders stuck in 'ready' (abandoned pickups).
 // Accepts { minutesOld, type, dryRun } — see controller for details.
-router.post('/admin/cleanup-stale', protect, adminOnly, orderController.cleanupStaleReadyOrders);
+router.post('/admin/cleanup-stale', protect, adminOnly, ov.orderCleanup, orderController.cleanupStaleReadyOrders);
 
 // Admin-only: force-run the empty-order sweep right now. Same logic
 // as the scheduled version, just triggered on demand so an operator
@@ -104,6 +112,7 @@ router.post(
     '/:id/append',
     protect,
     restrictTo('waiter', 'captain', 'admin', 'manager'),
+    ov.orderAppend,
     idempotency(),
     orderController.appendOrderItems
 );
@@ -118,13 +127,14 @@ router.patch(
     protect,
     restrictTo('waiter', 'captain', 'admin', 'manager'),
     noWaiterBilling,
+    ov.orderCoupon,
     orderController.applyCouponToOrder
 );
 
 // Bill workspace (Phase 3, D4): Save Bill (draft | final), Reopen (captain+
 // with a reason) and Bill Preview (the exact slip the printer would get).
-router.post('/:id/bill/save', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, orderController.saveBill);
-router.post('/:id/bill/reopen', protect, restrictTo('captain', 'admin', 'manager'), orderController.reopenBill);
+router.post('/:id/bill/save', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, ov.orderBillSave, orderController.saveBill);
+router.post('/:id/bill/reopen', protect, restrictTo('captain', 'admin', 'manager'), ov.orderBillReopen, orderController.reopenBill);
 router.get('/:id/bill/preview', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, orderController.previewBill);
 // UPI QR for the amount due now (restaurant's own UPI id). Captain/admin/manager; waiters get 403 BILLING_CAPTAIN_ONLY.
 router.get('/:id/upi-qr', protect, restrictTo('waiter', 'captain', 'admin', 'manager'), noWaiterBilling, orderController.upiQr);
@@ -136,6 +146,7 @@ router.post(
     '/:id/reprint-kot',
     protect,
     restrictTo('waiter', 'captain', 'admin', 'manager'),
+    ov.orderIdOnly,
     orderController.reprintKOT
 );
 
@@ -162,19 +173,19 @@ router.get('/active/table/:tableId', optionalAuth, orderController.getActiveOrde
 router.get('/active-list/table/:tableId', optionalAuth, orderController.getActiveOrdersListByTable);
 
 // Customer payment — controller enforces ownership
-router.patch('/:id/payment', optionalAuth, idempotency(), orderController.customerPayment);
+router.patch('/:id/payment', optionalAuth, ov.orderPayment, idempotency({ required: true }), orderController.customerPayment);
 
 // Customer requests "settle at counter" — flags the order for the
 // admin table drawer's red alert banner so a waiter can be sent with
 // a bill slip. optionalAuth keeps it usable from the guest QR flow.
-router.post('/:id/request-counter-payment', optionalAuth, orderController.requestCounterPayment);
+router.post('/:id/request-counter-payment', optionalAuth, ov.orderIdOnly, orderController.requestCounterPayment);
 
 // Cancel, rate & repeat — optionalAuth so guests can still operate via QR session,
 // controller enforces ownership for authenticated users
-router.patch('/:id/cancel', optionalAuth, orderController.cancelOrder);
-router.patch('/:id/rating', optionalAuth, orderController.rateOrder);
-router.post('/:orderId/repeat/:itemId', optionalAuth, idempotency(), orderController.repeatOrderItem);
+router.patch('/:id/cancel', optionalAuth, ov.orderIdOnly, orderController.cancelOrder);
+router.patch('/:id/rating', optionalAuth, ov.orderRating, orderController.rateOrder);
+router.post('/:orderId/repeat/:itemId', optionalAuth, ov.orderRepeatItem, idempotency(), orderController.repeatOrderItem);
 // Repeat an entire past order in one shot (customer "Repeat Order" button).
-router.post('/:id/repeat-all',           optionalAuth, idempotency(), orderController.repeatOrderAllItems);
+router.post('/:id/repeat-all',           optionalAuth, ov.orderRepeatAll, idempotency(), orderController.repeatOrderAllItems);
 
 module.exports = router;

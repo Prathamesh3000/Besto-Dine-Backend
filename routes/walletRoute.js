@@ -3,6 +3,7 @@ const router = express.Router();
 const { makeLimiter } = require('../utils/rateLimitStore');
 const auth = require('../middlewares/authMiddleware');
 const { featureGate } = require('../middlewares/featureGate');
+const { idempotency } = require('../middlewares/idempotency');
 const walletController = require('../controllers/walletController');
 const { validate, body, optionalObjectId } = require('../middlewares/validate');
 
@@ -77,7 +78,7 @@ router.get('/', auth.protect, walletGate, walletController.getWallet);
 // points only via server-computed payment paths.
 router.post('/points/add', walletMutationLimiter, auth.protect, auth.adminOnly, walletGate, addPointsValidation, walletController.addPoints);
 router.post('/points/redeem', walletMutationLimiter, auth.protect, walletGate, redeemPointsValidation, walletController.redeemPoints);
-router.post('/pay', walletMutationLimiter, auth.protect, walletGate, payValidation, walletController.payWithWallet);
+router.post('/pay', walletMutationLimiter, auth.protect, walletGate, payValidation, idempotency({ required: true }), walletController.payWithWallet);
 
 // Admin routes
 router.get('/admin/stats', auth.protect, auth.adminOnly, walletGate, walletController.getAdminWalletStats);

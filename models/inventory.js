@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 const stockAdjustmentSchema = new mongoose.Schema({
     type: {
         type: String,
-        enum: ['restock', 'usage', 'waste', 'correction', 'return'],
+        enum: ['restock', 'usage', 'waste', 'correction', 'return', 'transfer_out', 'transfer_in'],
         required: true
     },
     quantity: { type: Number, required: true },
@@ -102,6 +102,11 @@ const inventorySchema = new mongoose.Schema({
         required: [true, 'Please provide cost per unit'],
         min: 0
     },
+    // Weighted-average unit cost (services/inventoryCostService.js). null /
+    // absent = unknown: legacy items and items never received with a cost.
+    // Never defaulted to costPerUnit (that would invent a cost).
+    avgCost: { type: Number, min: 0, default: null },
+    avgCostUpdatedAt: { type: Date, default: null },
     supplier: {
         name: { type: String, default: '' },
         contact: { type: String, default: '' }

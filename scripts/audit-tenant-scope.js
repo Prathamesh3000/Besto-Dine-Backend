@@ -34,6 +34,14 @@
  *   node scripts/audit-tenant-scope.js --json         # machine-readable
  *   node scripts/audit-tenant-scope.js --quiet        # offenders only
  *
+ * Raw-operation check (task 4.6): controllers/, services/ and utils/ are also
+ * scanned for raw bulkWrite / insertMany / $lookup / $unionWith / $graphLookup /
+ * estimatedDocumentCount (scripts/lib/rawOpScan.js). The tenantScope plugin
+ * cannot scope these; use the wrappers in utils/tenantSafe.js
+ * (tenantBulkWrite, tenantInsertMany, tenantLookup, tenantUnionWith,
+ * tenantEstimatedCount) or add `// AUDIT-EXEMPT: <reason>` on / above the line.
+ * Each such offender prints as `RAW <kind>` with a fix hint.
+ *
  * Exit code:
  *   0 — no offenders, ship it
  *   1 — at least one offender → block the commit / CI build
@@ -50,6 +58,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { scanRawOps } = require('./lib/rawOpScan');
 
 // ── Config ──────────────────────────────────────────────────────────
 const ROOT = path.resolve(__dirname, '..', 'controllers');
@@ -58,6 +67,10 @@ const ROOT = path.resolve(__dirname, '..', 'controllers');
 // reported as `services/<name>` so EXEMPT_FILES (controller names) never
 // matches them by accident.
 const SERVICES_ROOT = path.resolve(__dirname, '..', 'services');
+// utils/ gets the raw-operation check only (its queries are helpers, not endpoints).
+const UTILS_ROOT = path.resolve(__dirname, '..', 'utils');
+// Infrastructure that implements the wrappers / plugin: raw calls are the point.
+const RAW_SCAN_SKIP = new Set(['utils/tenantSafe.js', 'utils/tenantScopePlugin.js']);
 
 // Baseline-accepted findings, keyed `<filename>:<line>` → reason.
 //
@@ -136,7 +149,6 @@ const QUERY_OPS = [
     'deleteOne',
     'deleteMany',
     'countDocuments',
-    'estimatedDocumentCount',
     'aggregate',
     'distinct',
 ];
@@ -167,16 +179,27 @@ const flags = {
 
 // ── Scan logic ──────────────────────────────────────────────────────
 const offenders = [];        // { file, line, snippet, op, model }
-const stats = { filesScanned: 0, filesExempt: 0, queriesScanned: 0, queriesPassed: 0 };
+const stats = { filesScanned: 0, filesExempt: 0, queriesScanned: 0, queriesPassed: 0, rawOpsFound: 0, rawOpsOffenders: 0 };
+
+function recordRaw(src, relName) {
+    if (RAW_SCAN_SKIP.has(relName)) return;
+    const found = scanRawOps(src, relName);
+    stats.rawOpsFound += found.length;
+    for (const f of found) {
+        stats.rawOpsOffenders += 1;
+        offenders.push({ file: f.file, line: f.line, op: f.kind, model: 'RAW', snippet: f.snippet, hint: f.hint, raw: true });
+    }
+}
 
 function scanFile(absPath, relName) {
     stats.filesScanned += 1;
-    if (EXEMPT_FILES.has(relName)) {
+    if (EXEMPT_FILES.has(relName) || relName.startsWith('superadmin/') || relName.startsWith('razorpay/')) {
         stats.filesExempt += 1;
         return;
     }
 
     const src = fs.readFileSync(absPath, 'utf8');
+    recordRaw(src, relName);
     const lines = src.split(/\r?\n/);
 
     // Build a model-name regex: capitalised identifier + dot + query op.
@@ -362,13 +385,25 @@ function walk(dir, prefix = '') {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const e of entries) {
         const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full, prefix);
+        if (e.isDirectory()) walk(full, (e.name === 'superadmin' || e.name === 'razorpay') && prefix === '' ? e.name + '/' : prefix);
         else if (e.isFile() && e.name.endsWith('.js')) scanFile(full, prefix + e.name);
     }
 }
 
 walk(ROOT);
 if (fs.existsSync(SERVICES_ROOT)) walk(SERVICES_ROOT, 'services/');
+if (fs.existsSync(UTILS_ROOT)) {
+    (function walkUtils(dir, prefix) {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, e.name);
+            if (e.isDirectory()) walkUtils(full, prefix + e.name + '/');
+            else if (e.isFile() && e.name.endsWith('.js')) {
+                stats.filesScanned += 1;
+                recordRaw(fs.readFileSync(full, 'utf8'), prefix + e.name);
+            }
+        }
+    })(UTILS_ROOT, 'utils/');
+}
 
 // ── Output ──────────────────────────────────────────────────────────
 if (flags.json) {
@@ -378,24 +413,32 @@ if (flags.json) {
     if (!flags.quiet) {
         console.log('');
         console.log(`Tenant-scope audit — ${new Date().toISOString().slice(0, 10)}`);
-        console.log(`${dim}Scanning Backend/controllers/ + Backend/services/${reset}`);
+        console.log(`${dim}Scanning Backend/controllers/ + Backend/services/ (+ utils/ for raw bulk/lookup ops)${reset}`);
         console.log('');
         console.log(`  files scanned ........ ${stats.filesScanned}`);
         console.log(`  files exempt ......... ${stats.filesExempt} ${dim}(see EXEMPT_FILES)${reset}`);
         console.log(`  queries scanned ...... ${stats.queriesScanned}`);
         console.log(`  queries passed ....... ${stats.queriesPassed}`);
+        console.log(`  raw bulk/lookup ops .. ${stats.rawOpsFound} unexempted ${dim}(bulkWrite/insertMany/$lookup/$unionWith/estimatedDocumentCount)${reset}`);
         console.log(`  ${offenders.length ? red : green}offenders ............ ${offenders.length}${reset}`);
         console.log('');
     }
 
     if (offenders.length === 0) {
-        if (!flags.quiet) console.log(`${green}✅ All controller + service queries appear tenant-scoped.${reset}`);
+        if (!flags.quiet) console.log(`${green}✅ All controller + service queries appear tenant-scoped; no unexempted raw bulk/lookup ops.${reset}`);
         process.exit(0);
     }
 
     console.log(`${red}❌ Offenders — these queries don't visibly carry a tenant filter:${reset}`);
     console.log('');
     for (const o of offenders) {
+        if (o.raw) {
+            console.log(`  ${yellow}${o.file}:${o.line}${reset}  RAW ${o.op}`);
+            console.log(`     ${o.snippet}`);
+            console.log(`     ${dim}fix: ${o.hint}${reset}`);
+            console.log('');
+            continue;
+        }
         console.log(`  ${yellow}${o.file}:${o.line}${reset}  ${dim}${o.model}.${o.op}(${reset}`);
         console.log(`     ${o.snippet}`);
         console.log('');

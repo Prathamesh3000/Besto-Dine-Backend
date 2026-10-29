@@ -11,6 +11,7 @@ const loginAttempts = require('../utils/loginAttempts');
 const { revokeAllSessions } = require('./authController');
 
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantInsertMany } = require('../utils/tenantSafe');
 const { generateTempPassword, getNextStaffIdForBranch, PASSWORD_REGEX } = require('../utils/staffUtils');
 const { resolvePermissions } = require('../utils/staffDefaults');
 const { parseCsv } = require('../utils/csvParser');
@@ -572,6 +573,7 @@ exports.addStaff = async (req, res) => {
     // Return the plain-text temp password so the admin can share it with
     // the staff member.  This is the ONLY time it is ever available — the
     // database only stores the bcrypt hash.
+    require('../services/tenantAuditHooks').auditStaff(req, 'create', null, staffMember);
     res.status(201).json({
       success: true,
       staffMember,
@@ -683,6 +685,7 @@ exports.updateStaffStatus = async (req, res) => {
     // Deactivation logs the staff member out everywhere.
     if (status === 'inactive') await revokeAllSessions(target._id);
 
+    if (status === 'inactive') require('../services/tenantAuditHooks').auditStaff(req, 'deactivate', { status: 'active', name: target.name, role: target.role, _id: target._id }, target);
     res.status(200).json({ success: true, staff: target });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to update status' });
@@ -948,6 +951,7 @@ exports.updateStaff = async (req, res) => {
     ).select('-password');
     if (!staff) return res.status(404).json({ success: false, message: 'Staff member not found' });
 
+    require('../services/tenantAuditHooks').auditStaff(req, 'update', existing, staff);
     res.status(200).json({ success: true, staff });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to update staff member' });
@@ -1021,6 +1025,7 @@ exports.deleteStaff = async (req, res) => {
 
     await revokeAllSessions(target._id);
     await User.deleteOne({ _id: target._id });
+    require('../services/tenantAuditHooks').auditStaff(req, 'deactivate', target, null);
     res.status(200).json({ success: true, message: 'Staff member removed successfully' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to delete staff member' });
@@ -1674,7 +1679,7 @@ exports.importStaffCsv = async (req, res) => {
     let created = 0;
     let writeErrors = [];
     try {
-      const inserted = await User.insertMany(docs, { ordered: false });
+      const inserted = await tenantInsertMany(User, docs, tenant, { ordered: false });
       created = inserted.length;
     } catch (err) {
       // insertMany throws with a `writeErrors` array when ordered:false;

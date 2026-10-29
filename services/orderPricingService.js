@@ -609,8 +609,16 @@ async function computeTaxBreakdown(req, {
   return { taxBreakdown, authoritativeTotal: exactTotal };
 }
 
+// HSN/SAC snapshot for an order line: the menu item's code, else its
+// category's, else the tenant default (settings.taxExport.defaultHsn), else ''
+// (the GST report then falls back to its own default).
+function resolveLineHsn(menu, defaultHsn = '') {
+  const clean = (v) => String(v ?? '').trim();
+  return clean(menu?.hsnCode) || clean(menu?.category?.hsnCode) || clean(defaultHsn);
+}
+
 // Enrich items with vegType, category name, prepStation + prep time snapshot.
-function enrichCartItems(items, menuById) {
+function enrichCartItems(items, menuById, { defaultHsn = '' } = {}) {
   // Enrich items with vegType, category name, and prepStation snapshot
   // so the chef dashboard can display/filter and the kitchen-bypass
   // logic below has authoritative routing data on each line item.
@@ -683,6 +691,8 @@ function enrichCartItems(items, menuById) {
       categoryKind: menuCategoryKind(menu) || undefined,
       prepStation: resolvedStation,
       prepTimeMinutes,
+      // HSN/SAC as it was at sale time (item, then category, then tenant default).
+      hsnCode: resolveLineHsn(menu, defaultHsn),
     };
   });
   return enrichedItems;
@@ -710,7 +720,7 @@ function insufficientStockBody(stockCheck) {
 // archived or out-of-window item → 400 — never a client-priced line), the
 // size price + offer is charged when a size is picked, toppings are
 // charged at their menu price, and a line holds at most 999.
-function buildAppendItems(items, menuById, branch) {
+function buildAppendItems(items, menuById, branch, { defaultHsn = '' } = {}) {
   const { resolvePrice } = require('../utils/priceResolver');
   const { menuItemUnavailableReason, MAX_LINE_QUANTITY } = require('./orderHelpers');
   const norm = (v) => String(v ?? '').trim().toLowerCase();
@@ -788,6 +798,7 @@ function buildAppendItems(items, menuById, branch) {
       selectedSizes,
       instructions: item.instructions || '',
       prepTimeMinutes,
+      hsnCode: resolveLineHsn(menu, defaultHsn),
       // Explicit timestamp so the chef card can split the newly-added
       // items from the original order. Every line of one append batch
       // shares the same moment so the batch stays grouped.
@@ -872,6 +883,7 @@ module.exports = {
   checkClientTotal,
   computeTaxBreakdown,
   enrichCartItems,
+  resolveLineHsn,
   insufficientStockBody,
   buildAppendItems,
   recomputeBillAfterAppend,

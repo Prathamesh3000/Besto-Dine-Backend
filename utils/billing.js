@@ -30,41 +30,22 @@
  * copies that used to own it.
  */
 
+// The arithmetic lives in ONE place now: packages/types (vendored here by
+// scripts/sync-types.js). This module keeps its historical public API.
+const shared = require('../vendor/bestodine-types/cjs/engine');
+
 /** Order types that attract a service charge. Dine-in only. */
-const SERVICE_CHARGE_TYPES = new Set(['dine-in']);
-
-function num(v) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : 0;
-}
-
-function round2(n) {
-    return Math.round((Number(n) || 0) * 100) / 100;
-}
+const SERVICE_CHARGE_TYPES = shared.SERVICE_CHARGE_TYPES;
 
 /** Normalise the order-type spellings in play across the codebase. */
-function normaliseOrderType(orderType) {
-    const t = String(orderType || '').toLowerCase().replace(/[\s_]/g, '-');
-    if (t === 'dinein' || t === 'dine-in') return 'dine-in';
-    if (t === 'takeaway' || t === 'take-away' || t === 'pickup') return 'takeaway';
-    if (t === 'delivery' || t === 'home-delivery') return 'delivery';
-    if (t === 'kiosk') return 'kiosk';
-    return t || 'dine-in';
-}
+const normaliseOrderType = shared.normaliseOrderType;
 
 /**
  * Flatten a Settings.taxes sub-document into the shape computeBill
  * wants. Disabled charges are dropped here so no downstream caller
  * has to remember the `enabled` flag.
  */
-function toTaxConfig(taxes) {
-    if (!taxes) return { gstPct: 0, servicePct: 0, additionalCharges: [] };
-    return {
-        gstPct: taxes.gst?.enabled ? num(taxes.gst.value) : 0,
-        servicePct: taxes.serviceCharge?.enabled ? num(taxes.serviceCharge.value) : 0,
-        additionalCharges: (taxes.additionalCharges || []).filter((c) => c.enabled !== false),
-    };
-}
+const toTaxConfig = shared.toTaxConfig;
 
 /**
  * Compute the full bill for an order.
@@ -81,58 +62,20 @@ function toTaxConfig(taxes) {
  * e.g. ₹1000 food, 5% GST, ₹100 coupon → GST ₹45 → total ₹945.
  * Must stay in lockstep with Frontend/src/utils/billing.js.
  */
-function computeBill({
-    subtotal = 0,
-    taxConfig = {},
-    orderType = 'dine-in',
-    couponDiscount = 0,
-    pointsRedeemed = 0,
-    tipAmount = 0,
-    deliveryFee = 0,
-} = {}) {
-    const sub = round2(num(subtotal));
-    const type = normaliseOrderType(orderType);
-
-    const gstPct = num(taxConfig.gstPct);
-    const serviceApplies = SERVICE_CHARGE_TYPES.has(type);
-    const servicePct = serviceApplies ? num(taxConfig.servicePct) : 0;
-
-    // GST base = subtotal after the coupon (never negative).
-    const gstBase = Math.max(0, round2(sub - num(couponDiscount)));
-    const gst = round2(gstBase * (gstPct / 100));
-    const serviceCharge = round2(sub * (servicePct / 100));
-
-    // A ₹0 cart attracts no flat charges — otherwise a packaging fee
-    // lands on an empty bill.
-    const additionalCharges = sub <= 0 ? [] : (taxConfig.additionalCharges || [])
-        .map((c) => ({
-            name: c.name,
-            type: c.type,
-            value: num(c.value),
-            amount: c.type === 'Percentage' ? round2(sub * (num(c.value) / 100)) : round2(num(c.value)),
-        }))
-        .filter((c) => c.amount > 0);
-
-    const additionalChargesTotal = round2(
-        additionalCharges.reduce((s, c) => s + c.amount, 0),
-    );
-
-    const total = round2(
-        sub + gst + serviceCharge + additionalChargesTotal
-        - num(couponDiscount) - num(pointsRedeemed)
-        + num(tipAmount) + num(deliveryFee),
-    );
-
+function computeBill(input = {}) {
+    const b = shared.computeBill(input);
+    // The server contract has always been these fields (the shared engine
+    // also echoes coupon/points/tip/delivery for the UIs).
     return {
-        subtotal: sub,
-        gst,
-        gstPct,
-        serviceCharge,
-        serviceChargePct: servicePct,
-        serviceChargeApplies: serviceApplies,
-        additionalCharges,
-        additionalChargesTotal,
-        total: total < 0 ? 0 : total,
+        subtotal: b.subtotal,
+        gst: b.gst,
+        gstPct: b.gstPct,
+        serviceCharge: b.serviceCharge,
+        serviceChargePct: b.serviceChargePct,
+        serviceChargeApplies: b.serviceChargeApplies,
+        additionalCharges: b.additionalCharges,
+        additionalChargesTotal: b.additionalChargesTotal,
+        total: b.total,
     };
 }
 

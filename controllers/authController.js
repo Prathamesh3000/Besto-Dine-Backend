@@ -10,7 +10,8 @@ const path = require('path');
 const sharp = require('sharp');
 const logger = require('../utils/logger');
 const loginAttempts = require('../utils/loginAttempts');
-const { setAuthCookie, clearAuthCookie, signAccessToken } = require('../middlewares/authMiddleware');
+const { clearAuthCookie, signAccessToken } = require('../middlewares/authMiddleware');
+const cookieAuth = require('../utils/cookieAuth');
 
 // Roles whose shift status should follow their auth session. Every
 // tenant-side staff role — admin, manager, waiter, captain, chef —
@@ -87,6 +88,8 @@ if (process.env.NODE_ENV !== 'production') {
 //
 // Refresh lifetime is sliding (every rotation restarts it):
 //   superadmin 12h · staff 7d  (hours; env-overridable)
+//   ...but never past the ABSOLUTE ceiling set from login time:
+//   superadmin 8h · staff 12h · customer 1h (see the caps below).
 //   customer   CUSTOMER_IDLE_TIMEOUT_MINUTES (default 60) — an INACTIVITY
 //              timeout: each refresh extends the session by 60 min, and a
 //              customer idle for longer must sign in again (QA N14).
@@ -184,7 +187,22 @@ async function issueSession(req, res, user, family, familyExpiresAt) {
     const ceiling = familyExpiresAt || new Date(Date.now() + refreshAbsoluteMs(user.role));
     const token = signAccessToken(user, { sessionExpiresAt: ceiling });
     const refreshToken = await createRefreshSession(user, req, family, ceiling);
-    setAuthCookie(res, token);  // CRIT-08 — no-op unless USE_COOKIE_AUTH=true
+    // 3A.4 — no-ops unless USE_COOKIE_AUTH=true. Sets the audience's httpOnly
+    // access + refresh cookies and a CSRF cookie. Tokens stay in the body for
+    // every client except a web build that sent `X-Auth-Mode: cookie`, which
+    // gets only { cookieAuth, csrfToken } so nothing secret reaches JS.
+    const csrfToken = cookieAuth.setSessionCookies(res, {
+        role: user.role,
+        accessToken: token,
+        refreshToken,
+        sessionRemainingMs: Math.max(0, new Date(ceiling).getTime() - Date.now()),
+        req,
+    });
+    if (csrfToken && cookieAuth.clientWantsCookieOnly(req)) {
+        // Non-secret timing hints so the SPA can refresh proactively and end a
+        // fixed-hour customer login on time without ever seeing the JWT.
+        return { cookieAuth: true, csrfToken, ...cookieAuth.jwtExpiries(token) };
+    }
     return { token, refreshToken };
 }
 
@@ -860,6 +878,17 @@ exports.login = async (req, res) => {
             logger.error('auth.login.attempts-clear-failed', { error: err.message });
         }
 
+        // Optional TOTP 2FA (admin / superadmin): password is right, but no
+        // session is issued until POST /auth/2fa/verify succeeds.
+        const tfPolicy = require('../utils/totp').loginPolicy(user);
+        if (tfPolicy.required) {
+            return res.status(200).json({
+                success: true,
+                twoFactorRequired: true,
+                challengeToken: require('./twoFactorController').signChallenge(user),
+            });
+        }
+
         const session = await issueSession(req, res, user);
 
         // Every staff role's shift mirrors the auth session: opens a
@@ -872,11 +901,30 @@ exports.login = async (req, res) => {
             success: true,
             ...(await buildAuthResponse(user)),
             ...session,
+            ...(tfPolicy.setupRequired ? { twoFactorSetupRequired: true } : {}),
         });
     } catch (err) {
         logger.error('Login error:', { error: err.message });
         return res.status(500).json({ success: false, message: 'Login failed' });
     }
+};
+
+/**
+ * Finish a login whose password step already passed (used by the 2FA
+ * verify step). Same tail as `login`: tenant lock, session issue (refresh
+ * session, tokenVersion, absolute caps), shift auto-open, response body.
+ */
+exports.completeLogin = async (req, res, user, extra = {}) => {
+    const tenantLock = await assertTenantNotLocked(user);
+    if (tenantLock) return res.status(tenantLock.status).json(tenantLock.body);
+    const session = await issueSession(req, res, user);
+    await openShiftOnLogin(user);
+    return res.status(200).json({
+        success: true,
+        ...(await buildAuthResponse(user)),
+        ...session,
+        ...extra,
+    });
 };
 
 // ─── GET /api/auth/me ────────────────────────────────────────────────────────
@@ -1204,8 +1252,19 @@ exports.verifyOtp = async (req, res) => {
 // CRIT-08 cookie. Safe to call without either (no-op). Always returns 200
 // so the FE can call it unconditionally from its logout flow.
 exports.logout = async (req, res) => {
+    // 3A.4 — cookie sessions: the refresh token may only be in its httpOnly
+    // cookie. Clear only the audience this request names (a customer logout
+    // must not end a staff session in the same browser).
+    const clearCookies = () => {
+        clearAuthCookie(res);
+        cookieAuth.clearSessionCookies(
+            res,
+            cookieAuth.normaliseAudience(req.headers?.['x-auth-audience'])
+                || (req.user ? cookieAuth.audienceForRole(req.user.role) : null),
+        );
+    };
     try {
-        const raw = req.body?.refreshToken;
+        const raw = req.body?.refreshToken || cookieAuth.readRefreshToken(req);
         if (typeof raw === 'string' && raw && raw.length <= 200) {
             await RefreshSession.updateOne(
                 { tokenHash: sha256(raw), revokedAt: null },
@@ -1217,11 +1276,11 @@ exports.logout = async (req, res) => {
         // v1.use(optionalAuth)). No-op for any role outside
         // SHIFT_AUTO_ROLES or for unauth'd hits.
         await closeShiftOnLogout(req.user);
-        clearAuthCookie(res);
+        clearCookies();
         return res.status(200).json({ success: true, message: 'Logged out' });
     } catch (err) {
         logger.error('Logout error:', { error: err.message });
-        clearAuthCookie(res);
+        clearCookies();
         return res.status(200).json({ success: true, message: 'Logged out' });
     }
 };
@@ -1233,6 +1292,7 @@ exports.logoutAll = async (req, res) => {
         await revokeAllSessions(req.user._id);
         await closeShiftOnLogout(req.user);
         clearAuthCookie(res);
+        cookieAuth.clearSessionCookies(res, cookieAuth.audienceForRole(req.user.role));
         return res.status(200).json({ success: true, message: 'Logged out of all devices' });
     } catch (err) {
         logger.error('LogoutAll error:', { error: err.message });
@@ -1250,7 +1310,9 @@ exports.refresh = async (req, res) => {
         message: 'Your session has ended. Please sign in again.',
     });
     try {
-        const raw = req.body?.refreshToken;
+        // Body token wins (bearer clients); else the httpOnly refresh cookie
+        // (null unless USE_COOKIE_AUTH is on).
+        const raw = req.body?.refreshToken || cookieAuth.readRefreshToken(req);
         if (typeof raw !== 'string' || !raw || raw.length > 200) return invalid();
 
         const tokenHash = sha256(raw);

@@ -21,6 +21,7 @@
  * it and a bill that says "Rs." everywhere prints the same on all of them.
  */
 const { lineItemsSubtotal } = require('../services/orderBillMath');
+const { formatBillNo } = require('./billNumber');
 
 const COLS = Object.freeze({ '58': 32, '80': 48 });
 
@@ -250,7 +251,7 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer, upi =
 
     pushRow(lines, `Bill ${order?.orderId || ''}`, formatDateTime(order?.createdAt || Date.now(), timezone), w, { b: true });
     // Saved bill number (order.bill.billNo), when the bill has been saved.
-    if (order?.bill?.billNo != null) pushRow(lines, `Bill No: ${order.bill.billNo}`, '', w, { b: true });
+    if (order?.bill?.billNo != null) pushRow(lines, `Bill No: ${formatBillNo(order.bill)}`, '', w, { b: true });
     const typeLabel = orderTypeLabel(order);
     pushRow(lines, tableLabel ? `Table ${tableLabel}` : typeLabel, tableLabel ? typeLabel : '', w);
     if (order?.customerName) pushRow(lines, `Customer: ${text(order.customerName)}`, '', w);
@@ -296,6 +297,9 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer, upi =
     if (gst > 0) {
         const pct = Number(order?.gstPercentage) || 0;
         const half = pct ? `${pct / 2}%` : '';
+        // HSN/SAC only when the bill data carries one (order.hsnCode or per-item hsnCode).
+        const hsnCodes = [...new Set([order?.hsnCode, ...items.map((it) => it?.hsnCode)].map((h) => String(h || '').trim()).filter(Boolean))];
+        if (hsnCodes.length) pushRow(lines, 'HSN/SAC', text(hsnCodes.slice(0, 3).join(', ')), w);
         pushRow(lines, `CGST ${half}`.trim(), money(gst / 2), w);
         pushRow(lines, `SGST ${half}`.trim(), money(gst / 2), w);
     }
@@ -322,6 +326,14 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer, upi =
     if (paid > 0) {
         const method = order.paymentMethod && order.paymentMethod !== 'Not selected' ? ` (${text(order.paymentMethod)})` : '';
         pushRow(lines, `Paid${method}`, money(paid), w);
+        // Split tender (task 2.3): one line per method when more than one.
+        const tenderLines = Array.isArray(order.payments) ? order.payments.filter((p) => Number(p.amount) > 0) : [];
+        if (tenderLines.length > 1) {
+            for (const p of tenderLines) {
+                const label = String(p.method || 'other');
+                pushRow(lines, `  ${label.charAt(0).toUpperCase()}${label.slice(1)}`, money(p.amount), w);
+            }
+        }
         const due = Math.max(0, total - manual - paid);
         if (due > 0.005) pushRow(lines, 'Balance due', money(due), w, { b: true });
     } else if (order?.paymentStatus === 'Pending') {

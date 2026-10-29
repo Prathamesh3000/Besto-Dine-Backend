@@ -17,6 +17,7 @@ exports.getPendingTipsByWaiter = async (req, res) => {
     const tf = tenantFilter(req);
     const pinned = pinnedBranchId(req);
 
+    let waiterScopeFilter;
     if (pinned) {
       const branchWaiterIds = await User.find({
         ...tf,
@@ -26,9 +27,9 @@ exports.getPendingTipsByWaiter = async (req, res) => {
       if (branchWaiterIds.length === 0) {
         return res.status(200).json({ success: true, waiters: [] });
       }
-      var waiterScopeFilter = { waiter: { $in: branchWaiterIds.map(w => w._id) } };
+      waiterScopeFilter = { waiter: { $in: branchWaiterIds.map(w => w._id) } };
     } else {
-      var waiterScopeFilter = {};
+      waiterScopeFilter = {};
     }
 
     // Aggregate pending tips grouped by waiter with real totals

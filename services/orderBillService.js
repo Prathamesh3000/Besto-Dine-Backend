@@ -21,8 +21,10 @@ const { httpError, reply } = require('./orderErrors');
 const { emitOrderEvent } = require('./orderHelpers');
 const printService = require('./printService');
 const { billTotals, toPlainText } = require('../utils/receiptRenderer');
-const { nextBillNo, publicBill } = require('../utils/billWorkspace');
+const { formatBillNo } = require('../utils/billNumber');
+const { allocateBillNo, publicBill } = require('../utils/billWorkspace');
 const upiPayment = require('./upiPayment');
+const { recordTenantAudit } = require('./tenantAuditService');
 const { buildUpiUri, buildNote, amountDue, maskVpa, qrDataUrl, MAX_UPI_AMOUNT } = require('../utils/upiQr');
 
 const isObjectId = (v) => typeof v === 'string' && /^[a-f0-9]{24}$/i.test(v) && mongoose.Types.ObjectId.isValid(v);
@@ -50,19 +52,21 @@ function assertSavable(order) {
     }
 }
 
-/** Reserve the order's bill number once; concurrent saves converge on one number. */
+/** Reserve the order's bill number (+ its financial year) once; concurrent saves converge on one number. */
 async function claimBillNo(order) {
-    if (order.bill && order.bill.billNo != null) return order.bill.billNo;
-    const n = await nextBillNo(order.restaurant, order.branch || null);
+    if (order.bill && order.bill.billNo != null) return { billNo: order.bill.billNo, financialYear: order.bill.financialYear || null };
+    const { billNo: n, financialYear } = await allocateBillNo(order.restaurant, order.branch || null);
     const won = await Order.findOneAndUpdate(
         { _id: order._id, restaurant: order.restaurant, 'bill.billNo': null },
-        { $set: { 'bill.billNo': n } },
+        { $set: { 'bill.billNo': n, 'bill.financialYear': financialYear } },
         { returnDocument: 'after', projection: { bill: 1 } },
     ).lean();
-    if (won) return won.bill.billNo;
+    if (won) return { billNo: won.bill.billNo, financialYear: won.bill.financialYear || null };
     // Lost a race: another save already stamped the order (our number is simply skipped).
     const current = await Order.findOne({ _id: order._id, restaurant: order.restaurant }).select('bill').lean();
-    return current?.bill?.billNo ?? n;
+    return current?.bill?.billNo != null
+        ? { billNo: current.bill.billNo, financialYear: current.bill.financialYear || null }
+        : { billNo: n, financialYear };
 }
 
 async function saveBill(req) {
@@ -75,14 +79,14 @@ async function saveBill(req) {
         throw httpError(409, { success: false, code: 'BILL_FINALIZED', message: 'This bill is finalised. Ask a captain to reopen it before saving it as a draft.' });
     }
 
-    const billNo = await claimBillNo(order);
+    const { billNo, financialYear } = await claimBillNo(order);
     const total = billTotals(order).payable;
     const now = new Date();
     const entry = { action: wantFinal ? 'finalize' : 'save', at: now, by: req.user?._id || null, total };
     const updated = await Order.findOneAndUpdate(
         { _id: order._id, restaurant: order.restaurant, 'bill.status': { $ne: 'final' } },
         {
-            $set: { 'bill.status': wantFinal ? 'final' : 'draft', 'bill.billNo': billNo, 'bill.savedAt': now, 'bill.savedBy': req.user?._id || null, 'bill.total': total },
+            $set: { 'bill.status': wantFinal ? 'final' : 'draft', 'bill.billNo': billNo, 'bill.financialYear': financialYear, 'bill.savedAt': now, 'bill.savedBy': req.user?._id || null, 'bill.total': total },
             $push: { 'bill.history': { $each: [entry], $slice: -20 } },
         },
         { returnDocument: 'after' },
@@ -90,10 +94,11 @@ async function saveBill(req) {
     if (!updated) {
         throw httpError(409, { success: false, code: 'BILL_FINALIZED', message: 'This bill was finalised just now. Ask a captain to reopen it.' });
     }
-    logger.info(`bill: ${wantFinal ? 'finalised' : 'saved'} ${updated.orderId} billNo=${billNo} total=${total} by ${req.user?._id}`);
+    logger.info(`bill: ${wantFinal ? 'finalised' : 'saved'} ${updated.orderId} billNo=${formatBillNo({ billNo, financialYear })} total=${total} by ${req.user?._id}`);
+    recordTenantAudit(req, { action: wantFinal ? 'bill.finalize' : 'bill.edit', entityType: 'order', entityId: updated.orderId, summary: `Bill ${wantFinal ? 'finalised' : 'saved as draft'} for order ${updated.orderId}`, before: { status: order.bill?.status || null }, after: { status: wantFinal ? 'final' : 'draft', billNo, total } });
     const bill = publicBill(updated);
     return reply(200, { success: true, orderId: updated.orderId, paymentStatus: updated.paymentStatus, bill }, [
-        ['bill-saved-event', async () => emitOrderEvent('order:updated', { orderId: updated.orderId, bill: { status: bill.status, billNo: bill.billNo } }, updated)],
+        ['bill-saved-event', async () => emitOrderEvent('order:updated', { orderId: updated.orderId, bill: { status: bill.status, billNo: bill.billNo, financialYear: bill.financialYear, billNoDisplay: bill.billNoDisplay } }, updated)],
     ]);
 }
 
@@ -118,10 +123,11 @@ async function reopenBill(req) {
         { returnDocument: 'after' },
     ).lean();
     if (!updated) throw httpError(409, { success: false, code: 'BILL_NOT_FINAL', message: 'This bill is not finalised, so there is nothing to reopen.' });
-    logger.info(`bill: REOPENED ${updated.orderId} billNo=${updated.bill.billNo} by ${req.user?._id} (${req.user?.role}) reason="${reason.slice(0, 300)}"`);
+    logger.info(`bill: REOPENED ${updated.orderId} billNo=${formatBillNo(updated.bill)} by ${req.user?._id} (${req.user?.role}) reason="${reason.slice(0, 300)}"`);
+    recordTenantAudit(req, { action: 'bill.edit', entityType: 'order', entityId: updated.orderId, summary: `Bill reopened for order ${updated.orderId}: ${reason.slice(0, 200)}`, before: { status: 'final', total: Number(order.bill.total) || 0 }, after: { status: 'draft', reason: reason.slice(0, 300) } });
     const bill = publicBill(updated);
     return reply(200, { success: true, orderId: updated.orderId, paymentStatus: updated.paymentStatus, bill }, [
-        ['bill-reopened-event', async () => emitOrderEvent('order:updated', { orderId: updated.orderId, bill: { status: bill.status, billNo: bill.billNo } }, updated)],
+        ['bill-reopened-event', async () => emitOrderEvent('order:updated', { orderId: updated.orderId, bill: { status: bill.status, billNo: bill.billNo, financialYear: bill.financialYear, billNoDisplay: bill.billNoDisplay } }, updated)],
     ]);
 }
 
@@ -131,7 +137,7 @@ async function previewBill(req) {
     return reply(200, {
         success: true,
         orderId: order.orderId,
-        bill: { status: order.bill?.status || null, billNo: order.bill?.billNo ?? null, savedAt: order.bill?.savedAt || null },
+        bill: { status: order.bill?.status || null, billNo: order.bill?.billNo ?? null, financialYear: order.bill?.financialYear || null, billNoDisplay: formatBillNo(order.bill) || null, savedAt: order.bill?.savedAt || null },
         paymentStatus: order.paymentStatus,
         width: document.width,
         printer,

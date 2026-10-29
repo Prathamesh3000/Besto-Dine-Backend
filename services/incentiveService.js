@@ -31,6 +31,7 @@ const Restaurant = require('../models/restaurant');
 const Order = require('../models/order');
 const User = require('../models/user');
 const { hasFeature } = require('../utils/featureAccess');
+const { formatBillNo } = require('../utils/billNumber');
 const logger = require('../utils/logger');
 
 const DEFAULT_TZ = process.env.ANALYTICS_TIMEZONE || 'Asia/Kolkata';
@@ -219,7 +220,7 @@ async function accrueForOrder(order, { now = new Date() } = {}) {
                 campaign: campaign._id,
                 order: orderId,
                 orderId: order.orderId || '',
-                billNo: order.bill?.billNo != null ? String(order.bill.billNo) : '',
+                billNo: formatBillNo(order.bill),
                 itemKey,
                 menuItem: mongoose.isValidObjectId(line.menuItem) ? line.menuItem : null,
                 itemName: line.name || '',
@@ -259,7 +260,7 @@ function snapshot(order) {
     return {
         _id: order._id, orderId: order.orderId, restaurant: order.restaurant, branch: order.branch || null,
         status: order.status, paymentStatus: order.paymentStatus, servedAt: order.servedAt, paidAt: order.paidAt,
-        waiter: order.waiter || null, bill: order.bill ? { billNo: order.bill.billNo } : undefined,
+        waiter: order.waiter || null, bill: order.bill ? { billNo: order.bill.billNo, financialYear: order.bill.financialYear } : undefined,
         items: (order.items || []).map((l) => ({ _id: l._id, menuItem: l.menuItem, name: l.name, quantity: l.quantity })),
     };
 }
@@ -356,7 +357,7 @@ async function reconcile({ lookbackHours = 48, restaurant = null } = {}) {
         const orders = await Order.find({
             restaurant: rid, updatedAt: { $gte: since },
             status: { $ne: 'cancelled' }, $or: [{ status: 'served' }, { paymentStatus: 'Paid' }],
-        }).select('_id orderId restaurant branch status paymentStatus servedAt paidAt waiter bill.billNo items._id items.menuItem items.name items.quantity')
+        }).select('_id orderId restaurant branch status paymentStatus servedAt paidAt waiter bill.billNo bill.financialYear items._id items.menuItem items.name items.quantity')
             .limit(5000).lean().setOptions({ skipTenantScope: true });
         for (let i = 0; i < orders.length; i += 10) {
             const results = await Promise.all(orders.slice(i, i + 10).map((o) => accrueSafe(o)));

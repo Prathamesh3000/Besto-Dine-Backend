@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 
 const { protect, adminExclusive } = require('../middlewares/authMiddleware');
+const v = require('../validators/money');
 const {
     getCurrentSubscription,
     getAvailablePlans,
@@ -33,13 +34,13 @@ const {
  */
 router.get('/current',         protect, adminExclusive, getCurrentSubscription);
 router.get('/plans',           protect, adminExclusive, getAvailablePlans);
-router.post('/upgrade',        protect, adminExclusive, upgradePlan);
+router.post('/upgrade',        protect, adminExclusive, v.billingUpgrade, upgradePlan);
 // ADM-106 — frontend-driven confirmation for Orders-API fallback
 // upgrades. Calls applyPaidPlanUpgrade so the invoice is created even
 // when Razorpay's payment.captured webhook can't reach the server
 // (local dev, missing webhook secret, etc.). Idempotent: the webhook
 // remains the safety net for tab-close-after-pay cases.
-router.post('/upgrade/verify', protect, adminExclusive, verifyUpgradePayment);
+router.post('/upgrade/verify', protect, adminExclusive, v.billingVerify, verifyUpgradePayment);
 
 // Abandon an unpaid upgrade (declined card, closed checkout). Clears the
 // stash and cancels the Razorpay subscription; the live plan is untouched.
@@ -52,9 +53,9 @@ router.post('/sync',           protect, adminExclusive, syncFromRazorpay);
 // Tenant-initiated downgrade requests — Super Admin approves /
 // rejects via the existing /superadmin/plan-change-requests/*
 // endpoints, which apply the plan automatically on approval.
-router.post('/downgrade-request',       protect, adminExclusive, requestDowngrade);
+router.post('/downgrade-request',       protect, adminExclusive, v.billingDowngradeRequest, requestDowngrade);
 router.get('/downgrade-request',        protect, adminExclusive, getDowngradeRequest);
-router.delete('/downgrade-request/:id', protect, adminExclusive, cancelDowngradeRequest);
+router.delete('/downgrade-request/:id', protect, adminExclusive, v.billingIdOnly, cancelDowngradeRequest);
 
 // Cancel an already-APPROVED scheduled downgrade (tenant changed
 // mind before cycle-end). Razorpay cancellation can't be undone, so

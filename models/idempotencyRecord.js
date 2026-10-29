@@ -36,6 +36,22 @@ const idempotencyRecordSchema = new mongoose.Schema({
         ref: 'Restaurant',
         default: null,
     },
+    // 'in_progress' = claimed by a request that is still executing (inserted
+    // atomically, guarded by the unique key, BEFORE the handler runs so a
+    // concurrent twin gets 409 instead of double-executing). 'done' = final
+    // response stored for replay. Records written before this field existed
+    // have no state and are treated as 'done' by the middleware.
+    state: {
+        type: String,
+        enum: ['in_progress', 'done'],
+        default: 'done',
+    },
+    // When the in-progress claim was taken. A claim older than the stale
+    // window (crashed process) can be taken over by a retry.
+    lockedAt: {
+        type: Date,
+        default: null,
+    },
     statusCode: {
         type: Number,
         default: 200,

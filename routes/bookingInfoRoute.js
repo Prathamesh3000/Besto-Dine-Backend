@@ -4,6 +4,7 @@ const bookingInfoController = require('../controllers/bookingInfoController');
 const { protect, adminOnly } = require('../middlewares/authMiddleware');
 const { featureGate, featureGateAny } = require('../middlewares/featureGate');
 const { csvUpload } = require('../middlewares/csvUpload');
+const ov = require('../validators/ops');
 
 // Customer-facing booking resources fall into two buckets:
 //
@@ -38,15 +39,15 @@ router.get('/parking',                  bookingInfoController.getParkingRates);
 // ordering rule as tableRoute / staffRoute.
 router.get('/event-types/template',  protect, adminOnly, hallGate, bookingInfoController.downloadEventTypeTemplate);
 router.post('/event-types/import',   protect, adminOnly, hallGate, csvUpload.single('file'), bookingInfoController.importEventTypesCsv);
-router.post('/event-types',          protect, adminOnly, hallGate, bookingInfoController.createEventType);
-router.put('/event-types/:id',       protect, adminOnly, hallGate, bookingInfoController.updateEventType);
-router.delete('/event-types/:id',    protect, adminOnly, hallGate, bookingInfoController.deleteEventType);
+router.post('/event-types',          protect, adminOnly, hallGate, ov.catalogCreate, bookingInfoController.createEventType);
+router.put('/event-types/:id',       protect, adminOnly, hallGate, ov.catalogUpdate, bookingInfoController.updateEventType);
+router.delete('/event-types/:id',    protect, adminOnly, hallGate, ov.catalogIdOnly, bookingInfoController.deleteEventType);
 
 router.get('/packages/template',  protect, adminOnly, hallGate, bookingInfoController.downloadPackageTemplate);
 router.post('/packages/import',   protect, adminOnly, hallGate, csvUpload.single('file'), bookingInfoController.importPackagesCsv);
-router.post('/packages',          protect, adminOnly, hallGate, bookingInfoController.createPackage);
-router.put('/packages/:id',       protect, adminOnly, hallGate, bookingInfoController.updatePackage);
-router.delete('/packages/:id',    protect, adminOnly, hallGate, bookingInfoController.deletePackage);
+router.post('/packages',          protect, adminOnly, hallGate, ov.catalogCreate, bookingInfoController.createPackage);
+router.put('/packages/:id',       protect, adminOnly, hallGate, ov.catalogUpdate, bookingInfoController.updatePackage);
+router.delete('/packages/:id',    protect, adminOnly, hallGate, ov.catalogIdOnly, bookingInfoController.deletePackage);
 
 // Add-ons admin CRUD — gated by the SHARED feature set so a tenant on
 // only `advanceBookingTable` can still curate add-ons used by their
@@ -55,8 +56,8 @@ router.delete('/packages/:id',    protect, adminOnly, hallGate, bookingInfoContr
 // dropdown can render the same options without duplication.
 router.get('/addons/slugs',    protect, adminOnly, sharedGate, bookingInfoController.getAddonSlugs);
 router.get('/addons/admin',    protect, adminOnly, sharedGate, bookingInfoController.getAdminAddons);
-router.post('/addons',         protect, adminOnly, sharedGate, bookingInfoController.createAddon);
-router.put('/addons/:id',      protect, adminOnly, sharedGate, bookingInfoController.updateAddon);
-router.delete('/addons/:id',   protect, adminOnly, sharedGate, bookingInfoController.deleteAddon);
+router.post('/addons',         protect, adminOnly, sharedGate, ov.catalogCreate, bookingInfoController.createAddon);
+router.put('/addons/:id',      protect, adminOnly, sharedGate, ov.catalogUpdate, bookingInfoController.updateAddon);
+router.delete('/addons/:id',   protect, adminOnly, sharedGate, ov.catalogIdOnly, bookingInfoController.deleteAddon);
 
 module.exports = router;

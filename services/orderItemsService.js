@@ -115,7 +115,7 @@ async function persistCounterSideOrder({
     // Inventory deduct — counter side bypasses 'preparing', so the
     // status-transition hook never fires for it.
     try {
-      const { deductInventoryForOrder } = require('../controllers/inventoryController');
+      const { runDeductionWithRecovery: deductInventoryForOrder } = require('./inventoryDeductionService');
       deductInventoryForOrder(doc, tenantId(req), req.user?._id)
         .catch((err) => logger.warn(`Counter-split inventory deduct failed for ${doc.orderId}: ${err.message}`));
     } catch (err) {
@@ -969,7 +969,7 @@ async function appendOrderItems(req) {
 
   const menuDocs = menuItemIds.length
     ? await MenuItem.find({ _id: { $in: menuItemIds }, ...tenantFilter(req) })
-      .populate('category', 'name kind').lean()
+      .populate('category', 'name kind hsnCode').lean()
     : [];
   const menuById = new Map(menuDocs.map(m => [String(m._id), m]));
 

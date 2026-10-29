@@ -269,6 +269,13 @@ async function processOrderRefund(order, opts = {}) {
     // here logs but does not reverse the already-successful refund.
     await revokeTipsForOrder(order, { reason: `refund: ${reason || 'no reason'}` });
 
+    // Webhook `refund.created` (one event per refund: keyed on order + running total).
+    try {
+        require('./webhookService').emitRefundCreated(order, {
+            amount: refundAmount, mode, refundRequestId: opts.refundRequestId, refundedAmount: order.refundedAmount,
+        });
+    } catch { /* webhooks never affect the refund */ }
+
     return {
         success: true,
         refundedAmount: order.refundedAmount,

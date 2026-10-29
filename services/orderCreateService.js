@@ -479,7 +479,7 @@ async function loadCartMenu(req, items) {
   const menuDocs = menuItemIds.length
     ? await MenuItem.find(
       { _id: { $in: menuItemIds }, ...tenantFilter(req) }
-    ).populate('category', 'name kind').lean()
+    ).populate('category', 'name kind hsnCode').lean()
     : [];
   const menuById = new Map(menuDocs.map(m => [String(m._id), m]));
 
@@ -740,6 +740,7 @@ function buildOrderDocs(req, ctx) {
     authoritativePointsRedeemed, authoritativeWalletPaid, taxBreakdown, wantsDelivery,
     cleanDeliveryAddress, authoritativeDeliverySlab, authoritativeDeliveryFee,
     authoritativeDeliveryDistance, authoritativeDeliveryCoords, authoritativeManualDiscount = 0,
+    orderTz,
   } = ctx;
   // Kitchen-bypass + mixed-cart split.
   //
@@ -797,7 +798,7 @@ function buildOrderDocs(req, ctx) {
       return sum + ((Number(item.price) || 0) + toppings) * (Number(item.quantity) || 1);
     }, 0);
     const counterTotal = Math.round(counterSubtotal * 100) / 100;
-    const counterOrderIdValue = type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
+    const counterOrderIdValue = type === 'takeaway' ? idGen.takeawayOrderId(orderTz) : idGen.orderId(orderTz);
 
     counterDocData = {
       orderId: counterOrderIdValue,
@@ -905,10 +906,16 @@ function buildOrderDocs(req, ctx) {
 // ── Phase: atomic write (bug #14) ───────────────────────────────────
 // Returns { savedOrder, counterSideOrder } — or { replay } when a
 // concurrent create with the same idempotency key won the race.
-async function persistOrderDocs(req, ctx) {
+const ORDER_ID_MAX_RETRIES = 5;
+// Duplicate-key error on the unique orderId index (not the idempotency key).
+const isOrderIdDuplicate = (err) => !!err && err.code === 11000
+  && (!!(err.keyPattern && err.keyPattern.orderId) || /index:\s*orderId_1/.test(err.message || ''));
+
+async function persistOrderDocs(req, ctx, attempt = 0) {
   const {
     primaryDocData, counterDocData, validUserId, clientIdempotencyKey, authoritativeSubtotal,
     authoritativePointsRedeemed, authoritativeCouponCode, authoritativeCouponDiscount, couponId,
+    orderTz,
   } = ctx;
   let counterSideOrder = null;
   // ── Atomic write (bug #14) ───────────────────────────────────────
@@ -1045,6 +1052,17 @@ async function persistOrderDocs(req, ctx) {
           }),
         };
       }
+    }
+    // Random order-number suffix collided with an existing order (the
+    // 6-char suffix is only 24 bits per day): nothing was written, so
+    // re-issue fresh ids with the same prefixes and try again.
+    if (isOrderIdDuplicate(err) && attempt < ORDER_ID_MAX_RETRIES) {
+      const reissue = (id) => idGen.generate(String(id).split('-')[0], orderTz);
+      primaryDocData.orderId = reissue(primaryDocData.orderId);
+      if (counterDocData) counterDocData.orderId = reissue(counterDocData.orderId);
+      logger.warn(`Order number collision — retrying with ${primaryDocData.orderId} (attempt ${attempt + 1})`);
+      session.endSession();
+      return persistOrderDocs(req, ctx, attempt + 1);
     }
     throw err;
   } finally {
@@ -1313,14 +1331,6 @@ async function createOrder(req) {
   // staff have their roles — neither needs one.
   const guestAccess = wantsToken && !req.user && !scanSessionId ? issueGuestAccess() : null;
 
-  // Generate Order ID — structured, human-readable.
-  // Kiosk-originated orders get their own KSK prefix (regardless of
-  // dine-in vs takeaway) so staff can spot them in the admin Orders
-  // tab and the customer-facing token (last 4 chars) starts with K.
-  const orderId = isKioskOrder
-    ? idGen.kioskOrderId()
-    : (type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId());
-
   const menuById = await loadCartMenu(req, items);
   pricing.validateSelectedToppings(items, menuById);
 
@@ -1338,6 +1348,16 @@ async function createOrder(req) {
   // conversion below and reused for the notification gate further down.
   // getSettings() is cache-backed so repeat calls are cheap.
   const settings = await getSettings(req);
+
+  // Generate Order ID — structured, human-readable; the date part uses the
+  // restaurant's time zone (Asia/Kolkata when none is configured).
+  // Kiosk-originated orders get their own KSK prefix (regardless of
+  // dine-in vs takeaway) so staff can spot them in the admin Orders
+  // tab and the customer-facing token (last 4 chars) starts with K.
+  const orderTz = settings?.general?.timezone || undefined;
+  const orderId = isKioskOrder
+    ? idGen.kioskOrderId(orderTz)
+    : (type === 'takeaway' ? idGen.takeawayOrderId(orderTz) : idGen.orderId(orderTz));
 
   const {
     authoritativeDeliveryFee, authoritativeDeliverySlab, authoritativeDeliveryDistance, authoritativeDeliveryCoords,
@@ -1380,7 +1400,7 @@ async function createOrder(req) {
   });
   const { hold, paymentChannel } = resolveOperationsGate(req, { type, isKioskOrder, authoritativeTip, prepaid, ops });
 
-  const enrichedItems = pricing.enrichCartItems(items, menuById);
+  const enrichedItems = pricing.enrichCartItems(items, menuById, { defaultHsn: settings?.taxExport?.defaultHsn });
 
   const { inheritedBranchId, resolvedAreaId, resolvedTableName, validWaiterId } = await resolvePlacement(req, {
     type, resolvedTableId, scanSessionId, branchId, isKioskOrder, validWaiterId: attribution.validWaiterId, tokenMode,
@@ -1396,6 +1416,7 @@ async function createOrder(req) {
     authoritativePointsRedeemed, authoritativeWalletPaid, taxBreakdown, wantsDelivery,
     cleanDeliveryAddress, authoritativeDeliverySlab, authoritativeDeliveryFee,
     authoritativeDeliveryDistance, authoritativeDeliveryCoords, authoritativeManualDiscount,
+    orderTz,
   });
 
   if (paymentChannel) {
@@ -1443,6 +1464,7 @@ async function createOrder(req) {
     persisted = await persistOrderDocs(req, {
       primaryDocData, counterDocData, validUserId, clientIdempotencyKey, authoritativeSubtotal,
       authoritativePointsRedeemed, authoritativeCouponCode, authoritativeCouponDiscount, couponId,
+      orderTz,
     });
   } catch (err) {
     // Nothing was written — free the payment for a retry / orphan refund.
@@ -1456,16 +1478,19 @@ async function createOrder(req) {
   const { savedOrder, counterSideOrder } = persisted;
 
   bumpMenuItemOrderCounts(savedOrder.items, savedOrder.restaurant);
+  try { require('../utils/webhookService').emitWebhookEvent(savedOrder.restaurant, 'order.created', require('../utils/publicApiSerializers').serializeOrder(savedOrder)); } catch { /* webhooks never affect the order */ }
 
   // Counter-side follow-ups (committed above together with the
   // primary doc). Inventory deduct runs now because the counter doc
   // skips 'preparing', where the normal deduction fires.
   if (counterSideOrder) {
     bumpMenuItemOrderCounts(counterSideOrder.items, counterSideOrder.restaurant);
+    // The counter doc of a split cart is its own order: its own webhook event.
+    try { require('../utils/webhookService').emitWebhookEvent(counterSideOrder.restaurant, 'order.created', require('../utils/publicApiSerializers').serializeOrder(counterSideOrder), { eventKey: `order:${counterSideOrder._id}:created` }); } catch { /* webhooks never affect the order */ }
   }
   if (counterSideOrder && !held) {
     try {
-      const { deductInventoryForOrder } = require('../controllers/inventoryController');
+      const { runDeductionWithRecovery: deductInventoryForOrder } = require('./inventoryDeductionService');
       deductInventoryForOrder(counterSideOrder, tenantId(req), req.user?._id)
         .catch(err => logger.warn(`Counter-split inventory deduct failed for ${counterSideOrder.orderId}: ${err.message}`));
     } catch (err) { logger.warn('Counter-split inventory setup failed:', err.message); }
@@ -1515,7 +1540,7 @@ async function createOrder(req) {
   // decrement stock — bottles of water would never tick down.
   if (!hasKitchenWork && !held) {
     try {
-      const { deductInventoryForOrder } = require('../controllers/inventoryController');
+      const { runDeductionWithRecovery: deductInventoryForOrder } = require('./inventoryDeductionService');
       const restaurantId = tenantId(req);
       if (restaurantId) {
         deductInventoryForOrder(savedOrder, restaurantId, req.user?._id)
@@ -1581,5 +1606,8 @@ module.exports = {
   verifyDineInScan,
   buildOrderDocs,
   resolveManualDiscount,
+  persistOrderDocs,
+  isOrderIdDuplicate,
+  ORDER_ID_MAX_RETRIES,
   VALID_ORDER_SOURCES,
 };

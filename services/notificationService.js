@@ -157,6 +157,7 @@ async function persistDocs(docs) {
         const doc = await Notification.create(docs[0]);
         return [doc];
     }
+    // AUDIT-EXEMPT: recipients are platform-wide too (superadmin notifications carry no restaurant); buildDocs stamps restaurant when the audience is a tenant
     return Notification.insertMany(docs);
 }
 

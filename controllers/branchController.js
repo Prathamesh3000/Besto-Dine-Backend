@@ -39,6 +39,7 @@ const Notification = require('../models/notification');
 const Request = require('../models/request');
 const logger = require('../utils/logger');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
+const { tenantBulkWrite, tenantInsertMany } = require('../utils/tenantSafe');
 const { generateTempPassword, getNextStaffIdForBranch, validateStaffEmail } = require('../utils/staffUtils');
 const { createMainBranchFor } = require('../utils/createMainBranch');
 const { pickAllowed, BRANCH_UPDATE_FIELDS } = require('../utils/bodyAllowlist');
@@ -214,7 +215,7 @@ async function initializeBranchMenu(restaurantId, branchId) {
         },
     }));
 
-    const result = await MenuItem.bulkWrite(ops, { ordered: false });
+    const result = await tenantBulkWrite(MenuItem, ops, restaurantId, { ordered: false });
     return result.modifiedCount || 0;
 }
 
@@ -287,7 +288,7 @@ async function initializeBranchAreas(restaurantId, branchId) {
     if (!docs.length) return 0;
 
     try {
-        const created = await Area.insertMany(docs, { ordered: false });
+        const created = await tenantInsertMany(Area, docs, restaurantId, { ordered: false });
         return created.length;
     } catch (err) {
         // ordered:false means individual duplicate-key errors don't
@@ -362,7 +363,7 @@ async function cloneCatalogToBranch(Model, restaurantId, sourceBranchId, branchI
     if (!docs.length) return 0;
 
     try {
-        const created = await Model.insertMany(docs, { ordered: false });
+        const created = await tenantInsertMany(Model, docs, restaurantId, { ordered: false });
         return created.length;
     } catch (err) {
         if (err?.insertedDocs) return err.insertedDocs.length;
@@ -530,7 +531,7 @@ async function initializeBranchTables(restaurantId, branchId) {
     if (!docs.length) return 0;
 
     try {
-        const created = await Table.insertMany(docs, { ordered: false });
+        const created = await tenantInsertMany(Table, docs, restaurantId, { ordered: false });
         return created.length;
     } catch (err) {
         if (err?.insertedDocs) return err.insertedDocs.length;
@@ -1820,7 +1821,7 @@ exports.syncMenuToBranch = async (req, res) => {
                         },
                     },
                 }));
-                const result = await MenuItem.bulkWrite(ops, { ordered: false });
+                const result = await tenantBulkWrite(MenuItem, ops, rid, { ordered: false });
                 pricesReset = result.modifiedCount || 0;
             }
         }

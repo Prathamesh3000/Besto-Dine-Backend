@@ -85,7 +85,9 @@ function createScheduler(deps = {}) {
                 ran = true;
                 job.stats.runs += 1;
                 job.lastStartedAt = new Date();
-                await job.fn();
+                // 4.6: every scheduled job is an explicit cross-tenant system context
+                // (per-tenant work inside should use runAsTenant).
+                await require('./tenantSafe').runAsSystem('job:' + job.name, () => job.fn());
             } catch (err) {
                 runError = err;
                 job.stats.errors += 1;

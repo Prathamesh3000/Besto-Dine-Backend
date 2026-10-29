@@ -105,6 +105,17 @@ router.post('/refresh', refreshLimiter, refresh);
 // Revokes the presented refresh token + clears the CRIT-08 cookie.
 // Idempotent, always succeeds.
 router.post('/logout', logout);
+// 3A.4 — hands a cookie-mode web client its CSRF token (the bd_csrf cookie is
+// unreadable cross-origin, and a reload loses the in-memory copy). Public,
+// no side effect beyond (re)setting the CSRF cookie; { enabled:false } when
+// USE_COOKIE_AUTH is off.
+router.get('/csrf', (req, res) => {
+    const cookieAuth = require('../utils/cookieAuth');
+    if (!cookieAuth.isEnabled()) return res.status(200).json({ success: true, enabled: false });
+    const existing = cookieAuth.parseCookies(req.headers.cookie)[cookieAuth.CSRF_COOKIE];
+    const csrfToken = cookieAuth.isValidCsrfToken(existing) ? existing : cookieAuth.setCsrfCookie(res);
+    return res.status(200).json({ success: true, enabled: true, csrfToken });
+});
 // #15 — end every session of the current user on every device.
 router.post('/logout-all', protect, logoutAll);
 

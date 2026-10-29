@@ -25,6 +25,9 @@ const mockCreate = jest.fn();
 jest.mock('../models/idempotencyRecord', () => ({
     findOne: (...a) => mockFindOne(...a),
     create: (...a) => mockCreate(...a),
+    updateOne: jest.fn().mockResolvedValue({}),
+    deleteOne: jest.fn().mockResolvedValue({}),
+    findOneAndUpdate: jest.fn(),
 }));
 
 // authMiddleware drags in models + DB; idempotency only needs the typed
@@ -132,10 +135,11 @@ describe('idempotency() — key handling', () => {
         expect(mockFindOne).not.toHaveBeenCalled();
     });
 
-    test('no header, required mode → 400 IDEMPOTENCY_KEY_REQUIRED', async () => {
+    test('no header, required mode, IDEMPOTENCY_ENFORCE on → 400 IDEMPOTENCY_KEY_REQUIRED', async () => {
+        process.env.IDEMPOTENCY_ENFORCE = '1';
         const res = mockRes();
         const next = jest.fn();
-        await idempotency({ required: true })(mockReq(), res, next);
+        try { await idempotency({ required: true })(mockReq(), res, next); } finally { delete process.env.IDEMPOTENCY_ENFORCE; }
         expect(next).not.toHaveBeenCalled();
         expect(res.statusCode).toBe(400);
         expect(res.body).toEqual(expect.objectContaining({ success: false, code: 'IDEMPOTENCY_KEY_REQUIRED' }));
@@ -254,134 +258,16 @@ describe('idempotency() — scoping', () => {
         expect(scopedIdempotencyKey(viaUrl, KEY)).not.toBe(scopedIdempotencyKey(bare, KEY));
     });
 
-    test('lookup uses the scoped key', async () => {
+    test('claim uses the scoped key', async () => {
         mockFindOne.mockReturnValue(leanResult(null));
         const req = base();
         await idempotency()(req, mockRes(), jest.fn());
-        expect(mockFindOne).toHaveBeenCalledWith({ key: k(req) });
+        expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ key: k(req), state: 'in_progress' }));
     });
 });
 
-describe('idempotency() — replay and recording', () => {
-    test('existing record → replays cached status + body with Idempotent-Replayed, handler skipped', async () => {
-        mockFindOne.mockReturnValue(leanResult({ statusCode: 201, response: { success: true, id: 7 } }));
-        const res = mockRes();
-        const next = jest.fn();
-        await idempotency()(mockReq({ key: KEY }), res, next);
-        expect(next).not.toHaveBeenCalled();
-        expect(res.statusCode).toBe(201);
-        expect(res.body).toEqual({ success: true, id: 7 });
-        expect(res.headers['Idempotent-Replayed']).toBe('true');
-    });
-
-    test('record with no statusCode replays as 200', async () => {
-        mockFindOne.mockReturnValue(leanResult({ response: { ok: 1 } }));
-        const res = mockRes();
-        await idempotency()(mockReq({ key: KEY }), res, jest.fn());
-        expect(res.statusCode).toBe(200);
-    });
-
-    test.each([
-        [200, true],
-        [201, true],
-        // Only 2xx + 409 are cached (fixed 2026-10): a transient 4xx such as
-        // 400 PAYMENT_NOT_CAPTURED must not be replayed to a later retry.
-        [400, false],
-        [404, false],
-        [409, true],
-        [499, false],
-        [500, false],
-        [502, false],
-        [503, false],
-    ])('first response with status %i → recorded: %s', async (status, recorded) => {
-        mockFindOne.mockReturnValue(leanResult(null));
-        const req = mockReq({ key: KEY, user: { _id: USER } });
-        const res = mockRes();
-        await idempotency()(req, res, () => res.status(status).json({ s: status }));
-        expect(res.body).toEqual({ s: status });
-        expect(mockCreate).toHaveBeenCalledTimes(recorded ? 1 : 0);
-        if (recorded) {
-            expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({
-                key: scopedIdempotencyKey(req, KEY),
-                endpoint: 'POST /api/v1/razorpay/verify-payment',
-                user: USER,
-                restaurant: TENANT,
-                statusCode: status,
-                response: { s: status },
-            }));
-        }
-    });
-
-    test('guest request records user:null', async () => {
-        mockFindOne.mockReturnValue(leanResult(null));
-        const res = mockRes();
-        await idempotency()(mockReq({ key: KEY, restaurant: null }), res, () => res.json({ ok: 1 }));
-        expect(mockCreate).toHaveBeenCalledWith(expect.objectContaining({ user: null, restaurant: null, statusCode: 200 }));
-    });
-
-    test('duplicate-key write (concurrent twin) is swallowed silently', async () => {
-        mockFindOne.mockReturnValue(leanResult(null));
-        mockCreate.mockRejectedValue(Object.assign(new Error('E11000 dup'), { code: 11000 }));
-        const res = mockRes();
-        await idempotency()(mockReq({ key: KEY }), res, () => res.json({ ok: 1 }));
-        await flush();
-        expect(res.body).toEqual({ ok: 1 });
-        expect(logger.warn).not.toHaveBeenCalled();
-    });
-
-    test('any other write failure is logged but the response still goes out', async () => {
-        mockFindOne.mockReturnValue(leanResult(null));
-        mockCreate.mockRejectedValue(new Error('disk full'));
-        const res = mockRes();
-        await idempotency()(mockReq({ key: KEY }), res, () => res.json({ ok: 1 }));
-        await flush();
-        expect(res.body).toEqual({ ok: 1 });
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('disk full'));
-    });
-
-    test('lookup failure fails OPEN: handler runs, nothing is recorded, warning logged', async () => {
-        mockFindOne.mockReturnValue({ lean: () => Promise.reject(new Error('mongo down')) });
-        const res = mockRes();
-        const next = jest.fn(() => res.json({ ran: true }));
-        await idempotency()(mockReq({ key: KEY }), res, next);
-        expect(next).toHaveBeenCalledTimes(1);
-        expect(res.body).toEqual({ ran: true });
-        expect(mockCreate).not.toHaveBeenCalled();
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('mongo down'));
-    });
-
-    test('lookup failure fails open even in required mode (key present)', async () => {
-        mockFindOne.mockReturnValue({ lean: () => Promise.reject(new Error('mongo down')) });
-        const next = jest.fn();
-        await idempotency({ required: true })(mockReq({ key: KEY }), mockRes(), next);
-        expect(next).toHaveBeenCalledTimes(1);
-    });
-
-    test('two concurrent requests with the same key BOTH run the handler (no in-flight lock)', async () => {
-        // Characterisation: the middleware only dedupes AFTER the first
-        // response is stored. Money endpoints rely on their own claims
-        // (PaymentClaim) for concurrent safety — see integration suite.
-        mockFindOne.mockReturnValue(leanResult(null));
-        const handler = jest.fn();
-        const mw = idempotency();
-        const r1 = mockRes();
-        const r2 = mockRes();
-        await Promise.all([
-            mw(mockReq({ key: KEY }), r1, () => { handler(); r1.json({ n: 1 }); }),
-            mw(mockReq({ key: KEY }), r2, () => { handler(); r2.json({ n: 2 }); }),
-        ]);
-        expect(handler).toHaveBeenCalledTimes(2);
-        expect(mockCreate).toHaveBeenCalledTimes(2);
-    });
-
-    test('responses sent with res.send (not res.json) are never recorded', async () => {
-        mockFindOne.mockReturnValue(leanResult(null));
-        const res = mockRes();
-        res.send = jest.fn();
-        await idempotency()(mockReq({ key: KEY }), res, () => res.send('ok'));
-        expect(mockCreate).not.toHaveBeenCalled();
-    });
-});
+// Replay / recording / claim / fail-closed / IDEMPOTENCY_ENFORCE behaviour is
+// covered in __tests__/idempotencyFailClosed.test.js.
 
 // ════════════════════════ validate ═══════════════════════════════════
 
@@ -522,6 +408,21 @@ function uploadApp(mw) {
 }
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// Real leading bytes per format — the upload middleware now sniffs content
+// (utils/imageSniff.js), so each accepted type needs its own signature.
+const le32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+const SIG = {
+    png: PNG_MAGIC,
+    jpeg: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46]),
+    webp: Buffer.concat([Buffer.from('RIFF'), le32(4), Buffer.from('WEBP')]),
+    gif: Buffer.from('GIF89a'),
+    svg: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
+    bmp: Buffer.concat([Buffer.from('BM'), Buffer.alloc(12), le32(40)]),
+    avif: Buffer.concat([le32(24), Buffer.from('ftypavif')]),
+    tiff: Buffer.from([0x49, 0x49, 0x2a, 0x00]),
+    heic: Buffer.concat([le32(24), Buffer.from('ftypheic')]),
+    ico: Buffer.from([0, 0, 1, 0, 1, 0]),
+};
 
 describe('uploadMiddleware (images)', () => {
     const app = uploadApp(upload.single('image'));
@@ -529,20 +430,20 @@ describe('uploadMiddleware (images)', () => {
         request(app).post('/up').attach('image', buf, { filename, contentType });
 
     test.each([
-        ['a.jpg', 'image/jpeg'],
-        ['a.JPEG', 'image/jpeg'],
-        ['a.png', 'image/png'],
-        ['a.webp', 'image/webp'],
-        ['a.gif', 'image/gif'],
-        ['logo.svg', 'image/svg+xml'],          // rasterised to PNG by cloudinaryUploader
-        ['a.bmp', 'image/bmp'],
-        ['a.avif', 'image/avif'],
-        ['a.tiff', 'image/tiff'],
-        ['IMG_0001.HEIC', 'image/heic'],
-        ['IMG_0002.heic', 'application/octet-stream'],   // Windows browsers
-        ['fav.ico', 'image/x-icon'],
-    ])('accepts %s (%s)', async (name, mime) => {
-        const res = await send(name, mime);
+        ['a.jpg', 'image/jpeg', 'jpeg'],
+        ['a.JPEG', 'image/jpeg', 'jpeg'],
+        ['a.png', 'image/png', 'png'],
+        ['a.webp', 'image/webp', 'webp'],
+        ['a.gif', 'image/gif', 'gif'],
+        ['logo.svg', 'image/svg+xml', 'svg'],          // rasterised to PNG by cloudinaryUploader
+        ['a.bmp', 'image/bmp', 'bmp'],
+        ['a.avif', 'image/avif', 'avif'],
+        ['a.tiff', 'image/tiff', 'tiff'],
+        ['IMG_0001.HEIC', 'image/heic', 'heic'],
+        ['IMG_0002.heic', 'application/octet-stream', 'heic'],   // Windows browsers
+        ['fav.ico', 'image/x-icon', 'ico'],
+    ])('accepts %s (%s)', async (name, mime, sig) => {
+        const res = await send(name, mime, SIG[sig]);
         expect(res.status).toBe(200);
         expect(res.body.ok).toBe(true);
     });
@@ -560,11 +461,16 @@ describe('uploadMiddleware (images)', () => {
         expect(res.body.message).toMatch(/Only image files/);
     });
 
-    test('filter only checks ext + client-declared mime, never the bytes: HTML body named .png/image/png passes', async () => {
-        // Characterisation: content is not sniffed. Downstream sharp() re-encodes
-        // the buffer (cloudinaryUploader), which is what actually defuses this.
+    test('content is sniffed: an HTML body named .png / image/png is rejected with 400', async () => {
         const res = await send('x.png', 'image/png', Buffer.from('<html><script>alert(1)</script></html>'));
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(400);
+        expect(res.body.message).toMatch(/not a recognised image/);
+    });
+
+    test('a real JPEG named .png is rejected (signature vs extension mismatch)', async () => {
+        const res = await send('x.png', 'image/png', SIG.jpeg);
+        expect(res.status).toBe(400);
+        expect(res.body.message).toMatch(/does not match/);
     });
 
     test('extension must be an exact image extension: ".pngx" with a non-image mime is rejected', async () => {
@@ -574,9 +480,9 @@ describe('uploadMiddleware (images)', () => {
 
     test('5 MB limit: exactly 5 MB passes; 5 MB + 1 byte is LIMIT_FILE_SIZE (multer >= 2.3 treats fileSize as inclusive)', async () => {
         const five = 5 * 1024 * 1024;
-        const ok = await send('big.png', 'image/png', Buffer.alloc(five));
+        const ok = await send('big.png', 'image/png', Buffer.concat([PNG_MAGIC, Buffer.alloc(five - PNG_MAGIC.length)]));
         expect(ok.status).toBe(200);
-        const tooBig = await send('big.png', 'image/png', Buffer.alloc(five + 1));
+        const tooBig = await send('big.png', 'image/png', Buffer.concat([PNG_MAGIC, Buffer.alloc(five + 1 - PNG_MAGIC.length)]));
         expect(tooBig.status).toBe(400);
         expect(tooBig.body.code).toBe('LIMIT_FILE_SIZE');
     });
@@ -736,7 +642,7 @@ describe('cloudinaryUploader.compressAndUpload', () => {
 
     test('format sharp cannot decode (HEIC) → original sent to Cloudinary, converted to JPG with the width cap', async () => {
         mockSharpCannotDecode = true;
-        const original = Buffer.from('heic-bytes');
+        const original = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypheic-bytes')]);
         const result = await compressAndUpload({ buffer: original, originalname: 'IMG_1.HEIC', mimetype: 'image/heic', maxWidth: 1200 });
         expect(mockUploadStream).toHaveBeenCalledWith(
             { folder: 'bestodine/uploads', format: 'jpg', resource_type: 'image', transformation: [{ width: 1200, crop: 'limit', quality: 80 }] },
@@ -748,6 +654,21 @@ describe('cloudinaryUploader.compressAndUpload', () => {
     test('an SVG sharp cannot rasterise is rejected, never uploaded as markup', async () => {
         mockSharpCannotDecode = true;
         await expect(compressAndUpload({ buffer: Buffer.from('<svg'), originalname: 'x.svg', mimetype: 'image/svg+xml' })).rejects.toThrow();
+        expect(mockUploadStream).not.toHaveBeenCalled();
+    });
+
+    test('sharp cannot decode a JPEG (corrupt) → rejected with status 400, never forwarded to Cloudinary', async () => {
+        mockSharpCannotDecode = true;
+        const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+        await expect(compressAndUpload({ buffer: jpeg, originalname: 'a.jpg', mimetype: 'image/jpeg' }))
+            .rejects.toMatchObject({ status: 400 });
+        expect(mockUploadStream).not.toHaveBeenCalled();
+    });
+
+    test('sharp cannot decode bytes that are not an image at all → rejected, not forwarded', async () => {
+        mockSharpCannotDecode = true;
+        await expect(compressAndUpload({ buffer: Buffer.from('<html>'), originalname: 'a.jpg', mimetype: 'image/jpeg' }))
+            .rejects.toMatchObject({ status: 400 });
         expect(mockUploadStream).not.toHaveBeenCalled();
     });
 

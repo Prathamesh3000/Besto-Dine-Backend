@@ -125,7 +125,11 @@ function readAuthCookie(req) {
 function readBearerToken(req) {
     const h = req.headers?.authorization;
     if (h && h.startsWith('Bearer ')) return h.slice(7);
-    if (isCookieAuthEnabled()) return readAuthCookie(req);
+    if (isCookieAuthEnabled()) {
+        // Per-audience cookies (utils/cookieAuth.js) first, then the
+        // pre-3A.4 single cookie.
+        return require('../utils/cookieAuth').readAccessToken(req) || readAuthCookie(req);
+    }
     return null;
 }
 
@@ -394,6 +398,7 @@ const PASSWORD_CHANGE_ALLOWED = new Set([
     '/auth/refresh',          // POST — keep the session alive while changing
     '/auth/logout',           // POST — let the user bail out
     '/auth/logout-all',
+    '/auth/csrf',             // GET — CSRF token for cookie-mode web sessions (3A.4)
 ]);
 
 const requirePasswordCurrent = (req, res, next) => {

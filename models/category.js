@@ -65,6 +65,8 @@ const categorySchema = new mongoose.Schema({
         enum: { values: ['food', 'beverages'], message: 'Category type must be food or beverages' },
         default: 'food',
     },
+    // Optional default HSN/SAC for items in this category (GST reports).
+    hsnCode: { type: String, default: '', trim: true, maxlength: [8, 'HSN code cannot exceed 8 characters'] },
 }, {
     timestamps: true,
     toJSON: { virtuals: true },

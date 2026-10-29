@@ -119,9 +119,8 @@ describe('idGenerator', () => {
     ])('%s → %s-YYMMDD-XXXXXX', (fn, prefix) => {
         const id = idGen[fn]();
         expect(id).toMatch(new RegExp(`^${prefix}-\\d{6}-[0-9A-F]{6}$`));
-        const now = new Date();
-        const ymd = `${String(now.getFullYear()).slice(-2)}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
-        expect(id.split('-')[1]).toBe(ymd);
+        // Date part is in the restaurant zone (default Asia/Kolkata), not server-local.
+        expect(id.split('-')[1]).toBe(idGen.getDatePart('Asia/Kolkata'));
     });
 
     test('generate() with a custom prefix', () => {
@@ -130,7 +129,7 @@ describe('idGenerator', () => {
 
     // Risk pin (deterministic): the random part is only 6 hex chars, i.e.
     // 16^6 ≈ 16.7M suffixes per prefix per day, shared across ALL tenants
-    // (Order.orderId is globally unique) and the create path does not retry
+    // (Order.orderId is globally unique) and the create path (now) retries a fresh suffix
     // on an orderId E11000. Birthday bound: ~50% chance of at least one
     // collision at ~4,800 orders/day platform-wide. A sampled uniqueness
     // check would be flaky (~11% for 2,000 ids), so the suffix space and the

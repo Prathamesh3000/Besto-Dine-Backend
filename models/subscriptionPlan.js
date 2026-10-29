@@ -43,6 +43,8 @@ const FEATURE_KEYS = [
     // Staff item-wise incentives (CAPTAIN_FLOW_UPDATE_PLAN Phase 5, D11): off
     // by default on every plan, sold as an add-on / Super Admin override.
     'incentives',
+    // Tenant API keys, read-only public API and signed webhooks (Gold+ or add-on).
+    'publicApi',
 ];
 
 // Build the features sub-schema dynamically so adding a new feature key

@@ -66,7 +66,7 @@ function completesWithoutKitchen(ops) {
 
 async function deductStock(order) {
     try {
-        const { deductInventoryForOrder } = require('../controllers/inventoryController');
+        const { runDeductionWithRecovery: deductInventoryForOrder } = require('./inventoryDeductionService');
         const result = await deductInventoryForOrder(order, order.restaurant, null);
         if (result?.errors?.length) logger.warn(`Inventory deduction warnings for ${order.orderId}:`, result.errors);
     } catch (err) {

@@ -18,8 +18,9 @@
  * When the explicit value is a different tenant than the context's, it
  * logs `tenantScope.explicit-mismatch` (no change to the query).
  *
- * No-op outside a request context (boot, seeds, scripts, setInterval
- * jobs, socket handlers) and for requests without a tenant (superadmin,
+ * No-op for QUERIES outside a request context (boot, seeds, scripts, jobs,
+ * socket handlers) unless wrapped in runAsTenant(); see utils/tenantSafe.js. Also a no-op
+ * for requests without a tenant (superadmin,
  * /public, /auth, /tables/scan, razorpay webhook).
  *
  * Opt-out (superadmin / deliberate cross-tenant code inside a tenant
@@ -33,8 +34,16 @@
  *   warn              — warn only, query unchanged
  *   off               — disabled
  *
- * Known limits: $lookup / $unionWith sub-pipelines, bulkWrite, insertMany
- * and estimatedDocumentCount are not scoped. Populate sub-queries ARE
+ * insertMany / bulkWrite (task 4.6): native model hooks stamp / verify
+ * `restaurant` on every doc / op when a tenant is resolved from context, and
+ * warn (TENANT_STRICT_CONTEXT=true: throw) when no tenant is resolvable and
+ * the docs carry no restaurant. runAsSystem() contexts are always accepted.
+ * Default: warn only, never throw (strict flag is OFF by default).
+ *
+ * Known limits: $lookup / $unionWith sub-pipelines and
+ * estimatedDocumentCount are not scoped by the plugin — use
+ * utils/tenantSafe (tenantLookup, tenantUnionWith, tenantEstimatedCount).
+ * Populate sub-queries ARE
  * scoped (populated docs belong to the same tenant); those are logged at
  * debug level because their filter is always `{ _id: { $in: [...] } }`.
  */
@@ -43,6 +52,7 @@
 const mongoose = require('mongoose');
 const logger = require('./logger');
 const { getContext } = require('./requestContext');
+const tenantSafe = require('./tenantSafe');
 
 const FIELD = 'restaurant';
 
@@ -156,7 +166,7 @@ function scopePipeline(pipeline, tenantId) {
 }
 
 // ── Logging (deduped: 1st, 10th, 100th, … occurrence per site) ───────
-const stats = { injected: 0, mismatches: 0, unscopable: 0, bySite: new Map() };
+const stats = { injected: 0, mismatches: 0, unscopable: 0, unscopedWrites: 0, bySite: new Map() };
 
 function shouldLog(key) {
     const n = (stats.bySite.get(key) || 0) + 1;
@@ -236,10 +246,80 @@ function aggregateHook() {
     }
 }
 
+// ── insertMany / bulkWrite native guards (task 4.6) ──────────────────
+function hasRestaurant(v) {
+    return v !== undefined && v !== null;
+}
+
+/** Does this bulkWrite op carry a restaurant (doc / filter)? */
+function opHasRestaurant(op) {
+    if (!op || typeof op !== 'object') return true; // let mongoose reject it
+    const kind = Object.keys(op)[0];
+    const body = op[kind] || {};
+    if (kind === 'insertOne') return hasRestaurant(body.document && body.document[FIELD]);
+    return hasTenantCondition(body.filter);
+}
+
+function failOrWarn(kind, model, op, ctx, message) {
+    stats.unscopedWrites += 1;
+    report(kind, { model, op, ctx, filter: null });
+    if (tenantSafe.strictContext()) {
+        throw new tenantSafe.TenantContextError(message, { model, op });
+    }
+}
+
+function guardWrite(model, op, items, ctx, scopeOne, hasOne) {
+    if (mode() === 'off') return;
+    if (ctx && ctx.system) return; // runAsSystem — deliberate cross-tenant work
+    if (ctx && ctx.tenantId) {
+        const tid = ctx.tenantId;
+        for (let i = 0; i < items.length; i++) {
+            try {
+                const before = hasOne(items[i]);
+                if (mode() === 'enforce') items[i] = scopeOne(items[i], tid, i);
+                if (!before) {
+                    stats.injected += 1;
+                    report('injected', { model, op, ctx, filter: null });
+                }
+            } catch (err) {
+                if (err instanceof tenantSafe.TenantMismatchError) {
+                    stats.mismatches += 1;
+                    report('explicit-mismatch', { model, op, ctx, filter: null });
+                    if (tenantSafe.strictContext()) throw err;
+                } else if (!(err instanceof TypeError)) {
+                    throw err;
+                }
+            }
+        }
+        return;
+    }
+    // No tenant resolvable (no context, superadmin, public route).
+    if (items.some(it => !hasOne(it))) {
+        failOrWarn('no-tenant-context', model, op, ctx,
+            `${model}.${op}: no tenant context and the write carries no restaurant; wrap in runAsTenant(id, fn) or runAsSystem(reason, fn), or use the utils/tenantSafe wrappers`);
+    }
+}
+
+function insertManyHook(docs) {
+    const arr = Array.isArray(docs) ? docs : [docs];
+    guardWrite(this.modelName, 'insertMany', arr, getContext(),
+        (d, tid) => tenantSafe.scopeDoc(d, tid),
+        (d) => !!d && typeof d === 'object' && hasRestaurant(d[FIELD]));
+}
+
+function bulkWriteHook(ops) {
+    if (!Array.isArray(ops)) return;
+    guardWrite(this.modelName, 'bulkWrite', ops, getContext(),
+        (op, tid) => tenantSafe.scopeBulkOps([op], tid)[0],
+        opHasRestaurant);
+}
+
 function tenantScopePlugin(schema) {
     if (!schema.path(FIELD)) return; // not a tenant-owned schema
     schema.pre(QUERY_OPS, { document: false, query: true }, queryHook);
     schema.pre('aggregate', aggregateHook);
+    schema.pre('insertMany', insertManyHook);
+    schema.pre('bulkWrite', bulkWriteHook);
 }
 
 function getTenantScopeStats() {
@@ -247,6 +327,7 @@ function getTenantScopeStats() {
         injected: stats.injected,
         mismatches: stats.mismatches,
         unscopable: stats.unscopable,
+        unscopedWrites: stats.unscopedWrites,
         bySite: Object.fromEntries(stats.bySite),
     };
 }

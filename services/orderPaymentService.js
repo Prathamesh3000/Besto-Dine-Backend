@@ -470,6 +470,10 @@ async function customerPayment(req) {
 // once every order on it is settled, award loyalty points, and notify.
 // Money fields are untouched — payWithWallet owns those.
 async function finalizeCustomerPaidOrder(req, updatedOrder, tf) {
+  // Webhook `order.paid` (same per-order event id as the wallet path, so it
+  // is delivered once however many settlement paths report this payment).
+  try { require('../utils/webhookService').emitOrderPaid(updatedOrder); } catch { /* never affects the order */ }
+
   // ── Free the table on payment ────────────────────────────────────
   // Table-status rule: Free as soon as no order on the table / merge
   // group is unsettled — the kitchen status no longer matters (a paid

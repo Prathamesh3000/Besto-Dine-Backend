@@ -75,8 +75,13 @@ function createApp({ isShuttingDown = () => false } = {}) {
     // ─── Security Headers ────────────────────────────────────────────────────────
     app.use(helmet({
         crossOriginResourcePolicy: { policy: 'cross-origin' },
-        contentSecurityPolicy: false,
+        // 3A.4 — CSP_MODE=off|report-only|enforce (default report-only). The
+        // policy lives in utils/csp.js; violations post to /csp-report.
+        contentSecurityPolicy: require('./utils/csp').helmetCspOption(),
     }));
+    // CSP violation sink (4 KB body, rate-limited, always 204). Browsers send
+    // reports as no-CORS POSTs, so it sits ahead of CORS and the /api catch-all.
+    app.use(['/csp-report', '/api/csp-report'], require('./middlewares/cspReport').createCspReportRouter());
 
     // ─── CORS — restrict to allowed origins ──────────────────────────────────────
     const allowedOrigins = (process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:5173'])
@@ -293,6 +298,9 @@ function createApp({ isShuttingDown = () => false } = {}) {
     // so unauthenticated public routes continue to work unchanged.
     const { optionalAuth, requirePasswordCurrent } = require('./middlewares/authMiddleware');
     const { attachTenant } = require('./middlewares/tenantContext');
+    // 3A.4 — CSRF for cookie-authenticated, state-changing requests (no-op
+    // unless USE_COOKIE_AUTH is on; Authorization-header requests are exempt).
+    v1.use(require('./utils/cookieAuth').csrfGuard(isOriginAllowed));
     v1.use(optionalAuth);
     v1.use(attachTenant);
     v1.use(require('./middlewares/tableSessionGuard'));   // revoked table scan sessions -> 401 TABLE_SESSION_ENDED
@@ -305,6 +313,7 @@ function createApp({ isShuttingDown = () => false } = {}) {
     v1.use(require('./middlewares/featureGate').staffAppGate);
 
     v1.use('/public', require('./routes/publicRoute'));   // Unauthenticated landing-page endpoints
+    v1.use('/auth/2fa', require('./routes/twoFactorRoute'));   // optional TOTP 2FA (mounted before /auth)
     v1.use('/auth', require('./routes/authRoute'));
     v1.use('/menu', require('./routes/menuRoute'));
     v1.use('/categories', require('./routes/categoryRoute'));
@@ -331,17 +340,26 @@ function createApp({ isShuttingDown = () => false } = {}) {
     v1.use('/crm', require('./routes/crmRoute'));
     v1.use('/invoices', require('./routes/invoiceRoute'));
     v1.use('/analytics', require('./routes/analyticsRoute'));
+    v1.use('/reports', require('./routes/reportsRoute'));      // GST summary, Tally export, emailed report schedules (export aids)
     v1.use('/advance-booking', require('./routes/advanceBookingRoute'));
     v1.use('/payments', require('./routes/paymentRoute'));
     v1.use('/razorpay', require('./routes/razorpayRoute'));
     v1.use('/refund-requests', require('./routes/refundRequestRoute'));
+    v1.use('/audit', require('./routes/auditRoute'));               // Tenant audit log (task 2.1)
+    v1.use('/inventory', require('./routes/stocktakeRoute'));       // stocktakes + deduction-health (own guards; falls through otherwise)
+    v1.use('/inventory', require('./routes/stockTransferRoute'));   // inter-branch transfers + valuation report (own guards; falls through otherwise)
     v1.use('/inventory', require('./routes/inventoryRoute'));
     v1.use('/suppliers', require('./routes/supplierRoute'));        // Vendor master (10.3.2)
     v1.use('/purchase-orders', require('./routes/purchaseRoute'));  // PO + GRN + payments (10.4, 10.9)
+    v1.use('/supplier-invoices', require('./routes/supplierInvoiceRoute')); // Supplier invoices + payments, aging, 3-way match (3B.3)
+    v1.use('/cash-closings', require('./routes/cashClosingRoute'));  // Daily cash closing (3B.5)
+    v1.use('/ledger', require('./routes/ledgerRoute'));              // Ledger-lite, trial balance, P&L, expenses (3B.3)
     v1.use('/production', require('./routes/productionRoute'));     // Batch cooking (10.6.2)
     v1.use('/shifts', require('./routes/shiftRoute'));
     v1.use('/campaigns', require('./routes/campaignRoute'));
     v1.use('/incentives', require('./routes/incentiveRoute'));   // Staff item incentives (module `incentives`)
+    v1.use('/payroll', require('./routes/payrollRoute'));        // Simple payroll runs (admin only; docs/payroll.md)
+    v1.use('/developer', require('./routes/developerRoute'));    // API keys + webhooks admin (module `publicApi`, owner only)
     // Aggregated first-paint bundle for admin dashboards — single round trip
     // in place of 5 parallel calls (tables, areas, reservations, staff,
     // settings). See controllers/adminBootstrapController.js.
@@ -355,6 +373,7 @@ function createApp({ isShuttingDown = () => false } = {}) {
     v1.use('/superadmin', require('./routes/superadminRoute'));
 
     app.use('/api/v1', v1);
+    app.use('/api/public/v1', require('./routes/publicApiRoute'));   // Read-only public API, tenant API keys (module `publicApi`)
 
     // CRIT-29 — the legacy un-versioned /api mount has been removed. Any
     // client that hasn't migrated to /api/v1 gets a clear 410 Gone so the

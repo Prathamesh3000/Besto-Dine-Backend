@@ -17,6 +17,7 @@ const { verifyUserToken, loadUserForToken } = require('../middlewares/authMiddle
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { releaseTableIfSettled } = require('../utils/tableOccupancy');
 const { createTipForPaidOrder } = require('../utils/tipHelpers');
+const { resolveTenderedBody, siblingDueFor } = require('./orderTenderService');
 const {
   VALID_TRANSITIONS,
   canTransition,
@@ -107,7 +108,13 @@ function applyStatusTransition(req, oldOrder, status, updateData) {
 }
 
 // Payment / tip / manual-discount fields + bill-paid auto-close.
-function applyPaymentFields(oldOrder, body, updateData, userId = null, role = null) {
+function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role = null, tenderCtx = {}) {
+  // Split tender (task 2.3): `payments: [{ method, amount }]` is folded into
+  // the legacy paymentStatus / paymentMethod / amountPaid fields first, so
+  // every check below (due, tolerance, tip, cash change) runs unchanged.
+  const tendered = rawBody && rawBody.payments !== undefined
+    ? resolveTenderedBody(oldOrder, rawBody, { userId, role, ...tenderCtx }) : null;
+  const body = tendered ? tendered.body : rawBody;
   const { paymentStatus, paymentMethod, tipAmount, manualDiscount } = body;
   let { amountPaid } = body;
 
@@ -252,6 +259,17 @@ function applyPaymentFields(oldOrder, body, updateData, userId = null, role = nu
     }));
   }
 
+  // Split tender: persist the full lines and the cumulative summary (the
+  // single-method amountPaid above is only what was collected just now).
+  if (tendered) {
+    updateData.payments = tendered.payments;
+    updateData.amountPaid = tendered.amountPaid;
+    if (updateData['payment.state'] === 'paid' && tendered.cashReceived !== null) {
+      updateData['payment.cashReceived'] = tendered.cashReceived;
+      updateData['payment.changeDue'] = tendered.changeDue;
+    }
+  }
+
   // Bill-paid auto-close for dine-in.
   //
   // The waiter's PaymentOption flow sends only payment fields (no
@@ -340,6 +358,10 @@ async function commitStatusUpdate(oldOrder, updateData, tf) {
   // notification side effects); the other gets a 409.
   const claimsPaid = updateData.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
   if (claimsPaid) atomicFilter.paymentStatus = { $ne: 'Paid' };
+  // Split tender rewrites payments[] / amountPaid from the order as read, so
+  // a concurrent payment (wallet, another counter) makes this a 409 rather
+  // than a lost line.
+  if (updateData.payments) atomicFilter.amountPaid = { $in: [Number(oldOrder.amountPaid) || 0, null] };
 
   const order = await Order.findOneAndUpdate(atomicFilter, updateData, { returnDocument: 'after' });
   if (!order) {
@@ -445,7 +467,8 @@ function runInventoryHooks(req, status, oldOrder, order) {
   // instead of only landing in `logs/combined.log`.
   if (status === 'preparing' && oldOrder.status !== 'preparing') {
     try {
-      const { deductInventoryForOrder } = require('../controllers/inventoryController');
+      // Durable wrapper: a failed deduction is queued for retry (never double-deducts).
+      const { runDeductionWithRecovery: deductInventoryForOrder } = require('./inventoryDeductionService');
       const restaurantId = tenantId(req);
       if (restaurantId) {
         deductInventoryForOrder(order, restaurantId, req.user?._id)
@@ -596,10 +619,13 @@ async function updateOrderStatus(req) {
 
   const updateData = {};
   applyStatusTransition(req, oldOrder, status, updateData);
-  applyPaymentFields(oldOrder, req.body, updateData, req.user?._id || null, req.user?.role || null);
+  const tenderCtx = req.body && req.body.payments !== undefined
+    ? { siblingDue: await siblingDueFor(req, oldOrder, tf) } : undefined;
+  applyPaymentFields(oldOrder, req.body, updateData, req.user?._id || null, req.user?.role || null, tenderCtx);
   applyKitchenStamps(req, oldOrder, status, updateData);
 
   let order = await commitStatusUpdate(oldOrder, updateData, tf);
+  require('./tenantAuditHooks').auditOrderUpdate(req, oldOrder, order);
 
   // Staff "Mark paid" on a held pay-first order (cash at the counter):
   // the payment is recorded, now release it to the kitchen.
@@ -620,12 +646,14 @@ async function updateOrderStatus(req) {
   }
 
   await clearFloorAlertsOnClose(status, oldOrder, order, tf);
-  await settleSiblingDineInRounds(req, paymentStatus, oldOrder, order, tf);
+  // updateData.paymentStatus: with split tenders the status is derived, not in the body.
+  await settleSiblingDineInRounds(req, updateData.paymentStatus || paymentStatus, oldOrder, order, tf);
   runInventoryHooks(req, status, oldOrder, order);
   await releaseTableIfDone(oldOrder, order, tf);
   await notifyStatusTransition({ status, oldOrder, order });
 
   const justPaid = order.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
+  try { const wh = require('../utils/webhookService'); const ser = require('../utils/publicApiSerializers').serializeOrder; if (justPaid) wh.emitOrderPaid(order); if (order.status === 'cancelled' && oldOrder.status !== 'cancelled') wh.emitWebhookEvent(order.restaurant, 'order.cancelled', ser(order)); } catch { /* webhooks never affect the order */ }
 
   // Staff incentives (fire-and-forget, never fails this request): a served
   // transition accrues (the paid side is covered by createTipForPaidOrder
@@ -742,7 +770,7 @@ async function pickupOrder(req) {
   // now. deductInventoryForOrder is idempotent on order.inventoryDeducted.
   if (servedWithoutKitchen) {
     try {
-      const { deductInventoryForOrder } = require('../controllers/inventoryController');
+      const { runDeductionWithRecovery: deductInventoryForOrder } = require('./inventoryDeductionService');
       const result = await deductInventoryForOrder(order, tenantId(req) || order.restaurant, req.user?._id);
       if (result?.errors?.length) logger.warn(`Inventory deduction warnings for ${order.orderId}:`, result.errors);
     } catch (err) {

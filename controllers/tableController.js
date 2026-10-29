@@ -39,6 +39,7 @@ const { billingStatesForTables } = require('../utils/paymentState');
 const SCAN_TOKEN_TTL = process.env.SCAN_TOKEN_TTL || '4h';
 
 const { tenantFilter, tenantId, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
+const { tenantBulkWrite, tenantInsertMany } = require('../utils/tenantSafe');
 const { getMainBranchId } = require('../utils/mainBranch');
 const { revokeTipsForOrder } = require('../utils/tipHelpers');
 const { resolveMergeLeader, freeTableOrUnmergeGroup, mergeGroupIdsOf } = require('../utils/tableMerge');
@@ -884,7 +885,7 @@ const mergeTables = async (req, res) => {
                 }
             }
         }));
-        await Table.bulkWrite(mergeOps);
+        await tenantBulkWrite(Table, mergeOps, tenantId(req));
 
         // Seat reservations (QA #13) live on the merge leader and count
         // against the group's summed capacity. Move any seats already
@@ -1847,7 +1848,7 @@ const importTablesCsv = async (req, res) => {
             // (concurrent admin creates the same name while we're importing)
             // instead of aborting the whole batch.
             try {
-                const inserted = await Table.insertMany(toInsert, { ordered: false });
+                const inserted = await tenantInsertMany(Table, toInsert, tenantId(req), { ordered: false });
                 created = inserted.length;
             } catch (bulkErr) {
                 // BulkWriteError surfaces per-doc failures in writeErrors[];

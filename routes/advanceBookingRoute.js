@@ -3,6 +3,7 @@ const router = express.Router();
 const controller = require('../controllers/advanceBookingController');
 const { protect, adminOnly } = require('../middlewares/authMiddleware');
 const { attachTenant } = require('../middlewares/tenantContext');
+const { idempotency } = require('../middlewares/idempotency');
 const { featureGate } = require('../middlewares/featureGate');
 const {
     validate, body, objectIdParam, optionalObjectId, isObjectIdLike,
@@ -84,7 +85,7 @@ const createBookingValidation = validate([
 ]);
 
 // Create a new booking (Logged in users only)
-router.post('/create', protect, dynamicAdvanceBookingGate, createBookingValidation, controller.createAdvanceBooking);
+router.post('/create', protect, dynamicAdvanceBookingGate, createBookingValidation, idempotency({ required: true }), controller.createAdvanceBooking);
 
 // Get bookings for the logged-in customer — gated by the base advance
 // booking feature. A customer of a tenant without the feature has
@@ -97,9 +98,9 @@ router.get('/my-bookings', protect, featureGate('advanceBookingTable'), controll
 // the controller — no adminOnly guard. The customer router segment
 // MUST come before the /:id admin routes because of the path overlap.
 router.post('/:id/create-remaining-payment',
-    protect, featureGate('advanceBookingTable'), validate([objectIdParam('id', 'Invalid booking id')]), controller.createRemainingPaymentOrder);
+    protect, featureGate('advanceBookingTable'), validate([objectIdParam('id', 'Invalid booking id')]), idempotency({ required: true }), controller.createRemainingPaymentOrder);
 router.post('/:id/verify-remaining-payment',
-    protect, featureGate('advanceBookingTable'), validate([objectIdParam('id', 'Invalid booking id')]), controller.verifyRemainingPayment);
+    protect, featureGate('advanceBookingTable'), validate([objectIdParam('id', 'Invalid booking id')]), idempotency({ required: true }), controller.verifyRemainingPayment);
 
 // CUS-075 — customer self-cancellation with refund-per-policy.
 // Preview is GET so the modal can render the exact refund tier before

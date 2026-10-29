@@ -12,6 +12,7 @@ const Branch = require('../models/branch');
 const logger = require('../utils/logger');
 
 const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
+const { tenantInsertMany } = require('../utils/tenantSafe');
 const { parseCsv } = require('../utils/csvParser');
 const { sendServerError } = require('../utils/httpErrors');
 
@@ -570,7 +571,7 @@ exports.importEventTypesCsv = async (req, res) => {
     let writeErrors = [];
     if (toInsert.length) {
       try {
-        const inserted = await EventType.insertMany(toInsert, { ordered: false });
+        const inserted = await tenantInsertMany(EventType, toInsert, tenant, { ordered: false });
         created = inserted.length;
       } catch (err) {
         created = err?.result?.nInserted || err?.insertedDocs?.length || 0;
@@ -782,7 +783,7 @@ exports.importPackagesCsv = async (req, res) => {
     let writeErrors = [];
     if (toInsert.length) {
       try {
-        const inserted = await Package.insertMany(toInsert, { ordered: false });
+        const inserted = await tenantInsertMany(Package, toInsert, tenant, { ordered: false });
         created = inserted.length;
       } catch (err) {
         created = err?.result?.nInserted || err?.insertedDocs?.length || 0;

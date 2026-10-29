@@ -652,7 +652,11 @@ exports.payWithWallet = async (req, res) => {
               ],
             },
           },
-          { $set: orderSet },
+          {
+            $set: orderSet,
+            // Tender line (task 2.3), appended with the claim.
+            $push: { payments: { method: 'wallet', amount: deductAmount, reference: '', receivedBy: userId, at: new Date(), source: 'wallet' } },
+          },
           { session },
         );
         if (claim.matchedCount !== 1) {
@@ -734,6 +738,8 @@ exports.payWithWallet = async (req, res) => {
     // Fire-and-forget; re-reads the order so the hook sees committed state.
     if (outcome?.orderPaid) {
       Order.findOne({ _id: orderId, ...tf }).then((o) => o && require('../services/incentiveService').accrueSafe(o)).catch(() => {});
+      // Webhook `order.paid` (deduped per order across settlement paths).
+      Order.findOne({ _id: orderId, ...tf }).then((o) => o && require('../utils/webhookService').emitOrderPaid(o)).catch(() => {});
     }
 
     // Table-status rule: the bill is settled → free the dine-in table now
@@ -938,6 +944,7 @@ exports.getWalletReports = async (req, res) => {
           { $group: { _id: '$user', totalRedeemed: { $sum: redeemedPointsExpr } } },
           { $sort: { totalRedeemed: -1 } },
           { $limit: 5 },
+          // AUDIT-EXEMPT: users is the platform-global customer collection; _id comes from a tenant-scoped Transaction group
           { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'userInfo' } },
           { $unwind: { path: '$userInfo', preserveNullAndEmptyArrays: true } },
           { $project: { name: { $ifNull: ['$userInfo.name', 'Unknown'] }, totalRedeemed: 1 } }

@@ -254,6 +254,7 @@ exports.approveRefundRequest = async (req, res) => {
                 reason: `Approved refund request: ${rr.reason || 'No reason'}`,
                 settings,
                 tenantId: tenantId(req),
+                refundRequestId: rr._id,   // carried into the refund.created webhook
             });
         } catch (refundErr) {
             await unclaim();
@@ -271,6 +272,8 @@ exports.approveRefundRequest = async (req, res) => {
         claimed.razorpayRefundId = result.razorpayRefundId || '';
         await claimed.save();
         rr = claimed;
+        // refund.created webhook is emitted by processOrderRefund (with this request's id).
+        require('../services/tenantAuditHooks').auditRefund(req, { _id: rr.order, orderId: rr.orderId, paymentStatus: null }, { amount, reason: rr.reason, mode: result.mode });
 
         // Customer notification — they're waiting for this status flip.
         if (rr.user) {

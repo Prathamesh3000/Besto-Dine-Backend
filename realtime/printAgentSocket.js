@@ -16,6 +16,7 @@ const EVENTS = require('./events');
 const logger = require('../utils/logger');
 const printService = require('../services/printService');
 const { printerRoom } = require('../utils/socketRooms');
+const { runAsTenant } = require('../utils/tenantSafe');
 
 function attach(socket) {
     const { restaurant, branch, agentId } = socket.data.agent;
@@ -36,7 +37,7 @@ function attach(socket) {
     socket.on('print:pending', async (cb) => {
         const reply = typeof cb === 'function' ? cb : () => {};
         try {
-            const jobs = await printService.listPending(restaurant, branch);
+            const jobs = await runAsTenant(restaurant, () => printService.listPending(restaurant, branch));
             reply({ ok: true, jobs });
         } catch (err) {
             logger.warn(`print-agent pending failed: ${err.message}`);
@@ -49,7 +50,7 @@ function attach(socket) {
         try {
             const { jobId, status: st, error } = payload || {};
             if (typeof jobId !== 'string' || !/^[a-f0-9]{24}$/i.test(jobId)) return reply({ ok: false, code: 'BAD_JOB_ID' });
-            const job = await printService.ackJob(restaurant, branch, jobId, st, error);
+            const job = await runAsTenant(restaurant, () => printService.ackJob(restaurant, branch, jobId, st, error));
             printService.markAgentSeen(restaurant, branch);
             reply({ ok: !!job, code: job ? undefined : 'NOT_FOUND' });
         } catch (err) {

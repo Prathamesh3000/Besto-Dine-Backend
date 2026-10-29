@@ -5,6 +5,7 @@ const { protect, adminOnly } = require('../middlewares/authMiddleware');
 const { attachTenant } = require('../middlewares/tenantContext');
 const { featureGate } = require('../middlewares/featureGate');
 const { csvUpload } = require('../middlewares/csvUpload');
+const ov = require('../validators/ops');
 
 const hallGate = featureGate('advanceBookingHall');
 
@@ -20,9 +21,9 @@ router.get('/', hallGate, hallController.getHalls);
 router.get('/template', protect, adminOnly, attachTenant, hallGate, hallController.downloadHallTemplate);
 router.post('/import',  protect, adminOnly, attachTenant, hallGate, csvUpload.single('file'), hallController.importHallsCsv);
 
-router.post('/',          protect, adminOnly, attachTenant, hallGate, hallController.createHall);
-router.post('/admin',     protect, adminOnly, attachTenant, hallGate, hallController.createHall); // legacy alias
-router.put('/:id',        protect, adminOnly, attachTenant, hallGate, hallController.updateHall);
-router.delete('/:id',     protect, adminOnly, attachTenant, hallGate, hallController.deleteHall);
+router.post('/',          protect, adminOnly, attachTenant, hallGate, ov.hallCreate, hallController.createHall);
+router.post('/admin',     protect, adminOnly, attachTenant, hallGate, ov.hallCreate, hallController.createHall); // legacy alias
+router.put('/:id',        protect, adminOnly, attachTenant, hallGate, ov.hallUpdate, hallController.updateHall);
+router.delete('/:id',     protect, adminOnly, attachTenant, hallGate, ov.hallIdOnly, hallController.deleteHall);
 
 module.exports = router;

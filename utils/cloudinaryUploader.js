@@ -11,6 +11,7 @@
  */
 const cloudinary = require('cloudinary').v2;
 const sharp = require('sharp');
+const { sniffImage } = require('./imageSniff');
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -18,6 +19,9 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
   secure:     true,
 });
+
+// Signature-verified formats that sharp's prebuilt binary cannot decode.
+const SHARP_FALLBACK_TYPES = new Set(['heic', 'bmp', 'ico']);
 
 async function compressAndUpload({
   buffer,
@@ -48,17 +52,25 @@ async function compressAndUpload({
   let outBuf = null;
   try {
     // .rotate() applies the EXIF orientation so phone photos aren't sideways.
-    const pipeline = sharp(buffer).rotate().resize({ width: maxWidth, withoutEnlargement: true });
+    const pipeline = sharp(buffer, { failOn: 'error' }).rotate().resize({ width: maxWidth, withoutEnlargement: true });
     if (format === 'png') outBuf = await pipeline.png({ quality: 80, compressionLevel: 9 }).toBuffer();
     else if (format === 'webp') outBuf = await pipeline.webp({ quality: 80 }).toBuffer();
     else outBuf = await pipeline.jpeg({ quality: 80 }).toBuffer();
   } catch (err) {
     // An SVG is only ever stored rasterised — never pass the markup on.
     if (ext === 'svg' || mime === 'image/svg+xml') throw err;
-    // Sharp can't decode this one (e.g. iPhone HEIC — the prebuilt
-    // binary has no HEVC decoder, or BMP / ICO). Hand the original to
-    // Cloudinary instead: it decodes far more formats and converts to
-    // `format` on upload, with the same width cap applied there.
+    // Sharp can't decode this one. Only formats the prebuilt binary is known
+    // to lack (iPhone HEIC — no HEVC decoder — BMP, ICO) AND whose magic bytes
+    // really match are handed to Cloudinary, which decodes far more formats
+    // and converts to `format` on upload with the same width cap. Anything
+    // else (a corrupt JPEG/PNG/GIF/WebP/TIFF/AVIF, or bytes that are not an
+    // image at all) is rejected instead of being forwarded unchecked.
+    if (!SHARP_FALLBACK_TYPES.has(sniffImage(buffer))) {
+      const bad = new Error('Image could not be processed. Please upload a valid image file.');
+      bad.status = 400;
+      bad.expose = true;
+      throw bad;
+    }
     outBuf = null;
   }
 

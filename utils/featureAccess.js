@@ -43,6 +43,7 @@ const ADDON_CATALOG = {
     kiosk:              { label: 'Self-order kiosk',        monthlyPrice: 499 },
     eInvoice:           { label: 'GST e-invoice (IRN)',     monthlyPrice: 0 },
     incentives:         { label: 'Staff incentives',        monthlyPrice: 299 },
+    publicApi:          { label: 'API keys & webhooks',     monthlyPrice: 499 },
 };
 
 function isOn(value) {

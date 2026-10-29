@@ -136,6 +136,9 @@ const menuItemSchema = new mongoose.Schema({
     healthTags: [{ type: String }],
     nutritionalInfo: nutritionalInfoSchema,
     healthyIngredients: [{ type: String }],
+    // Optional HSN/SAC code for GST reports (utils/gstReport.js). Empty =
+    // fall back to the category code, then the tenant default.
+    hsnCode: { type: String, default: '', trim: true, maxlength: [8, 'HSN code cannot exceed 8 characters'] },
     inStock: {
         type: Boolean,
         default: true,

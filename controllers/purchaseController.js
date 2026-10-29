@@ -284,6 +284,7 @@ exports.receive = asyncHandler(async (req, res) => {
             const inc = await Inventory.incStock({ _id: op.inventoryItem, ...tf }, op.qty);
             if (!inc) continue;
             const { previousStock, newStock, doc } = inc;
+            await require('../services/inventoryCostService').recordReceiptCost({ Inventory, filter: { _id: op.inventoryItem, ...tf }, doc, previousStock, inQty: op.qty, unitCost: (po.lines.find(l => String(l.inventoryItem) === String(op.inventoryItem)) || {}).rate }); // weighted-avg cost; never throws
             const status = newStock <= 0 ? 'out-of-stock' : newStock <= (doc.minStock || 0) ? 'low-stock' : 'in-stock';
             await Inventory.updateOne({ _id: op.inventoryItem, ...tf }, {
                 $set: {

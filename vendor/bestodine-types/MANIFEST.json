@@ -1,0 +1,17 @@
+{
+  "source": "packages/types/dist",
+  "files": {
+    "cjs/engine.d.ts": "aee10f51e4fa140623c0a114e5f170d36fe4f1f8042c6b0eeda8782412b77e10",
+    "cjs/engine.js": "487fdb82bc4773b901e8e37d187a225f759a9067f98f054a416e6452c49f08a2",
+    "cjs/index.d.ts": "5d4769db156d613b0f7ca7be719c10eb42c94d61adbf0e7be0fa6f74845b7544",
+    "cjs/index.js": "480b4fef0eab40f5b57288716752ae3799c11b91e212b67645e6a5a5ae49c14c",
+    "cjs/package.json": "d18f120db5a99372058690f86a1332484253e3cdbdbddbc0f5effa6a392b26e0",
+    "cjs/schemas.d.ts": "204149184e0f757615fc20801ee86d9e09c9d9c853c6ba56e72916867955603d",
+    "cjs/schemas.js": "53870c035650fcddfe15e644af7bd27af3eb15ab4ef047397866b2d1e405d8c7",
+    "esm/engine.js": "d51d2f88d0acbda39f28f0f068c001811bec9d0ceb5621cea46ced896978d29d",
+    "esm/index.js": "52e67a55296bc749e04eb5d3df266775977ad06cd89bc02ddea27cb9f16e04b4",
+    "esm/package.json": "5a065fe7d8eab2a582f428e11c2ea63aaf70607a54f69cfd5c711b5c53d91b32",
+    "esm/schemas.js": "54411746ed084f2a1db6304d8fb95fcc1a956e31c4767a0dc6d5ffb50e4630fd",
+    "golden-vectors.json": "d4a5016472b78cd105dfd3ac95376440f9e3b995e4065c6de052e5320b07d01a"
+  }
+}

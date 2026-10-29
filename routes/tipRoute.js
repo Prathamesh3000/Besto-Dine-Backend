@@ -5,6 +5,7 @@ const tipController = require('../controllers/tipController');
 const { protect, adminOnly } = require('../middlewares/authMiddleware');
 const { attachTenant } = require('../middlewares/tenantContext');
 const { featureGate } = require('../middlewares/featureGate');
+const { tipSettle } = require('../validators/money');
 
 const tipSettleLimiter = makeLimiter({ name: 'tip-settle',
     windowMs: 60 * 1000,
@@ -22,7 +23,7 @@ router.get('/my',      protect, tipController.getMyTips);
 
 const tipAdminGate = [protect, adminOnly, attachTenant, featureGate('tipManagement')];
 router.get('/pending', ...tipAdminGate, tipController.getPendingTipsByWaiter);
-router.post('/settle', tipSettleLimiter, ...tipAdminGate, tipController.settleTips);
+router.post('/settle', tipSettleLimiter, ...tipAdminGate, tipSettle, tipController.settleTips);
 router.get('/history', ...tipAdminGate, tipController.getSettlementHistory);
 
 module.exports = router;

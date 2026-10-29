@@ -9,6 +9,7 @@
 const mongoose = require('mongoose');
 const MenuItem = require('../models/menuItem');
 const logger = require('../utils/logger');
+const { tenantBulkWrite } = require('../utils/tenantSafe');
 const { getIO, emitToStaff } = require('../utils/socket');
 const { signTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const { lineItemsSubtotal } = require('./orderBillMath');
@@ -45,7 +46,7 @@ async function bumpMenuItemOrderCounts(items, restaurantId) {
     },
   }));
   try {
-    await MenuItem.bulkWrite(ops, { ordered: false });
+    await tenantBulkWrite(MenuItem, ops, restaurantId, { ordered: false });
   } catch (err) {
     logger.warn(`bumpMenuItemOrderCounts failed: ${err.message}`);
   }

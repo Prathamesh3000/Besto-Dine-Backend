@@ -182,7 +182,12 @@ function remapItemCategories(items, toBranch) {
 // @access  Public
 exports.getAllMenuItems = async (req, res) => {
     try {
-        const { page = 1, limit = 20, search, category, status, type, sort } = req.query;
+        const { category, status, type, sort } = req.query;
+        // qs can hand us arrays / objects: coerce to a plain string, cap its
+        // length, and bound the page size (default 20, max 100).
+        const search = typeof req.query.search === 'string' ? req.query.search.trim().slice(0, 100) : '';
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
 
         // Build query object — always scoped to the current tenant.
         const queryObj = { ...tenantFilter(req) };
@@ -214,7 +219,8 @@ exports.getAllMenuItems = async (req, res) => {
             if (search.length >= 3) {
                 queryObj.$text = { $search: search };
             } else {
-                queryObj.name = { $regex: `^${search}`, $options: 'i' }; // prefix-anchored regex (faster)
+                const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                queryObj.name = { $regex: `^${escapedSearch}`, $options: 'i' }; // prefix-anchored regex (faster)
             }
         }
 
@@ -253,7 +259,7 @@ exports.getAllMenuItems = async (req, res) => {
             Object.assign(queryObj, buildAvailabilityFilter());
         }
 
-        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const skip = (page - 1) * limit;
 
         // Default sort = bestsellers first. orderCount is incremented in
         // orderController.bumpMenuItemOrderCounts on every order create /
@@ -280,7 +286,7 @@ exports.getAllMenuItems = async (req, res) => {
                 .populate('category', 'name image status') // project only needed category fields
                 .sort(sortBy)
                 .skip(skip)
-                .limit(parseInt(limit))
+                .limit(limit)
                 .lean()
         ]);
         applyCustomerBranchPricing(menuItems, req);
@@ -811,6 +817,8 @@ exports.updateMenuItem = async (req, res) => {
             }
         }
 
+        const priceTouched = ['basePrice', 'offerPercentage', 'sizes', 'toppings'].some((k) => updateData[k] !== undefined);
+        const auditBefore = priceTouched ? await MenuItem.findOne(scope).lean() : null;
         const menuItem = await MenuItem.findOneAndUpdate(scope, updateData, {
             returnDocument: 'after',
             runValidators: true
@@ -818,6 +826,7 @@ exports.updateMenuItem = async (req, res) => {
         if (!menuItem) {
             return res.status(404).json({ success: false, message: 'Menu item not found' });
         }
+        if (priceTouched) require('../services/tenantAuditHooks').auditMenuPrice(req, auditBefore, menuItem);
         // If this update DISABLED the item (status moved off 'active' —
         // archived/draft), pull any combos that bundle it so they don't
         // keep selling a component that's now unavailable.

@@ -287,9 +287,11 @@ function guardServer(server) {
 // ── Join authorization ────────────────────────────────────────────────
 async function findOrderForJoin(orderId) {
     const Order = require('../models/order');
-    return Order.findOne({ orderId: String(orderId) })
+    // A guest joins by orderId before any tenant is known; the order's own
+    // restaurant is then verified by canJoinWith. Deliberate cross-tenant lookup.
+    return require('./tenantSafe').runAsSystem('socket-join-order-lookup', () => Order.findOne({ orderId: String(orderId) }) // AUDIT-EXEMPT: resolves the tenant from the order id
         .select('user table scanSessionId guestAccess restaurant branch')
-        .lean();
+        .lean());
 }
 
 // `guestAccess`: the raw guest access token a token-mode guest sent with
@@ -392,6 +394,25 @@ exports.close = async () => {
     }));
 };
 
+// Access token from the httpOnly cookie for a socket handshake (see io.use).
+// Null unless USE_COOKIE_AUTH is on, the handshake's Origin is allowed, and a
+// cookie for the named audience (auth.audience) exists.
+function cookieTokenForSocket(socket, allowedOrigins) {
+    const cookieAuth = require('./cookieAuth');
+    if (!cookieAuth.isEnabled()) return null;
+    const headers = (socket.handshake && socket.handshake.headers) || {};
+    const origin = headers.origin;
+    const allowed = typeof allowedOrigins === 'function'
+        ? allowedOrigins(origin)
+        : Array.isArray(allowedOrigins) ? allowedOrigins.includes(origin) : false;
+    if (!origin || !allowed) return null;
+    // auth.audience === 'none': the client chose to connect as a guest (its
+    // session is gone) — never fall back to a stale cookie.
+    if (socket.handshake.auth && socket.handshake.auth.audience === 'none') return null;
+    return cookieAuth.readAccessToken({ headers }, socket.handshake.auth && socket.handshake.auth.audience);
+}
+exports.cookieTokenForSocket = cookieTokenForSocket;
+
 exports.init = (server, allowedOrigins) => {
     const { Server } = require('socket.io');
 
@@ -427,7 +448,13 @@ exports.init = (server, allowedOrigins) => {
     // auto-join + `join` gate can check identity without hitting the DB.
     io.use(async (socket, next) => {
         try {
-            const { token, scanToken, agentToken } = socket.handshake.auth || {};
+            const { token: authToken, scanToken, agentToken } = socket.handshake.auth || {};
+            // 3A.4 — cookie sessions: when no token is in the handshake auth
+            // payload, fall back to the httpOnly access cookie (only with
+            // USE_COOKIE_AUTH on, and only from an allowed Origin: browsers do
+            // not apply CORS to WebSocket upgrades, so without this check a
+            // foreign page could ride the cookie — cross-site WS hijacking).
+            const token = authToken || cookieTokenForSocket(socket, allowedOrigins);
             // Lazy require — authMiddleware pulls in models; keep this
             // module loadable in isolation (tests, scripts).
             const auth = require('../middlewares/authMiddleware');

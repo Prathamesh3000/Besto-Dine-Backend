@@ -110,17 +110,18 @@ const refundLimiter = makeLimiter({ name: 'rzp-refund',
 // payment already in flight (or money already taken) can always settle.
 const gatewayGate = featureGate('paymentGateway');
 router.post('/create-order', paymentCreateLimiter, optionalAuth, noWaiterBilling, gatewayGate, createOrderValidation, createRazorpayOrder);
-// CRIT-16 — verify endpoints must be idempotent. Clients should send a
-// stable Idempotency-Key (e.g. the Razorpay order_id); retries replay the
-// cached response. Header is optional today for back-compat; tighten to
-// required once all callers are updated.
-router.post('/verify-payment', paymentVerifyLimiter, optionalAuth, noWaiterBilling, verifyPaymentValidation, idempotency(), verifyPayment);
+// CRIT-16 — verify / refund endpoints are idempotent. Clients send a stable
+// Idempotency-Key (e.g. the Razorpay order_id); retries replay the cached
+// response. { required: true } makes the key mandatory once env flag
+// IDEMPOTENCY_ENFORCE is on (default off until all clients ship) and makes
+// the record store fail CLOSED when a key is present.
+router.post('/verify-payment', paymentVerifyLimiter, optionalAuth, noWaiterBilling, verifyPaymentValidation, idempotency({ required: true }), verifyPayment);
 
 // Webhook — called by Razorpay server-to-server (no auth, signature verified in handler)
 router.post('/webhook', handleWebhook);
 
 // Refund — admin/staff with refund permission only (rate limited)
-router.post('/refund', refundLimiter, protect, adminOnly, checkPermission('refund'), refundValidation, idempotency(), refundPayment);
+router.post('/refund', refundLimiter, protect, adminOnly, checkPermission('refund'), refundValidation, idempotency({ required: true }), refundPayment);
 
 // Auto-refund for the "charged but order failed" edge case. The customer
 // (or guest, on QR scan) calls this from their payment-handler catch
@@ -128,11 +129,11 @@ router.post('/refund', refundLimiter, protect, adminOnly, checkPermission('refun
 // inside the controller via the notes.restaurantId stamp we put on the
 // Razorpay order at create-order time. Rate-limited with the refund
 // limiter so a misbehaving client can't grind us into Razorpay's API.
-router.post('/orphan-refund', refundLimiter, optionalAuth, orphanRefundValidation, refundOrphanPayment);
+router.post('/orphan-refund', refundLimiter, optionalAuth, orphanRefundValidation, idempotency({ required: true }), refundOrphanPayment);
 
 // Wallet recharge via Razorpay — authenticated users (rate limited)
 router.post('/create-wallet-recharge', paymentCreateLimiter, protect, featureGate('walletLoyalty'), gatewayGate, createWalletRechargeOrder);
-router.post('/verify-wallet-recharge', paymentVerifyLimiter, protect, verifyWalletRechargeValidation, idempotency(), verifyWalletRecharge);
+router.post('/verify-wallet-recharge', paymentVerifyLimiter, protect, verifyWalletRechargeValidation, idempotency({ required: true }), verifyWalletRecharge);
 
 // Payment reconciliation — admin only
 router.get('/reconcile', protect, adminOnly, reconcilePayments);

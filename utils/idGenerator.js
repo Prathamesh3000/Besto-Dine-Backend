@@ -16,30 +16,42 @@
 
 const { v4: uuidv4 } = require('uuid');
 
-const getDatePart = () => {
-    const now = new Date();
-    const yy = String(now.getFullYear()).slice(-2);
-    const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const dd = String(now.getDate()).padStart(2, '0');
-    return `${yy}${mm}${dd}`;
+const DEFAULT_TZ = 'Asia/Kolkata';
+
+// YYMMDD in the restaurant's IANA time zone (not the server's), so an order
+// placed after midnight local time never carries yesterday's date on a UTC host.
+const getDatePart = (timeZone, now = new Date()) => {
+    let parts;
+    try {
+        parts = new Intl.DateTimeFormat('en-GB', {
+            timeZone: timeZone || DEFAULT_TZ, year: '2-digit', month: '2-digit', day: '2-digit',
+        }).formatToParts(now);
+    } catch (_) {
+        // Invalid zone string stored on the tenant — fall back, never throw.
+        parts = new Intl.DateTimeFormat('en-GB', {
+            timeZone: DEFAULT_TZ, year: '2-digit', month: '2-digit', day: '2-digit',
+        }).formatToParts(now);
+    }
+    const get = (t) => parts.find((p) => p.type === t).value;
+    return `${get('year')}${get('month')}${get('day')}`;
 };
 
 const shortUuid = () => uuidv4().replace(/-/g, '').slice(0, 6).toUpperCase();
 
-const generate = (prefix) => `${prefix}-${getDatePart()}-${shortUuid()}`;
+const generate = (prefix, timeZone) => `${prefix}-${getDatePart(timeZone)}-${shortUuid()}`;
 
 module.exports = {
     /** Dine-in order: ORD-260407-A3X2K9 */
-    orderId: () => generate('ORD'),
+    orderId: (tz) => generate('ORD', tz),
 
     /** Takeaway order: ORT-260407-B7M1P4 */
-    takeawayOrderId: () => generate('ORT'),
+    takeawayOrderId: (tz) => generate('ORT', tz),
 
     /** Kiosk order (any type): KSK-260407-Z4Y8L2.
      *  Distinct prefix lets staff spot kiosk-originated orders in the
      *  admin Orders tab and gives the customer a recognisable token
      *  format (e.g. K4Y8L2) on the OrderToken screen. */
-    kioskOrderId: () => generate('KSK'),
+    kioskOrderId: (tz) => generate('KSK', tz),
 
     /** Table booking: BKT-260407-C9N3Q8 */
     tableBookingId: () => generate('BKT'),
@@ -52,4 +64,5 @@ module.exports = {
 
     /** Generic with custom prefix */
     generate,
+    getDatePart,
 };

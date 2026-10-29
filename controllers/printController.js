@@ -9,6 +9,7 @@ const printService = require('../services/printService');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { getMainBranchId } = require('../utils/mainBranch');
 const logger = require('../utils/logger');
+const { formatBillNo } = require('../utils/billNumber');
 
 const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v) && /^[a-f0-9]{24}$/i.test(v);
 
@@ -132,6 +133,7 @@ exports.printBill = async (req, res) => {
             status: result.job.status,
             printer: { name: result.job.printer?.name || '' },
             billNo: order.bill?.billNo ?? null,
+            billNoDisplay: formatBillNo(order.bill) || null,
             agentOnline: result.agentOnline,
             message: result.agentOnline ? 'Bill sent to the counter printer.' : 'Bill queued — it will print when the print agent connects.',
         });

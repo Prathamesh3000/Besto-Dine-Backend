@@ -13,6 +13,7 @@ const {
 } = require('../controllers/comboController');
 
 const { protect, adminOnly, checkPermission } = require('../middlewares/authMiddleware');
+const ov = require('../validators/ops');
 
 // CSV-only multer (memory) for the bulk import endpoint. Mirrors the
 // shape used by menuRoute / inventoryRoute so admins get a single
@@ -46,11 +47,11 @@ router.post(
 
 router.route('/')
     .get(getCombos)
-    .post(protect, adminOnly, checkPermission('editMenu'), createCombo);
+    .post(protect, adminOnly, checkPermission('editMenu'), ov.comboCreate, createCombo);
 
 router.route('/:id')
     .get(getComboById)
-    .put(protect, adminOnly, checkPermission('editMenu'), updateCombo)
-    .delete(protect, adminOnly, checkPermission('editMenu'), deleteCombo);
+    .put(protect, adminOnly, checkPermission('editMenu'), ov.comboUpdate, updateCombo)
+    .delete(protect, adminOnly, checkPermission('editMenu'), ov.comboIdOnly, deleteCombo);
 
 module.exports = router;

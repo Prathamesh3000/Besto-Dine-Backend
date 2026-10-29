@@ -44,6 +44,7 @@ exports.getAllCustomers = asyncHandler(async (req, res) => {
             { $match: { role: 'customer' } },
             { $sort: { createdAt: -1 } },
             // Lookup orders per customer (scoped to tenant + branch)
+            // AUDIT-EXEMPT: sub-pipeline $match spreads orderScopeMatch (tenant + branch)
             { $lookup: {
                 from: 'orders',
                 let: { uid: '$_id' },
@@ -54,6 +55,7 @@ exports.getAllCustomers = asyncHandler(async (req, res) => {
             }},
             // Lookup wallet per customer (tenant-scoped; wallet is not
             // branch-scoped — it's a tenant-level balance for the user).
+            // AUDIT-EXEMPT: sub-pipeline $match spreads tenantMatch (restaurant)
             { $lookup: {
                 from: 'wallets',
                 let: { uid: '$_id' },

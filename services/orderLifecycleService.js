@@ -167,6 +167,8 @@ async function cancelOrder(req) {
   order.status = cancelled.status;
   order.note = cancelled.note;
   require('./incentiveService').reverseIfVoidSafe(order, 'order cancelled by customer');
+  try { require('../utils/webhookService').emitWebhookEvent(order.restaurant, 'order.cancelled', require('../utils/publicApiSerializers').serializeOrder(order)); } catch { /* webhooks never affect the order */ }
+  require('./tenantAuditHooks').auditOrderUpdate(req, { status: 'open', paymentStatus: order.paymentStatus, amountPaid: order.amountPaid, total: order.total }, order);
 
   // Free the table if it was dine-in (scoped). Unmerges the group if
   // the table is part of a merge so all siblings go back to 'free'

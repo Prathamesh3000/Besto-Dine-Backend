@@ -34,13 +34,13 @@ const MENU_ITEM_FIELDS = Object.freeze([
     'basePrice', 'offerPercentage', 'offerExpiryDate', 'unit',
     'sizes', 'toppings', 'isHealthy', 'healthLevel', 'healthTags',
     'nutritionalInfo', 'healthyIngredients', 'inStock', 'prepStation',
-    'status',
+    'status', 'hsnCode',
 ]);
 
 // POST /categories + PUT /categories/:id — AddCategoryModal
 // { name, displayOrder, image, showOnKiosk } and the status toggle.
 const CATEGORY_FIELDS = Object.freeze([
-    'name', 'displayOrder', 'image', 'status', 'showOnKiosk', 'branch', 'kind',
+    'name', 'displayOrder', 'image', 'status', 'showOnKiosk', 'branch', 'kind', 'hsnCode',
 ]);
 
 // PUT /branches/:id — Branches.jsx edit form. isActive is NOT here:

@@ -48,7 +48,7 @@ async function backfillForTenant(tenant) {
         } },
         { $unwind: '$items' },
         { $match: {
-            'items.menuItem': { $exists: true, $ne: null, $ne: '' },
+            'items.menuItem': { $exists: true, $nin: [null, ''] },
         } },
         { $group: {
             _id: '$items.menuItem',

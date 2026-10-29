@@ -41,6 +41,9 @@ const orderItemSchema = new mongoose.Schema({
   // each later append / repeat). Optional: legacy lines have none and are
   // treated as round 1 (utils/kotRounds.js).
   kotNo: { type: Number, min: 1 },
+  // HSN/SAC snapshot at sale time (MenuItem, else Category, else tenant default).
+  // '' = legacy line: the GST report falls back to the live menu lookup.
+  hsnCode: { type: String, default: '', trim: true, maxlength: 8 },
 });
 
 // One entry per KOT send (create = round 1, every append / repeat = the
@@ -66,6 +69,7 @@ const kotSchema = new mongoose.Schema({
 const billSchema = new mongoose.Schema({
   status:       { type: String, enum: ['draft', 'final'], default: 'draft' },
   billNo:       { type: Number, default: null },       // sequential per restaurant+branch (models/billCounter.js)
+  financialYear: { type: String, default: null },       // FY of the counter billNo came from, e.g. '2026-27'; null on pre-FY bills. Print via utils/billNumber.formatBillNo
   savedAt:      { type: Date, default: null },
   savedBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   reopenedAt:   { type: Date, default: null },
@@ -345,6 +349,22 @@ const orderSchema = new mongoose.Schema({
   // its captured amount and the wallet contribution would be lost from
   // the order's history. Sum invariant: amountPaid = capturedRzp + walletAmountPaid.
   walletAmountPaid: { type: Number, default: 0, min: [0, 'Wallet amount paid cannot be negative'] },
+  // Per-tender lines (task 2.3): what was collected, one line per method.
+  // paymentMethod / amountPaid / paymentStatus above stay as the derived
+  // summary, rewritten on every change. Old orders have no lines — read
+  // them through utils/tenders.getTenders, which synthesises from the
+  // legacy fields (no backfill).
+  payments: {
+    type: [new mongoose.Schema({
+      method: { type: String, enum: ['cash', 'upi', 'card', 'wallet', 'razorpay', 'other'], required: true },
+      amount: { type: Number, required: true, min: [0, 'Payment amount cannot be negative'] },
+      reference: { type: String, default: '', maxlength: 80 },
+      receivedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      at: { type: Date, default: Date.now },
+      source: { type: String, default: '', maxlength: 30 }, // counter | wallet | razorpay | ...
+    }, { _id: false })],
+    default: undefined,
+  },
   razorpayOrderId: { type: String },    // Razorpay order ID (for reconciliation & refunds)
   // Every Razorpay checkout ever opened for this order (decision 4a).
   // razorpayOrderId is the latest / the one that settled it; a payment
@@ -406,8 +426,7 @@ const orderSchema = new mongoose.Schema({
   // updateOrderStatus requires a reason and a captain/manager role for
   // those two states; early cancellations record who/when only.
   cancellationReason: { type: String, trim: true },
-  cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  cancelledAt: { type: Date },
+  // (cancelledBy / cancelledAt are declared once, next to cancelReasonNote.)
   // Customer-initiated "settle bill at counter" request. Set when the
   // dine-in customer chooses Pay-at-Counter on the bill preview;
   // cleared (left as-is — historical record) when admin marks the

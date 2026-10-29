@@ -207,6 +207,8 @@ logger.debug('Socket.io initialized');
 const { runScheduledReconciliation } = require('./controllers/razorpayController');
 const scheduler = require('./utils/scheduler');
 scheduler.scheduleJob('payment-reconciliation', 30 * 60 * 1000, runScheduledReconciliation);
+require('./services/reportScheduleService').register(); // emailed GST / sales reports (cluster-locked, once per period)
+require('./utils/ledgerPostJob').startLedgerPostJob(scheduler); // opt-in: LEDGER_AUTO_POST=true
 
 // ─── Halted subscriptions — suspend after the 24h grace period ─────────────
 // subscription.halted marks the tenant past_due and schedules the lockout
@@ -232,6 +234,7 @@ require('./utils/scheduledTakeawayReleaser').startScheduledTakeawayReleaser();
 // and an open status past the grace window, so customer money is
 // never at risk.
 require('./utils/emptyOrderSweeper').startScheduledEmptyOrderSweep();
+require('./utils/inventoryDeductionRetryJob').startInventoryDeductionRetry();   // retries failed stock deductions
 
 // ─── Held-order sweeper — cancels pay-first orders never paid ──────────────
 // Operations profile (pay first, held until paid): an order waiting for
@@ -251,6 +254,9 @@ require('./services/incentiveService').startScheduledIncentiveReconcile();
 // (default 16h) gets marked 'missed' with a capped clockOut + audit note,
 // preventing the staff member from being blocked on next clock-in.
 require('./utils/shiftAutoCloser').startScheduledShiftAutoClose();
+
+// ─── Webhook delivery — retries pending outbound webhooks (module `publicApi`) ─
+require('./utils/webhookService').startScheduledWebhookDelivery();
 
 // ─── Start Server ────────────────────────────────────────────────────────────
 server.listen(port, () => {

@@ -758,6 +758,7 @@ const createAdvanceBooking = async (req, res) => {
             }
             throw saveErr;
         }
+        try { require('../utils/webhookService').emitWebhookEvent(tenantId(req), 'booking.created', require('../utils/publicApiSerializers').serializeBooking(savedBooking)); } catch { /* webhooks never affect the booking */ }
 
         // CUS-073 — fire confirmation email (with .ics attachment) in
         // the background. We don't await the response in the request

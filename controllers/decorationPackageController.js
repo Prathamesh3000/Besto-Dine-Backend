@@ -4,6 +4,7 @@ const DecorationPackage = require('../models/decorationPackage');
 const logger = require('../utils/logger');
 
 const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
+const { tenantInsertMany } = require('../utils/tenantSafe');
 const { parseCsv } = require('../utils/csvParser');
 const { _resolveBulkTargetBranch: resolveBulkTargetBranch } = require('./bookingInfoController');
 const { sendServerError } = require('../utils/httpErrors');
@@ -390,7 +391,7 @@ exports.importDecorationPackagesCsv = async (req, res) => {
         let writeErrors = [];
         if (toInsert.length) {
             try {
-                const inserted = await DecorationPackage.insertMany(toInsert, { ordered: false });
+                const inserted = await tenantInsertMany(DecorationPackage, toInsert, tenant, { ordered: false });
                 created = inserted.length;
             } catch (err) {
                 created = err?.result?.nInserted || err?.insertedDocs?.length || 0;

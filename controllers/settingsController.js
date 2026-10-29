@@ -898,6 +898,7 @@ exports.updateSettings = async (req, res) => {
     }
 
     let settings = await Settings.findOne(scope);
+    const auditBefore = settings;
 
     // UPI payee: only the two known fields, merged field-by-field so a
     // partial PUT cannot blank the other one.
@@ -925,6 +926,7 @@ exports.updateSettings = async (req, res) => {
       await syncRestaurantFromGeneral(req, updateBody.general);
     }
 
+    require('../services/tenantAuditHooks').auditSettingsChange(req, auditBefore, updateBody, 'all');
     invalidateCache(req);
     broadcastSettingsUpdated(req, 'all');
 
@@ -1007,6 +1009,7 @@ exports.updateSettingsSection = async (req, res) => {
       req.body = { upiId: cur.upiId || '', upiPayeeName: cur.upiPayeeName || '', ...pay };
     }
 
+    const auditBefore = settings[section];
     settings[section] = req.body;
 
     await settings.validate();
@@ -1016,6 +1019,7 @@ exports.updateSettingsSection = async (req, res) => {
       await syncRestaurantFromGeneral(req, req.body);
     }
 
+    require('../services/tenantAuditHooks').auditSettingsChange(req, auditBefore, req.body, section);
     invalidateCache(req);
     broadcastSettingsUpdated(req, section);
 

@@ -30,6 +30,7 @@ const ALL_OFF = {
     dataExport: false, accountingExport: false, aggregatorOrders: false,
     eInvoice: false, webhooks: false, whiteLabelBranding: false, kiosk: false,
     incentives: false,   // add-on only (utils/featureAccess ADDON_CATALOG)
+    publicApi: false,    // API keys + public API + webhooks: Gold and above, or add-on
 };
 
 const SILVER_FEATURES = {
@@ -46,6 +47,7 @@ const GOLD_FEATURES = {
     ...SILVER_FEATURES,
     walletLoyalty: true, couponPromotions: true, crm: true, campaigns: true,
     advanceBookingTable: true, staffPerformance: true,
+    publicApi: true,
     revenueAnalytics: 'standard',
 };
 

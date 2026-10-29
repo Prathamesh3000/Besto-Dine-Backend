@@ -1,0 +1,27 @@
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.env
+.env.*
+!.env.docker.example
+*.log
+logs
+backups
+uploads
+coverage
+.staging-db
+*.zip
+# docs are not needed at run time EXCEPT the OpenAPI documents served by
+# routes/publicApiRoute.js (GET /api/public/v1/openapi.json).
+docs/*
+!docs/openapi
+# tests are not shipped, EXCEPT the jest-free seed helper that
+# Seed/seedStaging.js requires (so `docker compose run ... seed` works).
+__tests__/*
+!__tests__/integration
+__tests__/integration/*
+!__tests__/integration/helpers
+Test
+Dockerfile
+.dockerignore

@@ -4,6 +4,7 @@ const decorationPackageController = require('../controllers/decorationPackageCon
 const { protect, adminOnly } = require('../middlewares/authMiddleware');
 const { featureGate } = require('../middlewares/featureGate');
 const { csvUpload } = require('../middlewares/csvUpload');
+const ov = require('../validators/ops');
 
 // Phase 2.5: decoration packages are part of the hall-booking flow.
 // Gate all reads (customer + admin) and mutations behind
@@ -23,9 +24,9 @@ router.post('/import',  protect, adminOnly, hallGate, csvUpload.single('file'), 
 router.get('/:id', hallGate, decorationPackageController.getDecorationPackageById);
 
 // Admin only
-router.post('/',            protect, adminOnly, hallGate, decorationPackageController.createDecorationPackage);
-router.put('/:id',          protect, adminOnly, hallGate, decorationPackageController.updateDecorationPackage);
-router.delete('/:id',       protect, adminOnly, hallGate, decorationPackageController.deleteDecorationPackage);
-router.patch('/:id/status', protect, adminOnly, hallGate, decorationPackageController.toggleStatus);
+router.post('/',            protect, adminOnly, hallGate, ov.decorCreate, decorationPackageController.createDecorationPackage);
+router.put('/:id',          protect, adminOnly, hallGate, ov.decorUpdate, decorationPackageController.updateDecorationPackage);
+router.delete('/:id',       protect, adminOnly, hallGate, ov.decorIdOnly, decorationPackageController.deleteDecorationPackage);
+router.patch('/:id/status', protect, adminOnly, hallGate, ov.decorIdOnly, decorationPackageController.toggleStatus);
 
 module.exports = router;

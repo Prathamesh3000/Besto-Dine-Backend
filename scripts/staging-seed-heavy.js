@@ -97,6 +97,7 @@ async function insertChunks(Model, docs, label) {
     for (let i = 0; i < docs.length; i += CHUNK) {
         const slice = docs.slice(i, i + CHUNK);
         try {
+            // AUDIT-EXEMPT: staging seed script; every row is built with an explicit restaurant, runs outside any request
             const res = await Model.insertMany(slice, { ordered: false });
             inserted += res.length;
         } catch (err) {
@@ -203,6 +204,7 @@ async function ensureOrders(restaurant, branch, users, tables, cats) {
         if (agg && agg.min && (now - agg.min.getTime()) < (span * 0.5)) {
             console.log(`${TAG} orders: createdAt was stamped by the model (min ${agg.min.toISOString()}); re-applying the ${DAYS}-day spread`);
             const ops = docs.map((d) => ({ updateOne: { filter: { restaurant: restaurant._id, orderId: d.orderId }, update: { $set: { createdAt: d.createdAt, updatedAt: d.updatedAt } }, timestamps: false } }));
+            // AUDIT-EXEMPT: staging seed script; ops carry explicit restaurant, runs outside any request
             for (let i = 0; i < ops.length; i += CHUNK) await Order.bulkWrite(ops.slice(i, i + CHUNK), { ordered: false });
         }
     }
