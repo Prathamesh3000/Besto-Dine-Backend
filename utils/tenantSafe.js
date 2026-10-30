@@ -216,7 +216,8 @@ function scopeLookupSpec(spec, restaurantId, stageName = '$lookup') {
     const { localField, foreignField } = spec;
     if (localField != null || foreignField != null) {
         if (localField == null || foreignField == null) throw new TypeError('$lookup needs both localField and foreignField');
-        const lv = '__tenantLookupLocal';
+        // MongoDB variable names must start with a lowercase letter.
+        const lv = 'tenantLookupLocal';
         const join = {
             $match: {
                 $expr: {

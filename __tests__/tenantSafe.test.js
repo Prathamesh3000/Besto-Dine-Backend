@@ -84,7 +84,7 @@ describe('tenantLookup / tenantUnionWith / tenantAggregate', () => {
         expect($lookup.localField).toBeUndefined();
         expect($lookup.from).toBe('tables');
         expect($lookup.as).toBe('tableDoc');
-        expect($lookup.let.__tenantLookupLocal).toBe('$table');
+        expect($lookup.let.tenantLookupLocal).toBe('$table');
         expect($lookup.pipeline[0]).toEqual({ $match: { restaurant: A } });
         expect(JSON.stringify($lookup.pipeline[1])).toContain('$_id');
     });
