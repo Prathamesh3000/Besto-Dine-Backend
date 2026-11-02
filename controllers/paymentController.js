@@ -154,6 +154,14 @@ exports.getAllPayments = async (req, res) => {
                 // once the Cart/Takeaway flows start persisting these fields.
                 serviceCharge: order.serviceCharge || 0,
                 gst: order.gst || 0,
+                // Tenant-defined extra charges stamped on the order — without
+                // these the receipt's lines do not add up to its total.
+                additionalCharges: (order.additionalCharges || []).map(c => ({
+                    name: c.name || 'Charge',
+                    type: c.type || '',
+                    value: c.value || 0,
+                    amount: c.amount || 0,
+                })).filter(c => c.amount > 0),
                 discount: order.discount || 0,
                 // Always-present residual so the card reconciles to `total`
                 // even for orders without the component breakdown.

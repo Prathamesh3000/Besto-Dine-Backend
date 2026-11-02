@@ -113,9 +113,11 @@ describe('record payment (atomic guard)', () => {
         await expect(call(req({ amount: 150 }))).rejects.toMatchObject({ status: 400, code: 'EXCEEDS_OUTSTANDING' });
         expect(SupplierPayment.create).not.toHaveBeenCalled();
         // the guard is part of the update filter itself (atomic), not a read-then-write
-        const [filter, update] = SupplierInvoice.findOneAndUpdate.mock.calls[0];
+        const [filter, update, options] = SupplierInvoice.findOneAndUpdate.mock.calls[0];
         expect(filter.$expr).toBeDefined();
         expect(Array.isArray(update)).toBe(true);
+        // Mongoose 9 throws on a pipeline update unless it is declared (this was a 500 in production use).
+        expect(options.updatePipeline).toBe(true);
     });
 
     test('unknown invoice -> 404', async () => {
@@ -140,10 +142,76 @@ describe('record payment (atomic guard)', () => {
         SupplierPayment.create.mockRejectedValue(new Error('db down'));
         await expect(call(req({ amount: 400 }))).rejects.toMatchObject({ status: 500 });
         expect(SupplierInvoice.updateOne).toHaveBeenCalledTimes(1);
+        expect(SupplierInvoice.updateOne.mock.calls[0][2]).toMatchObject({ updatePipeline: true });
     });
 
     test('non-positive amounts are rejected before touching the DB', async () => {
         await expect(call(req({ amount: 0 }))).rejects.toMatchObject({ code: 'INVALID_AMOUNT' });
         expect(SupplierInvoice.findOneAndUpdate).not.toHaveBeenCalled();
+    });
+});
+
+describe('edit invoice (PATCH)', () => {
+    let ctrl; let SupplierInvoice; let LedgerEntry;
+    const ID = '507f1f77bcf86cd799439011';
+    const res = () => { const r = { statusCode: 200 }; r.status = (c) => { r.statusCode = c; return r; }; r.json = (b) => { r.body = b; return r; }; return r; };
+    const req = (body) => ({ restaurant: { _id: 'r1', timezone: 'Asia/Kolkata' }, user: { _id: 'u1', role: 'admin' }, query: {}, params: { id: ID }, body });
+    const call = async (rq) => { const rs = res(); await ctrl.update(rq, rs, (e) => { throw e; }); if (rs.statusCode >= 400) throw Object.assign(new Error(rs.body.message), { status: rs.statusCode, code: rs.body.code }); return rs; };
+    const existing = () => ({ _id: ID, invoiceNo: 'INV-1', invoiceDate: new Date('2026-10-30'), dueDate: new Date('2026-11-10'), subtotal: 1000, tax: 0, total: 1000, amountPaid: 400, status: 'partial', notes: '' });
+    const saved = (o) => ({ ...o, toObject() { return { ...o }; } });
+
+    beforeEach(() => {
+        jest.resetModules();
+        jest.doMock('../models/supplierInvoice', () => ({ findOneAndUpdate: jest.fn(), findOne: jest.fn() }));
+        jest.doMock('../models/supplierPayment', () => ({}));
+        jest.doMock('../models/supplier', () => ({}));
+        jest.doMock('../models/purchaseOrder', () => ({}));
+        jest.doMock('../models/ledgerEntry', () => ({ exists: jest.fn() }));
+        jest.doMock('../services/tenantAuditService', () => ({ recordTenantAudit: jest.fn() }));
+        SupplierInvoice = require('../models/supplierInvoice');
+        LedgerEntry = require('../models/ledgerEntry');
+        ctrl = require('../controllers/supplierInvoiceController');
+        SupplierInvoice.findOne.mockReturnValue({ lean: () => Promise.resolve(existing()) });
+        SupplierInvoice.findOneAndUpdate.mockImplementation((f, u) => ({ populate: () => Promise.resolve(saved({ ...existing(), ...u.$set })) }));
+        LedgerEntry.exists.mockResolvedValue(null);
+    });
+
+    test('invoice number, due date and notes stay editable even once the invoice is in the ledger', async () => {
+        LedgerEntry.exists.mockResolvedValue({ _id: 'l1' });
+        const rs = await call(req({ invoiceNo: 'INV-1A', dueDate: '2026-11-20', notes: 'corrected number' }));
+        expect(rs.statusCode).toBe(200);
+        const [, update] = SupplierInvoice.findOneAndUpdate.mock.calls[0];
+        expect(update.$set).toMatchObject({ invoiceNo: 'INV-1A', notes: 'corrected number' });
+        expect(update.$set.total).toBeUndefined();
+    });
+
+    test('amounts or date of a ledger-posted invoice are refused (409) and nothing is written', async () => {
+        LedgerEntry.exists.mockResolvedValue({ _id: 'l1' });
+        await expect(call(req({ subtotal: 1200 }))).rejects.toMatchObject({ status: 409, code: 'LEDGER_POSTED' });
+        await expect(call(req({ invoiceDate: '2026-10-01' }))).rejects.toMatchObject({ code: 'LEDGER_POSTED' });
+        expect(SupplierInvoice.findOneAndUpdate).not.toHaveBeenCalled();
+    });
+
+    test('the new total cannot drop below what is already paid', async () => {
+        await expect(call(req({ subtotal: 300 }))).rejects.toMatchObject({ status: 400, code: 'BELOW_PAID' });
+        expect(SupplierInvoice.findOneAndUpdate).not.toHaveBeenCalled();
+    });
+
+    test('an amount edit recomputes total and status and is guarded on amountPaid', async () => {
+        await call(req({ subtotal: 400, tax: 0 })); // total 400 == paid 400 -> paid
+        const [filter, update] = SupplierInvoice.findOneAndUpdate.mock.calls[0];
+        expect(update.$set).toMatchObject({ subtotal: 400, total: 400, status: 'paid' });
+        expect(filter.amountPaid).toBe(400);
+    });
+
+    test('a payment landing mid-edit (guard no longer matches) -> 409', async () => {
+        SupplierInvoice.findOneAndUpdate.mockImplementation(() => ({ populate: () => Promise.resolve(null) }));
+        await expect(call(req({ subtotal: 900 }))).rejects.toMatchObject({ status: 409, code: 'CONFLICT' });
+    });
+
+    test('renaming to an existing number -> 409 DUPLICATE_INVOICE; empty edit -> 400', async () => {
+        SupplierInvoice.findOneAndUpdate.mockImplementation(() => ({ populate: () => Promise.reject({ code: 11000 }) }));
+        await expect(call(req({ invoiceNo: 'INV-2' }))).rejects.toMatchObject({ status: 409, code: 'DUPLICATE_INVOICE' });
+        await expect(call(req({}))).rejects.toMatchObject({ code: 'NOTHING_TO_UPDATE' });
     });
 });

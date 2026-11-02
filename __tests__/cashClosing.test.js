@@ -92,6 +92,32 @@ describe('cash closing controller', () => {
         await expect(call(ctrl.close, req({ body: { businessDate: '2026-10-01', countedCash: 10 } }))).rejects.toMatchObject({ status: 409 });
     });
 
+    describe('Main branch and legacy branch-less day records', () => {
+        const MAIN = '507f1f77bcf86cd799439011';
+        const OTHER = '507f1f77bcf86cd799439012';
+        const legacy = { _id: 'c0', branch: null, status: 'open', openingCash: 4000 };
+        const lean = (v) => ({ lean: () => Promise.resolve(v), sort: () => ({ lean: () => Promise.resolve(v) }) });
+        // Only a record with branch:null exists for the day.
+        beforeEach(() => { CashClosing.findOne.mockImplementation((q) => lean(q.branch === null ? legacy : null)); });
+
+        test('preview for Main finds the branch-less record (was "Not opened")', async () => {
+            const rs = await call(ctrl.preview, req({ query: { businessDate: '2026-10-01', branch: MAIN }, mainBranchId: MAIN }));
+            expect(rs.body.status).toBe('open');
+            expect(rs.body.openingCash).toBe(4000);
+        });
+
+        test('open for Main refuses to create a second record for that day', async () => {
+            await expect(call(ctrl.open, req({ body: { businessDate: '2026-10-01', openingCash: 1 }, query: { branch: MAIN }, mainBranchId: MAIN })))
+                .rejects.toMatchObject({ code: 'ALREADY_OPENED' });
+            expect(CashClosing.create).not.toHaveBeenCalled();
+        });
+
+        test('another branch does not inherit the branch-less record', async () => {
+            const rs = await call(ctrl.preview, req({ query: { businessDate: '2026-10-01', branch: OTHER }, mainBranchId: MAIN }));
+            expect(rs.body.status).toBe('none');
+        });
+    });
+
     test('future dates and bad counts are rejected', async () => {
         await expect(call(ctrl.close, req({ body: { businessDate: '2999-01-01', countedCash: 1 } }))).rejects.toMatchObject({ code: 'FUTURE_DATE' });
         await expect(call(ctrl.close, req({ body: { countedCash: -5 } }))).rejects.toMatchObject({ code: 'INVALID_AMOUNT' });

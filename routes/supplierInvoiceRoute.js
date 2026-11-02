@@ -15,6 +15,7 @@ router.get('/reports/three-way-match', sc.threeWay);
 router.get('/', sc.list);
 router.post('/', sc.create);
 router.get('/:id', sc.getOne);
+router.patch('/:id', sc.update);
 router.post('/:id/payments', sc.recordPayment);
 
 module.exports = router;

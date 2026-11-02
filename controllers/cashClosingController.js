@@ -24,11 +24,26 @@ async function liveCash(req, businessDate, branchId) {
 
 const dayKey = (businessDate, branchId) => ({ branch: branchId || null, businessDate });
 
+// The day's record for this branch. For the Main branch, records written
+// before branches existed carry `branch: null` and still belong to Main
+// (the same rule the History list applies via branchScopeClause) - looking
+// only for an exact match showed such a day as "Not opened" while History
+// listed it as open, and let "Open day" create a duplicate.
+async function findDay(req, businessDate, branchId) {
+    const exact = await CashClosing.findOne({ ...tenantFilter(req), ...dayKey(businessDate, branchId) }).lean();
+    if (exact || !branchId) return exact;
+    const main = req?.mainBranchId;
+    if (main && String(main) === String(branchId)) {
+        return CashClosing.findOne({ ...tenantFilter(req), ...dayKey(businessDate, null) }).lean();
+    }
+    return null;
+}
+
 // GET /cash-closings/preview?businessDate=&openingCash= - live expected cash, nothing saved.
 exports.preview = asyncHandler(async (req, res) => {
     const businessDate = dateOrThrow(req, req.query.businessDate);
     const branchId = resolveBranchId(req);
-    const existing = await CashClosing.findOne({ ...tenantFilter(req), ...dayKey(businessDate, branchId) }).lean();
+    const existing = await findDay(req, businessDate, branchId);
     const cash = await liveCash(req, businessDate, branchId);
     const opening = existing ? existing.openingCash : (isMoney(req.query.openingCash) ? Number(req.query.openingCash) : 0);
     res.json({ success: true, businessDate, status: existing?.status || 'none', closing: existing || null, ...computeCash({ openingCash: opening, ...cash }) });
@@ -46,6 +61,9 @@ exports.open = asyncHandler(async (req, res) => {
         openingCash = prev?.countedCash ?? 0;
     }
     if (!isMoney(openingCash)) throw new AppError(400, 'INVALID_AMOUNT', 'openingCash must be a number of 0 or more');
+    if (await findDay(req, businessDate, branchId)) {
+        throw new AppError(409, 'ALREADY_OPENED', `${businessDate} already has a cash closing record`);
+    }
     try {
         const doc = await CashClosing.create({
             restaurant: tenantId(req), branch: branchId || null, businessDate,
@@ -64,7 +82,7 @@ exports.close = asyncHandler(async (req, res) => {
     if (!isMoney(b.countedCash)) throw new AppError(400, 'INVALID_AMOUNT', 'countedCash must be a number of 0 or more');
     const businessDate = dateOrThrow(req, b.businessDate);
     const branchId = resolveBranchId(req);
-    const existing = await CashClosing.findOne({ ...tenantFilter(req), ...dayKey(businessDate, branchId) }).lean();
+    const existing = await findDay(req, businessDate, branchId);
     if (existing && existing.status === 'closed') {
         throw new AppError(409, 'ALREADY_CLOSED', `${businessDate} is already closed. An admin can amend it with a reason.`);
     }
