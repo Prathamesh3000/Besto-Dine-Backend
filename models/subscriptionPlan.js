@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { priceForPlan, availableCycles } = require('../utils/billingCycles');
 
 /**
  * SubscriptionPlan — SaaS billing plan / package tier
@@ -85,6 +86,15 @@ const subscriptionPlanSchema = new mongoose.Schema({
         required: true,
         min: [0, 'Price cannot be negative'],
     },
+    // Per-billing-cycle list prices in rupees, BEFORE GST (PRICING_PACKAGING §3).
+    // null / missing = the plan does not sell that cycle. `price` above stays
+    // the MONTHLY list price for every older reader (MRR, sorting, public
+    // listing); when `prices.monthly` is set the two should agree.
+    prices: {
+        monthly:  { type: Number, default: null, min: [0, 'Price cannot be negative'] },
+        annual:   { type: Number, default: null, min: [0, 'Price cannot be negative'] },
+        biennial: { type: Number, default: null, min: [0, 'Price cannot be negative'] },
+    },
     currency: {
         type: String,
         default: 'INR',
@@ -143,11 +153,34 @@ const subscriptionPlanSchema = new mongoose.Schema({
     // references this plan. We do not create a Razorpay plan eagerly
     // at seed time because free plans (price: 0) don't need one and
     // a Razorpay account may not be configured in dev.
+    // The MONTHLY Razorpay plan id (older readers) — mirrors razorpayPlanIds.monthly.
     razorpayPlanId: {
         type: String,
         default: '',
     },
+    // One Razorpay plan per billing cycle (Razorpay plans are immutable, so a
+    // price change needs a NEW plan). razorpayPlanAmounts records the paise the
+    // id was created at; utils/razorpayBilling re-creates the id whenever the
+    // expected GST-inclusive amount differs (stale-price guard).
+    razorpayPlanIds: {
+        monthly:  { type: String, default: '' },
+        annual:   { type: String, default: '' },
+        biennial: { type: String, default: '' },
+    },
+    razorpayPlanAmounts: {
+        monthly:  { type: Number, default: null },
+        annual:   { type: Number, default: null },
+        biennial: { type: Number, default: null },
+    },
 }, { timestamps: true });
+
+// Base price (rupees, excl. GST) for a billing cycle, or null if not sold.
+subscriptionPlanSchema.methods.priceFor = function (cycle) {
+    return priceForPlan(this, cycle);
+};
+subscriptionPlanSchema.methods.cycles = function () {
+    return availableCycles(this);
+};
 
 subscriptionPlanSchema.index({ isActive: 1, sortOrder: 1 });
 

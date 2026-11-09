@@ -666,3 +666,80 @@ exports.customerPasswordReset = ({ customerName, resetUrl, restaurantName, expir
 
     return { subject, html, text };
 };
+
+/**
+ * Free-trial countdown reminder (7 / 3 / 1 days left).
+ * Props: { restaurantName, ownerName, daysLeft, trialEndDate, upgradeUrl }
+ */
+exports.trialEndingSoon = ({ restaurantName, ownerName, daysLeft, trialEndDate, upgradeUrl }) => {
+    const dayWord = daysLeft === 1 ? 'day' : 'days';
+    const endText = trialEndDate ? new Date(trialEndDate).toUTCString().slice(0, 16) : '';
+    const subject = `Your BestoDine free trial ends in ${daysLeft} ${dayWord}`;
+    const html = simpleEmailHtml(subject, `
+        <h2 style="margin:0 0 12px;font-size:20px;">Hi ${escapeHtml(ownerName || 'there')},</h2>
+        <p style="margin:0 0 16px;">The free trial for <strong>${escapeHtml(restaurantName)}</strong> ends in
+        <strong>${daysLeft} ${dayWord}</strong>${endText ? ` (${escapeHtml(endText)})` : ''}.</p>
+        <p style="margin:0 0 16px;">Choose a plan now to keep taking orders without interruption. After the trial your account is paused, but your data stays safe.</p>
+        <p style="margin:0 0 16px;"><a href="${escapeHtml(upgradeUrl)}" style="display:inline-block;background-color:#FE8301;color:#FFFFFF;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:10px;">Choose a plan</a></p>
+        <p style="margin:0;font-size:13px;color:#8D848F;">Questions? Just reply to this email.</p>`);
+    const text = [
+        `Hi ${ownerName || 'there'},`,
+        '',
+        `The free trial for "${restaurantName}" ends in ${daysLeft} ${dayWord}${endText ? ` (${endText})` : ''}.`,
+        'Choose a plan now to keep taking orders without interruption. After the trial your account is paused, but your data stays safe.',
+        '',
+        `Choose a plan: ${upgradeUrl}`,
+        '',
+        '- The BestoDine Team',
+    ].join('\n');
+    return { subject, html, text };
+};
+
+/** Free trial ended (account locked, data kept). Props: { restaurantName, ownerName, upgradeUrl } */
+exports.trialEnded = ({ restaurantName, ownerName, upgradeUrl }) => {
+    const subject = `Your BestoDine free trial has ended - ${restaurantName}`;
+    const html = simpleEmailHtml(subject, `
+        <h2 style="margin:0 0 12px;font-size:20px;">Hi ${escapeHtml(ownerName || 'there')},</h2>
+        <p style="margin:0 0 16px;">The free trial for <strong>${escapeHtml(restaurantName)}</strong> has ended, so ordering and the staff apps are paused.
+        <strong>None of your data was deleted</strong>: pick a plan and everything comes back instantly.</p>
+        <p style="margin:0 0 16px;"><a href="${escapeHtml(upgradeUrl)}" style="display:inline-block;background-color:#FE8301;color:#FFFFFF;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:10px;">Upgrade and restore access</a></p>
+        <p style="margin:0;font-size:13px;color:#8D848F;">You can still log in as the owner to upgrade or export your data.</p>`);
+    const text = [
+        `Hi ${ownerName || 'there'},`,
+        '',
+        `The free trial for "${restaurantName}" has ended, so ordering and the staff apps are paused. None of your data was deleted: pick a plan and everything comes back instantly.`,
+        '',
+        `Upgrade: ${upgradeUrl}`,
+        '',
+        '- The BestoDine Team',
+    ].join('\n');
+    return { subject, html, text };
+};
+
+/**
+ * Renewal reminder for a paid term that does not auto-renew (annual / 2-year
+ * prepay, or one-time-Order payers).
+ * Props: { restaurantName, ownerName, planName, billingCycle, daysLeft, periodEnd, renewUrl }
+ */
+exports.renewalReminder = ({ restaurantName, ownerName, planName, billingCycle, daysLeft, periodEnd, renewUrl }) => {
+    const dayWord = daysLeft === 1 ? 'day' : 'days';
+    const term = { monthly: 'monthly', annual: 'annual', biennial: '2-year' }[billingCycle] || 'monthly';
+    const endText = periodEnd ? new Date(periodEnd).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : '';
+    const subject = `Your ${planName || 'BestoDine'} plan renews in ${daysLeft} ${dayWord} - ${restaurantName}`;
+    const html = simpleEmailHtml(subject, `
+        <h2 style="margin:0 0 12px;font-size:20px;">Hi ${escapeHtml(ownerName || 'there')},</h2>
+        <p style="margin:0 0 16px;">Your ${escapeHtml(term)} <strong>${escapeHtml(planName || 'BestoDine')}</strong> plan for <strong>${escapeHtml(restaurantName)}</strong> ends in <strong>${daysLeft} ${dayWord}</strong>${endText ? ` (${escapeHtml(endText)})` : ''}.
+        It does not renew automatically, so renew now to keep taking orders without interruption. The price stays the same.</p>
+        <p style="margin:0 0 16px;"><a href="${escapeHtml(renewUrl)}" style="display:inline-block;background-color:#FE8301;color:#FFFFFF;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:10px;">Renew my plan</a></p>
+        <p style="margin:0;font-size:13px;color:#8D848F;">Renewing early never loses days: the new term starts when the current one ends.</p>`);
+    const text = [
+        `Hi ${ownerName || 'there'},`,
+        '',
+        `Your ${term} ${planName || 'BestoDine'} plan for "${restaurantName}" ends in ${daysLeft} ${dayWord}${endText ? ` (${endText})` : ''}. It does not renew automatically; renew now to keep taking orders. The price stays the same.`,
+        '',
+        `Renew: ${renewUrl}`,
+        '',
+        '- The BestoDine Team',
+    ].join('\n');
+    return { subject, html, text };
+};

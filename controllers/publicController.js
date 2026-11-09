@@ -14,13 +14,19 @@ const { isReservedSlug, checkExplicitRestaurantSlug } = require('../utils/reserv
 const mongoose = require('mongoose');
 const Settings = require('../models/settings');
 const { sendEmail } = require('../utils/email');
-const { signupApplicationReceived, signupAdminAlert } = require('../utils/emailTemplates');
+const { signupApplicationReceived, signupAdminAlert, restaurantSelfSignupWelcome } = require('../utils/emailTemplates');
 const { resolveRecipients: resolveAlertRecipients } = require('../utils/alerts');
 const { isStrongPassword, STRONG_PASSWORD_MESSAGE } = require('../utils/passwordPolicy');
 const { normalizeMobile } = require('../utils/mobile');
 const { slugify, slugFromName, slugIssue, suggestSlugs } = require('../utils/signupSlug');
 const { getPublicPlans } = require('../utils/publicPlans');
-const { SELF_SIGNUP_TRIAL_DAYS } = require('../utils/selfSignup');
+const {
+    SELF_SIGNUP_TRIAL_DAYS,
+    normalizeEmailForSignup,
+    normalizePhoneForSignup,
+    signupRequiresApproval,
+    findSignupDuplicate,
+} = require('../utils/selfSignup');
 
 // ─── Shared validation helpers (mirrors superadminController) ──────────
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -247,25 +253,33 @@ exports.getRestaurantBranches = async (req, res) => {
  *
  * Self-service tenant signup. Unauthenticated endpoint that creates a
  * Restaurant + owner User in one atomic-ish operation. The owner
- * supplies their own password during signup; the tenant stays
- * suspended (signupStatus 'pending') until a Super Admin approves it,
- * and staff login answers 403 SIGNUP_PENDING until then.
+ * supplies their own password during signup. INSTANT START (default): the
+ * tenant is created `status: 'trial'` with a 14-day Gold trial that starts
+ * now, and the response logs the owner in (201 + tokens). With
+ * SELF_SIGNUP_REQUIRE_APPROVAL=true the old flow is used: the tenant stays
+ * suspended (signupStatus 'pending') until a Super Admin approves it, and
+ * staff login answers 403 SIGNUP_PENDING until then (202, no tokens).
  *
  * Flow:
  *   1. Validate input (restaurantName, ownerName, contactEmail, 10-digit
  *      mobile, city, strong password — utils/passwordPolicy,
  *      acceptTerms === true, optional public planId, source/utm)
- *   2. Resolve a default plan (first active plan with price === 0,
- *      or explicitly slug === 'free')
- *   3. Conflict check: slug uniqueness, email uniqueness
+ *   2. Resolve the trial plan (Gold, or SELF_SIGNUP_TRIAL_PLAN)
+ *   3. Conflict check: slug uniqueness, email + phone uniqueness
+ *      (aliases normalised - utils/selfSignup)
  *   4. Create Restaurant with N-day trial (default 14)
  *   5. Create owner User (role: 'admin') with user-supplied password
  *   6. Link owner → restaurant
  *   7. Write a system audit entry (actor=null, role=system)
- *   8. Fire-and-forget "application received" email to the owner and a
- *      new-signup alert to Super Admins (welcome email goes on approval)
- *   9. 202 { restaurant, owner, signupStatus, pageUrl, message } — NOT a
- *      token. After approval the owner logs in at /staff-login.
+ *   8. Fire-and-forget welcome email (instant) or "application received"
+ *      email (approval mode) to the owner and a new-signup alert to Super
+ *      Admins
+ *   9. Instant: 201 { success, data: { ..., signupStatus: 'approved',
+ *      trialStarted: true, autoLogin: true, trialStartDate, trialEndDate },
+ *      ...login body (user payload + tenant, token, refreshToken) }.
+ *      Approval mode: 202 { restaurant, owner, signupStatus: 'pending',
+ *      pageUrl, message } — NOT a token; after approval the owner logs in
+ *      at /staff-login.
  *
  * Anti-abuse: the route this handler is mounted on carries a dedicated
  * rate limiter (server.js: `signupLimiter` — 3 requests per hour per
@@ -345,16 +359,14 @@ exports.registerRestaurant = async (req, res) => {
         const signupMeta = buildSignupMeta(body, { ownerName: cleanOwner, ip: req.ip });
 
         // ── Resolve default plan ───────────────────────────────────────
-        // Prefer a plan explicitly slug'd 'free'; then the trial plan
-        // (Gold — "14 days of Gold", PRICING_PACKAGING §3); then the
-        // cheapest active plan that has a list price. Enterprise is priced
+        // The trial plan is Gold ("14 days of Gold", PRICING_PACKAGING §3;
+        // SELF_SIGNUP_TRIAL_PLAN overrides). No 'free' slug lookup — a stray
+        // plan named free must never decide what every trial gets. Fallback:
+        // the cheapest active plan that has a list price. Enterprise is priced
         // 0 because it is quoted, so a plain cheapest-first pick handed
         // every trial the full Enterprise module set. If no plans exist at
         // all, the platform isn't set up yet — 503 and let the operator know.
-        let plan = await SubscriptionPlan.findOne({ slug: 'free', isActive: true });
-        if (!plan) {
-            plan = await SubscriptionPlan.findOne({ slug: SELF_SIGNUP_TRIAL_PLAN_SLUG, isActive: true });
-        }
+        let plan = await SubscriptionPlan.findOne({ slug: SELF_SIGNUP_TRIAL_PLAN_SLUG, isActive: true });
         if (!plan) {
             plan = await SubscriptionPlan.findOne({ isActive: true, price: { $gt: 0 } }).sort({ price: 1 });
         }
@@ -405,10 +417,17 @@ exports.registerRestaurant = async (req, res) => {
                 'An account with this email already exists. Log in or use another email.', 'EMAIL_IN_USE');
         }
 
-        // ── Build subscription snapshot ────────────────────────────────
-        // Trial dates are pre-computed; the tenant stays suspended until
-        // a Super Admin approves the signup.
-        // Provisional — approveSignup restarts the trial from the approval date.
+        // One trial per person: a Gmail dot/+tag alias of a registered
+        // email, or a phone already on a restaurant, is refused.
+        const duplicate = await findSignupDuplicate(Restaurant, { email: cleanEmail, phone: cleanPhone });
+        if (duplicate) return fail(409, duplicate.field, duplicate.message, duplicate.code);
+
+        // ── Build subscription snapshot ────────────────────────────────────────
+        // Instant start: the 14-day clock starts NOW and the tenant is live.
+        // Approval mode (SELF_SIGNUP_REQUIRE_APPROVAL=true): the dates are
+        // provisional — approveSignup restarts the trial from the approval
+        // date and the tenant stays suspended until then.
+        const needsApproval = signupRequiresApproval();
         const TRIAL_DAYS = SELF_SIGNUP_TRIAL_DAYS;
         const startDate = new Date();
         const trialEndDate = new Date(startDate.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
@@ -425,32 +444,61 @@ exports.registerRestaurant = async (req, res) => {
                 : {},
             startDate,
             endDate: null,
+            trialStartDate: startDate,
             trialEndDate,
             status: 'trial',
         };
 
-        // ── Create restaurant (PENDING APPROVAL) ───────────────────────
-        // signupSource='self' + signupStatus='pending' tags this for the
-        // Super Admin's Pending Approvals queue. status='suspended' keeps
-        // staff locked out until the operator clicks Approve (staff login
-        // answers 403 SIGNUP_PENDING meanwhile).
-        const restaurant = await Restaurant.create({
-            name: cleanName,
-            slug,
-            contactEmail: cleanEmail,
-            contactPhone: cleanPhone,
-            city: cleanCity,
-            status: 'suspended',
-            signupSource: 'self',
-            signupStatus: 'pending',
-            suspendedAt: new Date(),
-            suspendedReason: 'Awaiting Super Admin approval',
-            subscription: snapshot,
-            ...(requestedPlan ? {
-                requestedPlan: { plan: requestedPlan._id, planName: requestedPlan.name, planSlug: requestedPlan.slug },
-            } : {}),
-            signupMeta,
-        });
+        // ── Create restaurant ──────────────────────────────────────
+        // signupSource='self' tags it as a self-service signup. Instant start:
+        // status 'trial' + signupStatus 'approved', usable at once (the Super
+        // Admin can still suspend it later). Approval mode: signupStatus
+        // 'pending' lands it in the Pending Approvals queue and
+        // status='suspended' keeps staff locked out until the operator clicks
+        // Approve (staff login answers 403 SIGNUP_PENDING meanwhile).
+        let restaurant;
+        try {
+            restaurant = await Restaurant.create({
+                name: cleanName,
+                slug,
+                contactEmail: cleanEmail,
+                contactPhone: cleanPhone,
+                contactEmailNormalized: normalizeEmailForSignup(cleanEmail),
+                contactPhoneNormalized: normalizePhoneForSignup(cleanPhone),
+                city: cleanCity,
+                ...(needsApproval ? {
+                    status: 'suspended',
+                    signupStatus: 'pending',
+                    suspendedAt: new Date(),
+                    suspendedReason: 'Awaiting Super Admin approval',
+                } : {
+                    status: 'trial',
+                    signupStatus: 'approved',
+                    signupReviewedAt: startDate,
+                }),
+                signupSource: 'self',
+                subscription: snapshot,
+                ...(requestedPlan ? {
+                    requestedPlan: { plan: requestedPlan._id, planName: requestedPlan.name, planSlug: requestedPlan.slug },
+                } : {}),
+                signupMeta,
+            });
+        } catch (createErr) {
+            // A concurrent duplicate signup lost the race on a unique index.
+            if (createErr?.code === 11000) {
+                const key = Object.keys(createErr.keyPattern || {})[0] || '';
+                if (key === 'contactPhoneNormalized') {
+                    return fail(409, 'contactPhone',
+                        'A restaurant is already registered with this mobile number. Log in or use another number.', 'PHONE_IN_USE');
+                }
+                if (key === 'slug') {
+                    return fail(409, 'slug', 'This restaurant URL is already taken. Please choose another.', 'SLUG_TAKEN');
+                }
+                return fail(409, 'contactEmail',
+                    'An account with this email already exists. Log in or use another email.', 'EMAIL_IN_USE');
+            }
+            throw createErr;
+        }
 
         // ── Create owner user ──────────────────────────────────────────
         // Roll back the restaurant if user creation fails, so we don't
@@ -504,6 +552,7 @@ exports.registerRestaurant = async (req, res) => {
                     plan: plan.slug,
                     requestedPlan: requestedPlan?.slug || '',
                     trialDays: TRIAL_DAYS,
+                    instantStart: !needsApproval,
                     ownerEmail: cleanEmail,
                     source: signupMeta.source,
                 },
@@ -522,11 +571,47 @@ exports.registerRestaurant = async (req, res) => {
             ownerName: cleanOwner,
             requestedPlanName: requestedPlan?.name || '',
             source: signupMeta.source || signupMeta.utmSource,
+            instant: !needsApproval,
+            trialDays: TRIAL_DAYS,
         });
 
-        logger.info(`self-signup PENDING ${restaurant.slug} (${cleanEmail})`);
-
         const pageUrl = `${frontendBase()}/${restaurant.slug}`;
+
+        if (!needsApproval) {
+            logger.info(`self-signup TRIAL STARTED ${restaurant.slug} (${cleanEmail})`);
+            const message = `Welcome to BestoDine! Your ${TRIAL_DAYS}-day free trial of ${plan.name} has started.`;
+            // Same body a login returns (user + tenant snapshot + token /
+            // refreshToken, or cookie-auth hints) so the SPA can sign the
+            // owner in without a second request. A session failure must not
+            // lose the signup: the owner can still log in at /staff-login.
+            let session = {};
+            try {
+                session = await require('./authController').issueSignupSession(req, res, ownerUser);
+            } catch (sessErr) {
+                logger.warn(`self-signup auto-login failed for ${restaurant.slug}: ${sessErr.message}`);
+            }
+            return res.status(201).json({
+                success: true,
+                data: {
+                    restaurant: { _id: restaurant._id, name: restaurant.name, slug: restaurant.slug },
+                    owner: { _id: ownerUser._id, name: ownerUser.name, email: ownerUser.email },
+                    signupStatus: 'approved',
+                    trialStarted: true,
+                    autoLogin: !!(session.token || session.cookieAuth),
+                    trialStartDate: startDate,
+                    trialEndDate,
+                    trialDays: TRIAL_DAYS,
+                    planName: plan.name,
+                    pageUrl,
+                    requestedPlan: requestedPlan ? { _id: requestedPlan._id, name: requestedPlan.name } : null,
+                    message,
+                },
+                message,
+                ...session,
+            });
+        }
+
+        logger.info(`self-signup PENDING ${restaurant.slug} (${cleanEmail})`);
         const message = `Thanks for signing up! Your application is being reviewed — usually within 1 business day. We'll email ${cleanEmail} once it's approved.`;
         return res.status(202).json({
             success: true,
@@ -584,17 +669,26 @@ function buildSignupMeta(body, { ownerName, ip }) {
 }
 
 /** Owner "application received" + Super Admin alert. Never throws. */
-function notifySignupReceived({ restaurant, ownerName, requestedPlanName, source }) {
+function notifySignupReceived({ restaurant, ownerName, requestedPlanName, source, instant = false, trialDays }) {
     setImmediate(async () => {
         try {
             await sendEmail({
                 to: restaurant.contactEmail,
-                ...signupApplicationReceived({
-                    restaurantName: restaurant.name,
-                    ownerName,
-                    email: restaurant.contactEmail,
-                    slug: restaurant.slug,
-                }),
+                ...(instant
+                    ? restaurantSelfSignupWelcome({
+                        restaurantName: restaurant.name,
+                        ownerName,
+                        email: restaurant.contactEmail,
+                        planName: restaurant.subscription?.planName || '',
+                        trialDays,
+                        slug: restaurant.slug,
+                    })
+                    : signupApplicationReceived({
+                        restaurantName: restaurant.name,
+                        ownerName,
+                        email: restaurant.contactEmail,
+                        slug: restaurant.slug,
+                    })),
             });
         } catch (e) {
             logger.warn(`self-signup application email failed for ${restaurant.contactEmail}: ${e.message}`);

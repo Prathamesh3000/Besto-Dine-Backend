@@ -80,7 +80,7 @@ beforeAll(async () => {
             limits: { maxBranches: 1, maxTables: 2, maxStaff: 4, maxMenuItems: 3 },
         }),
         pro: await SubscriptionPlan.create({
-            name: 'Pro', slug: 'pro-sb', price: 1999, sortOrder: 2, razorpayPlanId: 'plan_pro_rzp',
+            name: 'Pro', slug: 'pro-sb', price: 1999, sortOrder: 2, razorpayPlanId: 'plan_pro_rzp', razorpayPlanIds: { monthly: 'plan_pro_rzp' }, razorpayPlanAmounts: { monthly: 235882 },
             features: { dineIn: true, takeaway: true, crm: true, inventory: true, multiBranch: true, revenueAnalytics: 'advanced' },
             limits: { maxBranches: 3, maxTables: 50, maxStaff: 20, maxMenuItems: 400 },
         }),
@@ -185,13 +185,13 @@ describe('POST /tenant/billing/upgrade', () => {
         const res = await owner(t).post('/tenant/billing/upgrade').send({ planId: String(plans.premium._id) });
         expect(res.status).toBe(200);
         expect(res.body.data.billing).toMatchObject({
-            fallbackOrder: true, orderId: 'order_fb_A', amount: 299900, currency: 'INR',
+            fallbackOrder: true, orderId: 'order_fb_A', amount: 353882, currency: 'INR',
             key: process.env.RAZORPAY_KEY_ID, status: 'pending_payment',
         });
         const args = rzp.instance.orders.create.mock.calls[0][0];
-        expect(args.amount).toBe(299900);
+        expect(args.amount).toBe(353882);
         expect(args.notes).toMatchObject({
-            type: 'plan_payment', restaurantId: String(t.restaurant._id), planSlug: 'premium-sb', planName: 'Premium',
+            type: 'plan_payment', restaurantId: String(t.restaurant._id), planSlug: 'premium-sb', planName: 'Premium', billingCycle: 'monthly',
         });
         expect(rzp.instance.subscriptions.create).not.toHaveBeenCalled();
         const s = await sub(t);
@@ -258,7 +258,7 @@ describe('POST /tenant/billing/upgrade/verify — amount / order binding', () =>
 
     test('full payment → plan applied, invoice in PAISE, listed + downloadable', async () => {
         const t = await startFallbackUpgrade('vok', 'order_vok');
-        const res = await verify(t, { orderId: 'order_vok', paymentId: 'pay_vok', amount: 299900 });
+        const res = await verify(t, { orderId: 'order_vok', paymentId: 'pay_vok', amount: 353882 });
         expect(res.status).toBe(200);
         expect(res.body.data).toMatchObject({ upgradeApplied: true, alreadyInvoiced: false });
         expect(res.body.data.invoiceNumber).toMatch(/^INV-\d{8}-0001$/);
@@ -269,13 +269,13 @@ describe('POST /tenant/billing/upgrade/verify — amount / order binding', () =>
         expect(s.pendingUpgrade?.planSlug).toBeFalsy();
 
         const inv = await SubscriptionInvoice.findOne({ razorpayPaymentId: 'pay_vok' }).lean();
-        expect(inv).toMatchObject({ amount: 299900, currency: 'INR', planSlug: 'premium-sb', status: 'paid' });
+        expect(inv).toMatchObject({ amount: 353882, baseAmount: 299900, gstAmount: 53982, gstRate: 18, billingCycle: 'monthly', currency: 'INR', planSlug: 'premium-sb', status: 'paid' });
         expect(String(inv.restaurant)).toBe(String(t.restaurant._id));
 
         const list = await owner(t).get('/tenant/billing/invoices');
         expect(list.status).toBe(200);
         expect(list.body.data).toHaveLength(1);
-        expect(list.body.data[0]).toMatchObject({ amount: 299900, planName: 'Premium', invoiceNumber: inv.invoiceNumber });
+        expect(list.body.data[0]).toMatchObject({ amount: 353882, planName: 'Premium', invoiceNumber: inv.invoiceNumber });
         expect(list.body.data[0]).not.toHaveProperty('razorpayPaymentId');
 
         const pdf = await owner(t).get(`/tenant/billing/invoices/${inv._id}/download`);
@@ -284,7 +284,7 @@ describe('POST /tenant/billing/upgrade/verify — amount / order binding', () =>
         expect(pdf.headers['content-disposition']).toContain(`${inv.invoiceNumber}.pdf`);
 
         // Replay → idempotent
-        const again = await verify(t, { orderId: 'order_vok', paymentId: 'pay_vok', amount: 299900 });
+        const again = await verify(t, { orderId: 'order_vok', paymentId: 'pay_vok', amount: 353882 });
         expect(again.body.data).toMatchObject({ alreadyInvoiced: true, upgradeApplied: false });
         expect(await SubscriptionInvoice.countDocuments({ restaurant: t.restaurant._id })).toBe(1);
     });
@@ -311,7 +311,7 @@ describe('POST /tenant/billing/upgrade/verify — amount / order binding', () =>
 
     test('non-captured payment → 409, nothing applied', async () => {
         const t = await startFallbackUpgrade('vauth', 'order_vauth');
-        const res = await verify(t, { orderId: 'order_vauth', paymentId: 'pay_vauth', amount: 299900, status: 'authorized' });
+        const res = await verify(t, { orderId: 'order_vauth', paymentId: 'pay_vauth', amount: 353882, status: 'authorized' });
         expect(res.status).toBe(409);
         expect((await sub(t)).planSlug).toBe('basic-sb');
     });
@@ -409,7 +409,7 @@ describe('POST /tenant/billing/sync', () => {
             { payment_id: 'pay_unpaid', status: 'issued' },
         ] });
         rzp.instance.payments.fetch.mockImplementation(async (id) => ({
-            id, amount: 199900, currency: 'INR', status: 'captured', created_at: Math.floor(Date.now() / 1000),
+            id, amount: 235882, currency: 'INR', status: 'captured', created_at: Math.floor(Date.now() / 1000),
         }));
 
         const res = await owner(t).post('/tenant/billing/sync').send({});
@@ -421,7 +421,7 @@ describe('POST /tenant/billing/sync', () => {
         expect(s).toMatchObject({ planSlug: 'pro-sb', razorpaySubscriptionId: 'sub_sync1', razorpayStatus: 'active', shortUrl: '', razorpayCustomerId: 'cust_sync1' });
         expect(new Date(s.currentPeriodEnd).getTime()).toBe(currentEnd * 1000);
         const inv = await SubscriptionInvoice.findOne({ razorpayPaymentId: 'pay_sync1' }).lean();
-        expect(inv.amount).toBe(199900);
+        expect(inv.amount).toBe(235882);
 
         const again = await owner(t).post('/tenant/billing/sync').send({});
         expect(again.body.data.invoicesCreated).toBe(0);

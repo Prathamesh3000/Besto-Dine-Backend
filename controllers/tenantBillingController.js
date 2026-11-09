@@ -50,6 +50,15 @@ const {
 } = require('../utils/razorpayBilling');
 const { applyPaidPlanUpgrade, applyScheduledDowngrade } = require('../utils/planPaymentApply');
 const { streamInvoicePdf } = require('../utils/invoicePdf');
+const {
+    CYCLE_KEYS, isCycle, normalizeCycle, gstRate, priceWithGst,
+    monthlyEquivalent, priceForPlan, buildCycleRows,
+} = require('../utils/billingCycles');
+
+// A prepaid term (annual / biennial) can be renewed or re-cycled this long
+// before it ends; earlier than that the term is locked (TERM_ACTIVE).
+const RENEWAL_WINDOW_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function safeEqual(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -66,11 +75,31 @@ function buildPlanCard(plan) {
         slug: plan.slug,
         description: plan.description || '',
         price: plan.price,
+        prices: {
+            monthly:  priceForPlan(plan, 'monthly'),
+            annual:   priceForPlan(plan, 'annual'),
+            biennial: priceForPlan(plan, 'biennial'),
+        },
+        gstRate: gstRate(),
+        cycles: buildCycleRows(plan),
         billingCycle: plan.billingCycle,
         features: plan.features || {},
         limits: plan.limits || {},
         sortOrder: plan.sortOrder || 0,
     };
+}
+
+// Is the tenant inside a prepaid (annual / biennial) term that has not ended?
+function prepaidTermActive(sub, now = new Date()) {
+    return normalizeCycle(sub?.billingCycle) !== 'monthly'
+        && !!sub?.currentPeriodEnd
+        && new Date(sub.currentPeriodEnd) > now;
+}
+
+// Does Razorpay still auto-renew this tenant (a live recurring subscription)?
+function hasAutoRenewSub(sub) {
+    return !!sub?.razorpaySubscriptionId
+        && ['created', 'authenticated', 'active', 'pending'].includes(sub?.razorpayStatus || '');
 }
 
 /**
@@ -127,8 +156,17 @@ exports.getCurrentSubscription = async (req, res) => {
                     planSlug: sub.planSlug || '',
                     status: sub.status || '',
                     startDate: sub.startDate || null,
+                    trialStartDate: sub.trialStartDate || null,
                     trialEndDate: sub.trialEndDate || null,
                     currentPeriodEnd: sub.currentPeriodEnd || null,
+                    billingCycle: normalizeCycle(sub.billingCycle),
+                    price: typeof sub.price === 'number' ? sub.price : null,
+                    gstRate: gstRate(),
+                    // Prepaid terms lock plan / cycle changes until this date
+                    // (30 days before the end). null for monthly tenants.
+                    renewalWindowOpensAt: prepaidTermActive(sub)
+                        ? new Date(new Date(sub.currentPeriodEnd).getTime() - RENEWAL_WINDOW_DAYS * DAY_MS)
+                        : null,
                     lastChargedAt: sub.lastChargedAt || null,
                     razorpayStatus: sub.razorpayStatus || '',
                     // Decision 5 (2026-10): when a halted subscription will
@@ -156,6 +194,9 @@ exports.getCurrentSubscription = async (req, res) => {
                     ? {
                         planName: pending.planName || '',
                         planSlug: pending.planSlug || '',
+                        billingCycle: normalizeCycle(pending.billingCycle),
+                        price: typeof pending.price === 'number' ? pending.price : null,
+                        renewal: pending.renewal === true,
                         shortUrl: pending.shortUrl || '',
                         razorpaySubscriptionId: pending.razorpaySubscriptionId || '',
                         razorpayOrderId: pending.razorpayOrderId || '',
@@ -240,6 +281,8 @@ exports.getAvailablePlans = async (req, res) => {
             success: true,
             data: {
                 currentPlanSlug: currentSlug,
+                currentBillingCycle: normalizeCycle(req.restaurant.subscription?.billingCycle),
+                gstRate: gstRate(),
                 plans: plans.map(buildPlanCard),
             },
         });
@@ -268,6 +311,16 @@ exports.upgradePlan = async (req, res) => {
         if (!planId || !mongoose.isValidObjectId(planId)) {
             return res.status(400).json({ success: false, message: 'Invalid plan id' });
         }
+        // Billing cycle the owner picks at checkout; omitted = monthly (old clients).
+        const rawCycle = req.body?.billingCycle;
+        if (rawCycle !== undefined && rawCycle !== null && rawCycle !== '' && !isCycle(rawCycle)) {
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_CYCLE',
+                message: `billingCycle must be one of: ${CYCLE_KEYS.join(', ')}.`,
+            });
+        }
+        const cycle = normalizeCycle(rawCycle);
 
         // Reload the tenant fresh — req.restaurant is a snapshot from
         // the middleware, and we're about to mutate it.
@@ -284,12 +337,66 @@ exports.upgradePlan = async (req, res) => {
 
         // ── Reject nonsense transitions ─────────────────────────────
         const currentSlug = restaurant.subscription?.planSlug || '';
-        if (plan.slug === currentSlug) {
+        const cyclePrice = priceForPlan(plan, cycle);   // base, excl. GST
+        if (cyclePrice === null && plan.price > 0) {
             return res.status(400).json({
                 success: false,
-                code: 'SAME_PLAN',
-                message: `You're already on the ${plan.name} plan.`,
+                code: 'CYCLE_NOT_AVAILABLE',
+                message: `${plan.name} is not available with ${cycle} billing.`,
             });
+        }
+
+        // Term rules (no proration, no credits):
+        //  - Inside a PREPAID term (annual / biennial, not yet ended) nothing
+        //    can change until the renewal window opens (30 days before the
+        //    end), and then only the SAME plan may be renewed / re-cycled; the
+        //    new term is added after the current one. A different plan waits
+        //    for the term end (TERM_ACTIVE): upgrades are never granted for
+        //    free and money already paid is never forfeited.
+        //  - Monthly (or lapsed) tenants keep the old behaviour: a new plan
+        //    starts now. The same plan on a different cycle (e.g. monthly ->
+        //    annual) is allowed immediately, with no credit for the unused
+        //    part of the paid month. Without a live auto-renew subscription
+        //    (one-time Order payers) a same-plan purchase near the end, or a
+        //    cycle change, is a renewal that extends the paid term.
+        const sub0 = restaurant.subscription || {};
+        const now = new Date();
+        const samePlan = plan.slug === currentSlug;
+        const periodEnd0 = sub0.currentPeriodEnd ? new Date(sub0.currentPeriodEnd) : null;
+        const inWindow = !!periodEnd0 && (periodEnd0.getTime() - now.getTime()) <= RENEWAL_WINDOW_DAYS * DAY_MS;
+        let renewal = false;
+        if (prepaidTermActive(sub0, now)) {
+            if (!samePlan || !inWindow) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'TERM_ACTIVE',
+                    message: samePlan
+                        ? `Your ${sub0.planName} ${normalizeCycle(sub0.billingCycle)} term runs until ${periodEnd0.toLocaleDateString('en-IN')}. You can renew or change the billing cycle from ${new Date(periodEnd0.getTime() - RENEWAL_WINDOW_DAYS * DAY_MS).toLocaleDateString('en-IN')}.`
+                        : `Your ${sub0.planName} ${normalizeCycle(sub0.billingCycle)} term is prepaid until ${periodEnd0.toLocaleDateString('en-IN')}. You can switch plans after it ends, or contact support.`,
+                    data: {
+                        currentPeriodEnd: periodEnd0,
+                        renewalWindowOpensAt: new Date(periodEnd0.getTime() - RENEWAL_WINDOW_DAYS * DAY_MS),
+                    },
+                });
+            }
+            renewal = true;
+        } else if (samePlan) {
+            const sameCycle = cycle === normalizeCycle(sub0.billingCycle);
+            if (['trial', 'expired', 'past_due'].includes(sub0.status)) {
+                // Trial owners buy the plan they trialled; a past-due tenant
+                // pays for a fresh term. Starts now.
+                renewal = false;
+            } else if (!hasAutoRenewSub(sub0) && periodEnd0 && (inWindow || !sameCycle)) {
+                renewal = periodEnd0 > now;
+            } else if (!sameCycle) {
+                renewal = false;
+            } else {
+                return res.status(400).json({
+                    success: false,
+                    code: 'SAME_PLAN',
+                    message: `You're already on the ${plan.name} plan.`,
+                });
+            }
         }
         if (plan.price <= 0) {
             return res.status(400).json({
@@ -309,10 +416,14 @@ exports.upgradePlan = async (req, res) => {
         if (currentPlanId) {
             const currentPlanDoc = await SubscriptionPlan.findById(currentPlanId).select('name price');
             // Judge against what the tenant actually pays (snapshot),
-            // not the possibly-edited catalogue price.
+            // not the possibly-edited catalogue price. Normalised to a
+            // MONTHLY equivalent so an annual price (12 months in one number)
+            // is never compared raw against a monthly list price.
             const snapPrice = restaurant.subscription?.price;
-            const currentPrice = typeof snapPrice === 'number' ? snapPrice : (currentPlanDoc?.price ?? 0);
-            if (currentPrice > 0 && plan.price < currentPrice) {
+            const currentPrice = typeof snapPrice === 'number'
+                ? monthlyEquivalent(snapPrice, restaurant.subscription?.billingCycle)
+                : (currentPlanDoc?.price ?? 0);
+            if (!samePlan && currentPrice > 0 && plan.price < currentPrice) {
                 return res.status(400).json({
                     success: false,
                     code: 'DOWNGRADE_NOT_SUPPORTED',
@@ -422,18 +533,23 @@ exports.upgradePlan = async (req, res) => {
         let fallbackOrderFlag = false;
         let customerId = previousCustomerId;
         try {
-            try {
-                await ensureRazorpayPlan(plan);
-            } catch (planErr) {
-                if (planErr?.statusCode !== 401) throw planErr;
-                // 401 → Subscriptions not enabled; fall through to
-                // createRazorpaySubscription which handles the fallback.
+            // A renewal extends the CURRENT term, so it is a one-time Order
+            // (no recurring subscription whose first charge/period would
+            // overlap the days already paid for).
+            if (!renewal) {
+                try {
+                    await ensureRazorpayPlan(plan, cycle);
+                } catch (planErr) {
+                    if (planErr?.statusCode !== 401) throw planErr;
+                    // 401 → Subscriptions not enabled; fall through to
+                    // createRazorpaySubscription which handles the fallback.
+                }
             }
 
             const owner = restaurant.owner ? await User.findById(restaurant.owner) : req.user;
             customerId = await ensureRazorpayCustomer(restaurant, owner);
 
-            const sub = await createRazorpaySubscription({ plan, restaurant, customerId });
+            const sub = await createRazorpaySubscription({ plan, restaurant, customerId, cycle, forceOrder: renewal });
 
             if (sub.fallbackOrder) {
                 // Fallback: Orders API used instead of Subscriptions.
@@ -495,7 +611,9 @@ exports.upgradePlan = async (req, res) => {
             plan: plan._id,
             planName: plan.name,
             planSlug: plan.slug,
-            price: typeof plan.price === 'number' ? plan.price : 0,
+            price: cyclePrice,           // base per cycle, excl. GST
+            billingCycle: cycle,
+            renewal,
             features: plan.features?.toObject ? plan.features.toObject() : { ...(plan.features || {}) },
             limits:   plan.limits?.toObject   ? plan.limits.toObject()   : { ...(plan.limits   || {}) },
             razorpaySubscriptionId,
@@ -522,6 +640,8 @@ exports.upgradePlan = async (req, res) => {
                 details: {
                     from: previousPlanSlug,
                     to: plan.slug,
+                    billingCycle: cycle,
+                    renewal,
                     billing: billingResult,
                 },
                 ip: req.ip || req.headers['x-forwarded-for'] || '',
@@ -547,6 +667,10 @@ exports.upgradePlan = async (req, res) => {
                 pendingUpgrade: {
                     planName: plan.name,
                     planSlug: plan.slug,
+                    billingCycle: cycle,
+                    price: cyclePrice,
+                    total: priceWithGst(cyclePrice).totalPaise / 100,
+                    renewal,
                     razorpayStatus,
                     shortUrl,
                     subscriptionId: razorpaySubscriptionId,
@@ -598,6 +722,10 @@ exports.listInvoices = async (req, res) => {
                 invoiceNumber: i.invoiceNumber,
                 planName: i.planName,
                 amount: i.amount,
+                billingCycle: i.billingCycle || 'monthly',
+                baseAmount: typeof i.baseAmount === 'number' ? i.baseAmount : null,
+                gstAmount: typeof i.gstAmount === 'number' ? i.gstAmount : null,
+                gstRate: typeof i.gstRate === 'number' ? i.gstRate : null,
                 currency: i.currency,
                 periodStart: i.periodStart,
                 periodEnd: i.periodEnd,
@@ -949,6 +1077,11 @@ exports.syncFromRazorpay = async (req, res) => {
         if (preferredSub?.current_end) {
             fresh.subscription.currentPeriodEnd = new Date(preferredSub.current_end * 1000);
         }
+        // Cycle the live subscription bills (stamped in its notes at create
+        // time) - only trusted for the LIVE sub, never a still-pending one.
+        if (liveState?.sub?.notes?.billingCycle && isCycle(liveState.sub.notes.billingCycle)) {
+            fresh.subscription.billingCycle = liveState.sub.notes.billingCycle;
+        }
         if (preferredSub?.status === 'active') {
             // First charge cleared — the authorization URL is dead.
             // Clear it so the "Complete Payment" CTA stops showing.
@@ -1061,8 +1194,12 @@ exports.requestDowngrade = async (req, res) => {
         }
         // Snapshot price (what the tenant pays); catalogue only as a
         // fallback for legacy tenants without one.
+        // Normalised to a monthly equivalent (an annual snapshot is 12 months
+        // in one number) before comparing with the monthly list price.
         let currentPrice = restaurant.subscription?.price;
-        if (typeof currentPrice !== 'number') {
+        if (typeof currentPrice === 'number') {
+            currentPrice = monthlyEquivalent(currentPrice, restaurant.subscription?.billingCycle);
+        } else {
             const currentPlanDoc = restaurant.subscription?.plan
                 ? await SubscriptionPlan.findById(restaurant.subscription.plan).select('price')
                 : null;

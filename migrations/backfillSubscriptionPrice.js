@@ -38,10 +38,11 @@ const SubscriptionInvoice = require('../models/subscriptionInvoice');
     for (const t of tenants) {
         // 1. latest paid invoice amount (paise → rupees)
         const lastPaid = await SubscriptionInvoice.findOne({ restaurant: t._id, status: 'paid' })
-            .sort({ createdAt: -1 }).select('amount').lean();
+            .sort({ createdAt: -1 }).select('amount baseAmount').lean();
         let price = null;
         if (lastPaid && typeof lastPaid.amount === 'number') {
-            price = Math.round(lastPaid.amount / 100);
+            // Invoices include GST; the snapshot price is the BASE (excl. GST).
+            price = Math.round((typeof lastPaid.baseAmount === 'number' ? lastPaid.baseAmount : lastPaid.amount) / 100);
         } else if (t.subscription?.plan) {
             price = priceById.get(String(t.subscription.plan)) ?? 0;
         } else {

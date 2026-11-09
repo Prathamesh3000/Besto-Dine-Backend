@@ -167,6 +167,13 @@ const restaurantSchema = new mongoose.Schema({
         // until they're re-assigned. null = legacy tenant (fall back to live
         // plan price for metrics).
         price: { type: Number, default: null },
+        // Billing cycle `price` is for: monthly | annual (12 mo prepaid) |
+        // biennial (24 mo prepaid). `price` is the BASE amount per cycle,
+        // excl. GST (utils/billingCycles). Pre-annual tenants read as monthly.
+        billingCycle: { type: String, enum: ['monthly', 'annual', 'biennial'], default: 'monthly' },
+        // Last term whose end we emailed a renewal reminder for, as
+        // `<ISO currentPeriodEnd>:<days>` markers (utils/renewalReminderJob dedupe).
+        renewalReminderSentFor: { type: [String], default: [] },
         startDate: { type: Date, default: Date.now },
         endDate: { type: Date },                    // null = no fixed end
         trialEndDate: { type: Date },               // null = no trial
@@ -175,9 +182,16 @@ const restaurantSchema = new mongoose.Schema({
         trialStartDate: { type: Date },
         status: {
             type: String,
-            enum: ['trial', 'active', 'past_due', 'cancelled'],
+            enum: ['trial', 'active', 'past_due', 'cancelled', 'expired'],
             default: 'trial',
         },
+        // Free-trial lifecycle (utils/trialExpirySweeper, trialReminderJob).
+        // 'expired' = trial ended unpaid: tenant `status` is 'suspended',
+        // data kept, only the owner's billing screens work (utils/trialLock).
+        trialExpiredAt: { type: Date },
+        // Days-before-end thresholds (7, 3, 1) and 0 (= ended) already
+        // emailed, so each reminder goes out exactly once.
+        trialRemindersSent: { type: [Number], default: [] },
         // Snapshot of plan.features at assignment time (immutable until
         // Super Admin reassigns the plan).
         features: { type: Object, default: {} },
@@ -222,6 +236,10 @@ const restaurantSchema = new mongoose.Schema({
             planName:               { type: String, default: '' },
             planSlug:               { type: String, default: '' },
             price:                  { type: Number, default: null },
+            billingCycle:           { type: String, enum: ['monthly', 'annual', 'biennial'], default: 'monthly' },
+            // Same-plan renewal / cycle extension: the paid term is added to
+            // the END of the current term instead of starting today.
+            renewal:                { type: Boolean, default: false },
             features:               { type: Object, default: {} },
             limits:                 { type: Object, default: {} },
             razorpaySubscriptionId: { type: String, default: '' },
@@ -251,6 +269,7 @@ const restaurantSchema = new mongoose.Schema({
             planName:    { type: String, default: '' },
             planSlug:    { type: String, default: '' },
             price:       { type: Number, default: null },
+            billingCycle: { type: String, enum: ['monthly', 'annual', 'biennial'], default: 'monthly' },
             features:    { type: Object, default: {} },
             limits:      { type: Object, default: {} },
             // Snapshot of the cycle end the tenant already paid for —
@@ -482,11 +501,41 @@ const restaurantSchema = new mongoose.Schema({
     paymentConfirmedAt: { type: Date },
     paymentConfirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     paymentNote: { type: String, default: '', maxlength: 500 },
+
+    // Normalised self-signup identity (utils/selfSignup): Gmail dots and +tags
+    // stripped, phone = last 10 digits. Trial-abuse guard — one trial per
+    // person. Unset on admin-created / legacy tenants.
+    contactEmailNormalized: { type: String },
+    contactPhoneNormalized: { type: String },
 }, { timestamps: true });
 
 // ─── Indexes ─────────────────────────────────────────────────────────────
 restaurantSchema.index({ status: 1, createdAt: -1 });
 restaurantSchema.index({ contactEmail: 1 });
+// Partial-unique so concurrent duplicate signups cannot both win, while
+// tenants without the field (admin-created, legacy) are unaffected.
+restaurantSchema.index({ contactEmailNormalized: 1 },
+    { unique: true, partialFilterExpression: { contactEmailNormalized: { $type: 'string' } } });
+restaurantSchema.index({ contactPhoneNormalized: 1 },
+    { unique: true, partialFilterExpression: { contactPhoneNormalized: { $type: 'string' } } });
+// Trial sweeper / reminder scans.
+restaurantSchema.index({ status: 1, 'subscription.trialEndDate': 1 });
+
+// Paying lifts the free-trial lock. Every plan-payment path (verify, webhook,
+// Super Admin confirm) ends by setting subscription.status = 'active' on a
+// document and saving it; a tenant locked by the trial sweeper
+// (status 'suspended' + subscription.status 'expired') is reactivated here
+// so no path can forget it. Other suspensions are untouched.
+restaurantSchema.pre('save', function () {
+    if (this.isNew || !this.isModified('subscription.status')) return;
+    if (this.status === 'suspended' && this.subscription?.status === 'active'
+        && this.subscription?.trialExpiredAt) {
+        this.status = 'active';
+        this.suspendedAt = undefined;
+        this.suspendedReason = '';
+        this.subscription.trialExpiredAt = undefined;
+    }
+});
 
 // ─── Instance helpers ────────────────────────────────────────────────────
 

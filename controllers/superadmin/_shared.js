@@ -74,12 +74,33 @@ const ADDON_MRR_EXPR = {
     },
 };
 
+// Monthly-equivalent of a tenant's agreed price (aggregation expression).
+// `subscription.price` is the BASE amount per billingCycle, so an annual
+// tenant's 6,999 is 583/month of MRR, not 6,999. Missing / unknown cycle = 1
+// month (every pre-annual tenant). `priceExpr` is the agreed price expression.
+function monthlyPriceExpr(priceExpr) {
+    return {
+        $divide: [priceExpr, {
+            $switch: {
+                branches: [
+                    { case: { $eq: ['$subscription.billingCycle', 'annual'] }, then: 12 },
+                    { case: { $eq: ['$subscription.billingCycle', 'biennial'] }, then: 24 },
+                ],
+                default: 1,
+            },
+        }],
+    };
+}
+
+// A tenant assigned by Super Admin starts on the plan's MONTHLY price; paid
+// annual / 2-year terms only come from the tenant checkout.
 function snapshotPlan(plan) {
     return {
         plan: plan._id,
         planName: plan.name,
         planSlug: plan.slug,
         price: typeof plan.price === 'number' ? plan.price : 0,
+        billingCycle: 'monthly',
         features: plan.features ? plan.features.toObject ? plan.features.toObject() : { ...plan.features } : {},
         limits:   plan.limits   ? plan.limits.toObject   ? plan.limits.toObject()   : { ...plan.limits }   : {},
     };
@@ -127,6 +148,11 @@ function buildPlanPayload(p) {
         slug: p.slug,
         description: p.description,
         price: p.price,
+        prices: {
+            monthly:  p.prices?.monthly ?? null,
+            annual:   p.prices?.annual ?? null,
+            biennial: p.prices?.biennial ?? null,
+        },
         currency: p.currency,
         billingCycle: p.billingCycle,
         trialDays: p.trialDays,
@@ -151,6 +177,7 @@ module.exports = {
     slugify,
     generateTempPassword,
     ADDON_MRR_EXPR,
+    monthlyPriceExpr,
     snapshotPlan,
     buildRestaurantPayload,
     buildPlanPayload,

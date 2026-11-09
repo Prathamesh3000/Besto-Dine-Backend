@@ -12,6 +12,7 @@ const logger = require('../utils/logger');
 const loginAttempts = require('../utils/loginAttempts');
 const { clearAuthCookie, signAccessToken } = require('../middlewares/authMiddleware');
 const cookieAuth = require('../utils/cookieAuth');
+const { isTrialLocked, trialInfo, trialExpiredBody } = require('../utils/trialLock');
 
 // Roles whose shift status should follow their auth session. Every
 // tenant-side staff role — admin, manager, waiter, captain, chef —
@@ -384,7 +385,7 @@ const assertTenantNotLocked = async (user) => {
     if (!user || !user.restaurant) return null;
     if (user.role === 'superadmin') return null;
 
-    const restaurant = await Restaurant.findById(user.restaurant).select('status name signupSource signupStatus signupRejectedReason');
+    const restaurant = await Restaurant.findById(user.restaurant).select('status name signupSource signupStatus signupRejectedReason subscription.status subscription.trialEndDate subscription.lastChargedAt');
     if (!restaurant) {
         // Integrity failure — the user references a deleted tenant.
         // Treat the same as suspension so they cannot get a working session.
@@ -404,6 +405,14 @@ const assertTenantNotLocked = async (user) => {
     // — not "contact support". Only applies while the signup itself is
     // unresolved; an approved tenant suspended later falls through to the
     // generic TENANT_SUSPENDED below.
+    // Free trial ended unpaid: the owner (admin) may still sign in to reach
+    // billing and data export (the lock itself is enforced per request in
+    // attachTenant); every other role is told why.
+    if (isTrialLocked(restaurant)) {
+        if (user.role === 'admin') return null;
+        return { status: 403, body: trialExpiredBody(restaurant) };
+    }
+
     if (restaurant.status === 'suspended' || restaurant.status === 'cancelled') {
         if (restaurant.signupStatus === 'pending') {
             return {
@@ -513,6 +522,9 @@ const buildAuthResponse = async (user, { branchId: selectedBranch = null } = {})
             planSlug: r.subscription?.planSlug || '',
             subscriptionStatus: r.subscription?.status || '',
             trialEndDate: r.subscription?.trialEndDate || null,
+            // trialStartDate / trialExpired / daysLeft (utils/trialLock) for
+            // the trial banner and the lock screen.
+            ...trialInfo(r),
             // Fully-resolved module map (plan snapshot + paid add-ons +
             // legacy fallbacks) so the UI applies exactly the backend's
             // rules. The raw plan snapshot stays available as planFeatures.
@@ -926,6 +938,17 @@ exports.completeLogin = async (req, res, user, extra = {}) => {
         ...extra,
     });
 };
+
+/**
+ * Session for a freshly self-registered owner (publicController
+ * registerRestaurant, instant trial start): the same body a login returns
+ * (user payload + tenant snapshot + token/refreshToken, or the cookie-auth
+ * hints), minus the shift auto-open.
+ */
+exports.issueSignupSession = async (req, res, user) => ({
+    ...(await buildAuthResponse(user)),
+    ...(await issueSession(req, res, user)),
+});
 
 // ─── GET /api/auth/me ────────────────────────────────────────────────────────
 // Protected — requires valid Bearer token (applied in the route file).

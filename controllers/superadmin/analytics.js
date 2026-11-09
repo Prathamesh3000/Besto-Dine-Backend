@@ -5,7 +5,7 @@ const Branch = require('../../models/branch');
 const PlanChangeRequest = require('../../models/planChangeRequest');
 const AuditLog = require('../../models/auditLog');
 const logger = require('../../utils/logger');
-const { ADDON_MRR_EXPR } = require('./_shared');
+const { ADDON_MRR_EXPR, monthlyPriceExpr } = require('./_shared');
 
 // GET /api/v1/superadmin/analytics
 //
@@ -60,7 +60,9 @@ exports.getPlatformAnalytics = async (_req, res) => {
             {
                 $addFields: {
                     _agreedPrice: { $add: [
-                        { $ifNull: ['$subscription.price', { $ifNull: ['$_plan.price', 0] }] },
+                        // Normalised to per-month: annual / 2-year prices are
+                        // 12 / 24 months in one number.
+                        monthlyPriceExpr({ $ifNull: ['$subscription.price', { $ifNull: ['$_plan.price', 0] }] }),
                         // Active paid add-ons count toward MRR too.
                         ADDON_MRR_EXPR,
                     ] },
@@ -235,6 +237,28 @@ exports.getPlatformAnalytics = async (_req, res) => {
             }),
         };
 
+        // Trials that ended unpaid in the last 30 days (tenant locked by
+        // utils/trialExpirySweeper, never converted) - the win-back list.
+        const trialsExpiredRows = await Restaurant.find({
+            status: 'suspended',
+            'subscription.status': 'expired',
+            'subscription.trialExpiredAt': { $gte: thirtyDaysAgo },
+        }).select('name slug contactEmail contactPhone subscription.planName subscription.trialEndDate subscription.trialExpiredAt')
+            .sort({ 'subscription.trialExpiredAt': -1 }).limit(50).lean();
+        const trialsExpired = {
+            count: trialsExpiredRows.length,
+            tenants: trialsExpiredRows.map(t => ({
+                _id: t._id,
+                name: t.name,
+                slug: t.slug,
+                contactEmail: t.contactEmail,
+                contactPhone: t.contactPhone,
+                planName: t.subscription?.planName || '',
+                trialEndDate: t.subscription?.trialEndDate || null,
+                trialExpiredAt: t.subscription?.trialExpiredAt || null,
+            })),
+        };
+
         // ── Post-process: Growth ─────────────────────────────────────
         const signupsDeltaPct = signupsLastMonth > 0
             ? Math.round(((signupsThisMonth - signupsLastMonth) / signupsLastMonth) * 100)
@@ -394,6 +418,7 @@ exports.getPlatformAnalytics = async (_req, res) => {
                 atRiskTenants,
                 geoDistribution,
                 trialsExpiringSoon,
+                trialsExpired,
                 plansByUsage,
                 recentActivity: recentActivity.map(a => ({
                     _id: a._id,

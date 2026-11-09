@@ -82,7 +82,7 @@ beforeAll(async () => {
             limits: { maxBranches: 1, maxStaff: 10 },
         }),
         pro: await SubscriptionPlan.create({
-            name: 'Pro', slug: 'pro-op', price: 1999, sortOrder: 2, razorpayPlanId: 'plan_op_secret',
+            name: 'Pro', slug: 'pro-op', price: 1999, sortOrder: 2, razorpayPlanId: 'plan_op_secret', razorpayPlanIds: { monthly: 'plan_op_secret' }, razorpayPlanAmounts: { monthly: 235882 },
             features: { dineIn: true, inventory: true, crm: true },
             limits: { maxBranches: 3, maxStaff: 20 },
         }),

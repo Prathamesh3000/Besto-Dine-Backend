@@ -15,9 +15,11 @@
  * Hall bookings, kiosk and e-invoice can also be sold to Silver / Gold
  * tenants as paid add-ons (utils/featureAccess ADDON_CATALOG).
  *
- * Prices are the per-month list prices (INR, before GST). Per-outlet
- * billing and annual prices from the pricing proposal are not modelled
- * yet, so maxBranches keeps the previous 1 / 3 / 10 outlet ladder.
+ * `price` is the per-month list price (INR, before GST); `prices` holds the
+ * three billing cycles the owner picks at checkout (monthly / annual /
+ * 2-year prepay, PRICING_PACKAGING §3), all BEFORE 18% GST and unchanged at
+ * renewal. Per-outlet billing is not modelled yet, so maxBranches keeps the
+ * previous 1 / 3 / 10 outlet ladder.
  */
 
 // Every boolean module, off. Each plan below switches on what it sells.
@@ -67,6 +69,7 @@ const LINEUP = [
         slug: 'silver',
         description: 'For cafes, QSRs and single-outlet starters — billing, QR ordering, kitchen display, tips and inventory.',
         price: 699,
+        prices: { monthly: 699, annual: 6999, biennial: 11199 },
         billingCycle: 'monthly',
         trialDays: 14,
         sortOrder: 1,
@@ -80,6 +83,7 @@ const LINEUP = [
         slug: 'gold',
         description: 'For dine-in restaurants and small chains — everything in Silver plus loyalty, coupons, CRM, campaigns and reservations.',
         price: 1799,
+        prices: { monthly: 1799, annual: 17999, biennial: 28799 },
         billingCycle: 'monthly',
         trialDays: 14,
         sortOrder: 2,
@@ -93,6 +97,7 @@ const LINEUP = [
         slug: 'premium',
         description: 'For busy restaurants, banquets and chains — everything in Gold plus hall bookings, kiosk, e-invoicing and integrations.',
         price: 2999,
+        prices: { monthly: 2999, annual: 29999, biennial: 47999 },
         billingCycle: 'monthly',
         trialDays: 14,
         sortOrder: 3,
@@ -106,6 +111,7 @@ const LINEUP = [
         slug: 'enterprise',
         description: 'Custom contracts for 20+ outlets. Dedicated account manager and SLA.',
         price: 0,                    // priced individually
+        prices: { monthly: null, annual: null, biennial: null },
         billingCycle: 'monthly',
         trialDays: 0,
         sortOrder: 4,

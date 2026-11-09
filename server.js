@@ -215,6 +215,16 @@ require('./utils/ledgerPostJob').startLedgerPostJob(scheduler); // opt-in: LEDGE
 // (decision 5, 2026-10); this job applies it once the grace period ends.
 require('./utils/haltedSubscriptionSuspender').startHaltedSubscriptionSuspender();
 
+// ─── Free trials — lock expired unpaid trials, send 7/3/1-day reminders ─────
+// Hourly sweeper (TRIAL_SWEEP_DISABLED=true to opt out) and a daily reminder
+// job (TRIAL_REMINDERS_DISABLED=true). Both cluster-locked via the scheduler.
+require('./utils/trialExpirySweeper').startTrialExpirySweeper();
+require('./utils/trialReminderJob').startTrialReminderJob();
+
+// ─── Paid-term renewal reminders (7 / 1 days), lapse -> past_due, due downgrades ─
+// Daily; RENEWAL_REMINDERS_DISABLED=true to opt out. Cluster-locked via the scheduler.
+require('./utils/renewalReminderJob').startRenewalReminderJob();
+
 // ─── Stale takeaway order sweeper — observe-only, notifies admins ───────────
 // Flags takeaway orders stuck in 'ready' for longer than the threshold
 // (default 6h) so admins can clean them up from the Orders dashboard.

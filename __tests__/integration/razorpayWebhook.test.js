@@ -640,7 +640,7 @@ describe('payment.captured for a plan payment', () => {
         payload: {
             payment: {
                 entity: {
-                    id: paymentId, entity: 'payment', amount: 199900, currency: 'INR', status: 'captured',
+                    id: paymentId, entity: 'payment', amount: 235882, currency: 'INR', status: 'captured',
                     order_id: `order_${rid()}`, notes: { type: 'plan_payment', restaurantId }, created_at: 1767225600,
                 },
             },
@@ -662,7 +662,7 @@ describe('payment.captured for a plan payment', () => {
 
         const invoices = await SubscriptionInvoice.find({ razorpayPaymentId: paymentId }, null, { skipTenantScope: true }).lean();
         expect(invoices).toHaveLength(1);
-        expect(invoices[0]).toMatchObject({ amount: 199900, currency: 'INR', status: 'paid', planSlug: 'pro' });
+        expect(invoices[0]).toMatchObject({ amount: 235882, baseAmount: 199900, gstAmount: 35982, gstRate: 18, billingCycle: 'monthly', currency: 'INR', status: 'paid', planSlug: 'pro' });
         expect(String(invoices[0].restaurant)).toBe(String(P.restaurant._id));
 
         // The other tenant's pending upgrade is untouched.
@@ -796,7 +796,9 @@ describe('subscription events', () => {
         const startAt = 1767225600;    // 2026-01-01T00:00:00Z
         const pmt = { id: `pay_${rid()}`, amount: 99900, currency: 'INR', created_at: 1767225600 };
         const evt = subscriptionEvent('subscription.charged',
-            { id: subId, status: 'active', current_end: currentEnd, start_at: startAt }, pmt);
+            // start_at is the FIRST charge (a year earlier here); the invoice period
+            // must start at current_start, the cycle just paid (BUG: it used start_at).
+            { id: subId, status: 'active', current_end: currentEnd, current_start: startAt, start_at: startAt - 365 * 86400 }, pmt);
 
         expectOk(await deliver(evt));
         expectOk(await deliver(evt));

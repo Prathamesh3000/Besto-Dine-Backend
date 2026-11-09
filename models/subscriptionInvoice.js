@@ -48,6 +48,14 @@ const subscriptionInvoiceSchema = new mongoose.Schema({
     amount:   { type: Number, required: true },
     currency: { type: String, default: 'INR' },
 
+    // Billing cycle the charge covers + the GST split of `amount` (paise).
+    // amount = baseAmount + gstAmount. Rows from before GST / annual billing
+    // have none of these (read as monthly, GST not itemised).
+    billingCycle: { type: String, enum: ['monthly', 'annual', 'biennial'], default: 'monthly' },
+    baseAmount:   { type: Number, default: null },
+    gstAmount:    { type: Number, default: null },
+    gstRate:      { type: Number, default: null },   // percent, e.g. 18
+
     // Billing period covered by this charge.
     periodStart: { type: Date },
     periodEnd:   { type: Date },

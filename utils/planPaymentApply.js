@@ -2,18 +2,31 @@ const Restaurant = require('../models/restaurant');
 const SubscriptionInvoice = require('../models/subscriptionInvoice');
 const logger = require('./logger');
 const { describeRazorpayError } = require('./razorpayErrors');
+const {
+    normalizeCycle, addMonths, addCycle, priceWithGst, invoiceAmounts,
+} = require('./billingCycles');
 
 // Apply a pending plan upgrade onto the live subscription. Idempotent:
 // no-op once pendingUpgrade has been cleared, so retried webhooks /
 // duplicate verify calls don't double-apply.
 function applyPendingUpgrade(restaurant) {
+    return applyPendingUpgradeDetailed(restaurant).applied;
+}
+
+// Same as applyPendingUpgrade but also reports what it applied
+// ({ applied, cycle, renewal }) so the caller can compute the paid term
+// BEFORE the pending block is cleared.
+function applyPendingUpgradeDetailed(restaurant) {
     const pending = restaurant.subscription?.pendingUpgrade;
-    if (!pending || !pending.planSlug) return false;
+    if (!pending || !pending.planSlug) return { applied: false, cycle: null, renewal: false };
+    const cycle = normalizeCycle(pending.billingCycle);
+    const renewal = pending.renewal === true;
 
     restaurant.subscription.plan      = pending.plan || restaurant.subscription.plan;
     restaurant.subscription.planName  = pending.planName || '';
     restaurant.subscription.planSlug  = pending.planSlug || '';
     if (typeof pending.price === 'number') restaurant.subscription.price = pending.price;
+    restaurant.subscription.billingCycle = cycle;
     restaurant.subscription.features  = pending.features || {};
     restaurant.subscription.limits    = pending.limits   || {};
     const oldSubId = restaurant.subscription?.razorpaySubscriptionId;
@@ -33,13 +46,29 @@ function applyPendingUpgrade(restaurant) {
             }
         }
     }
+    // One-time Order purchase (no new recurring subscription) that replaces a
+    // live recurring one - e.g. monthly auto-renew -> a prepaid annual term
+    // via Orders: cancel the old subscription, or it keeps billing monthly on
+    // top of the term just paid for.
+    if (!renewal && pending.fallbackOrder && !pending.razorpaySubscriptionId && oldSubId) {
+        restaurant.subscription.razorpaySubscriptionId = '';
+        try {
+            const { cancelRazorpaySubscription } = require('./razorpayBilling');
+            cancelRazorpaySubscription(oldSubId, false)
+                .catch(err => logger.warn(`Failed to cancel old subscription ${oldSubId}`, describeRazorpayError(err)));
+        } catch (err) {
+            logger.warn('Razorpay client error during sub cancel', describeRazorpayError(err));
+        }
+    }
     // CLEAR the authorization shortUrl now that payment confirmed — the
     // URL is stale, and leaving it set keeps the "Complete Payment"
     // button visible on the tenant's subscription page even though the
     // charge already landed (which made the page look broken).
     restaurant.subscription.shortUrl  = '';
     restaurant.subscription.status    = 'active';
-    restaurant.subscription.startDate = new Date();
+    // A same-plan renewal / cycle extension keeps the original start date
+    // (the term is extended, not restarted).
+    if (!renewal || !restaurant.subscription.startDate) restaurant.subscription.startDate = new Date();
     restaurant.subscription.endDate   = null;
     restaurant.subscription.trialEndDate = null;
     if (restaurant.status === 'trial') restaurant.status = 'active';
@@ -49,7 +78,18 @@ function applyPendingUpgrade(restaurant) {
     // Leaving the schedule in place would cause the next cycle-end to
     // silently downgrade them away from the plan they just paid for.
     restaurant.subscription.scheduledDowngrade = undefined;
-    return true;
+    return { applied: true, cycle, renewal };
+}
+
+// The paid term a payment buys: starts now, or at the END of the current term
+// for a renewal / extension that is paid while time remains (the owner never
+// loses days they already paid for). `cycle` sets the length (+1 / +12 / +24
+// calendar months). Returns { periodStart, periodEnd }.
+function paidTermFor(restaurant, { cycle, renewal = false, now = new Date() }) {
+    const currentEnd = restaurant.subscription?.currentPeriodEnd
+        ? new Date(restaurant.subscription.currentPeriodEnd) : null;
+    const periodStart = renewal && currentEnd && currentEnd > now ? currentEnd : now;
+    return { periodStart, periodEnd: addCycle(periodStart, cycle) };
 }
 
 // Local-calendar YYYYMMDD — same basis as the local-midnight
@@ -60,15 +100,10 @@ function localYmd(d) {
 }
 
 // +1 calendar month, clamped to the last day of the next month
-// (31 Jan → 28/29 Feb, not 3 Mar).
+// (31 Jan -> 28/29 Feb, not 3 Mar). Kept for older callers; the general
+// version is billingCycles.addMonths.
 function addOneMonth(from) {
-    const d = new Date(from);
-    const day = d.getDate();
-    d.setDate(1);
-    d.setMonth(d.getMonth() + 1);
-    const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
-    d.setDate(Math.min(day, lastDay));
-    return d;
+    return addMonths(from, 1);
 }
 
 // Does this captured payment actually pay for the stashed pendingUpgrade?
@@ -79,14 +114,87 @@ function pendingPaymentMismatch(pending, payment) {
     if (pending.razorpayOrderId && payment.order_id !== pending.razorpayOrderId) {
         return `order ${payment.order_id || '(none)'} is not the pending upgrade order ${pending.razorpayOrderId}`;
     }
+    // pending.price is the BASE price (excl. GST) for the pending cycle; the
+    // customer must have paid base + GST (utils/billingCycles.priceWithGst).
     const price = Number(pending.price);
     if (Number.isFinite(price) && price > 0) {
-        const required = Math.round(price * 100);
+        const required = priceWithGst(price).totalPaise;
         if (!(Number(payment.amount) >= required)) {
-            return `amount ${payment.amount || 0} paise is below the plan price ${required} paise`;
+            return `amount ${payment.amount || 0} paise is below the plan price incl. GST ${required} paise`;
         }
     }
     return '';
+}
+
+// Persist one SubscriptionInvoice for a captured plan payment, with the
+// cycle and the GST split (base + GST = total paid, in paise). Used by the
+// Orders-API path (applyPaidPlanUpgrade) AND the subscription.charged webhook
+// so invoice numbering, dedupe and money fields cannot drift apart.
+//
+// Returns { invoiceNumber } or { deduped: true } when another path already
+// materialised this razorpayPaymentId. Throws on any other failure.
+async function createPaidInvoice({
+    restaurant, payment, logTag = 'plan-payment', billingCycle, periodStart, periodEnd,
+    razorpaySubscriptionId = '',
+}) {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const ymd = localYmd(startOfDay);
+    const money = invoiceAmounts(payment.amount || 0, restaurant.subscription?.price);
+    // Atomic-ish invoice numbering. countDocuments + 1 raced (two concurrent
+    // webhooks the same day computed the same N), so we retry with the next
+    // slot when Mongo rejects the insert on the composite
+    // { restaurant, invoiceNumber } unique index. Bounded at 50 attempts.
+    const todayBase = await SubscriptionInvoice.countDocuments({
+        restaurant: restaurant._id,
+        createdAt: { $gte: startOfDay },
+    });
+    let seq = todayBase + 1;
+    let saved = null;
+    let invoiceNumber = '';
+    for (let attempt = 0; attempt < 50 && !saved; attempt++, seq++) {
+        invoiceNumber = `INV-${ymd}-${String(seq).padStart(4, '0')}`;
+        try {
+            saved = await SubscriptionInvoice.create({
+                restaurant: restaurant._id,
+                restaurantName: restaurant.name,
+                invoiceNumber,
+                planName: restaurant.subscription?.planName || '',
+                planSlug: restaurant.subscription?.planSlug || '',
+                billingCycle: normalizeCycle(billingCycle),
+                amount: money.amount,
+                baseAmount: money.baseAmount,
+                gstAmount: money.gstAmount,
+                gstRate: money.gstRate,
+                currency: payment.currency || 'INR',
+                periodStart,
+                periodEnd,
+                razorpayPaymentId: payment.id,
+                razorpaySubscriptionId,
+                status: 'paid',
+                paidAt: payment.created_at ? new Date(payment.created_at * 1000) : new Date(),
+            });
+        } catch (insertErr) {
+            if (insertErr?.code === 11000) {
+                // Two duplicate-key flavours: invoiceNumber (concurrent invoice
+                // in the same slot -> retry next slot) and razorpayPaymentId
+                // (another path already materialised this payment -> deduped).
+                const msg = insertErr.message || '';
+                if (/invoiceNumber/.test(msg)) {
+                    logger.info(`${logTag}: invoice number ${invoiceNumber} race-lost, retrying`);
+                    continue;
+                }
+                logger.info(`${logTag}: SubscriptionInvoice already exists for payment ${payment.id} - race deduped`);
+                return { deduped: true };
+            }
+            throw insertErr;
+        }
+    }
+    if (!saved) {
+        throw new Error(`Could not allocate a unique invoiceNumber after 50 attempts (tenant ${restaurant.slug})`);
+    }
+    logger.info(`${logTag}: SubscriptionInvoice ${invoiceNumber} created for ${restaurant.slug}`);
+    return { invoiceNumber };
 }
 
 // Shared apply-paid-plan logic used by BOTH the Razorpay webhook
@@ -124,91 +232,41 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
         return { applied: false, invoiceCreated: false, alreadyInvoiced: false, skipped: true, reason: mismatch };
     }
 
-    const applied = applyPendingUpgrade(restaurant);
+    const detail = applyPendingUpgradeDetailed(restaurant);
+    const applied = detail.applied;
     restaurant.subscription = restaurant.subscription || {};
     restaurant.subscription.razorpayStatus = 'active';
     restaurant.subscription.lastChargedAt = new Date();
 
-    // Orders-API one-shot: no real cycle date, assume +1 month so the
-    // "next billing" badge in the UI has something to render.
-    const oneMonthFromNow = addOneMonth(new Date());
-    restaurant.subscription.currentPeriodEnd = oneMonthFromNow;
+    // Orders-API one-shot: no real cycle date from Razorpay, so the paid term
+    // is computed here: +1 / +12 / +24 calendar months for the cycle the
+    // owner bought. A payment with no pending upgrade is a plain renewal of
+    // the current plan, so it extends from the end of the current term.
+    const cycle = detail.cycle || normalizeCycle(restaurant.subscription.billingCycle);
+    const { periodStart, periodEnd } = paidTermFor(restaurant, {
+        cycle,
+        renewal: applied ? detail.renewal : true,
+    });
+    restaurant.subscription.currentPeriodEnd = periodEnd;
+    restaurant.subscription.renewalReminderSentFor = [];
+    // A paid renewal lifts the soft past_due state a lapsed term put the
+    // tenant in (utils/renewalReminderJob). Suspensions are NOT lifted here.
+    if (restaurant.subscription.status === 'past_due') restaurant.subscription.status = 'active';
+    if (restaurant.status === 'past_due') restaurant.status = 'active';
     await restaurant.save();
 
     if (applied) {
         logger.info(`${logTag}: applied pending upgrade for ${restaurant.slug} → ${restaurant.subscription.planName} (payment ${payment.id})`);
     }
 
-    let invoiceCreated = false;
-    let invoiceNumber = '';
-    try {
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
-        const ymd = localYmd(startOfDay);
-        // Atomic-ish invoice numbering. The old `countDocuments + 1`
-        // approach raced — two concurrent webhooks on the same day for
-        // the same tenant both computed the same N and produced
-        // duplicate invoice numbers (the razorpayPaymentId unique
-        // index doesn't catch this when the payments differ). We now
-        // retry with the next slot if Mongo rejects the insert on the
-        // composite { restaurant, invoiceNumber } index (added as a
-        // belt-and-braces unique). Bounded retry — give up after 50
-        // attempts to avoid an infinite loop on a real bug.
-        const todayBase = await SubscriptionInvoice.countDocuments({
-            restaurant: restaurant._id,
-            createdAt: { $gte: startOfDay },
-        });
-        let seq = todayBase + 1;
-        let saved = null;
-        for (let attempt = 0; attempt < 50 && !saved; attempt++, seq++) {
-            invoiceNumber = `INV-${ymd}-${String(seq).padStart(4, '0')}`;
-            try {
-                saved = await SubscriptionInvoice.create({
-                    restaurant: restaurant._id,
-                    restaurantName: restaurant.name,
-                    invoiceNumber,
-                    planName: restaurant.subscription?.planName || '',
-                    planSlug: restaurant.subscription?.planSlug || '',
-                    amount: payment.amount || 0,
-                    currency: payment.currency || 'INR',
-                    periodStart: new Date(),
-                    periodEnd: oneMonthFromNow,
-                    razorpayPaymentId: payment.id,
-                    razorpaySubscriptionId: '',
-                    status: 'paid',
-                    paidAt: payment.created_at ? new Date(payment.created_at * 1000) : new Date(),
-                });
-            } catch (insertErr) {
-                if (insertErr?.code === 11000) {
-                    // Two duplicate-key flavours we expect:
-                    //   - razorpayPaymentId unique: another path already
-                    //     materialised this payment → treat as deduped.
-                    //   - invoiceNumber unique: another concurrent invoice
-                    //     in the same per-day counter slot → retry with
-                    //     the next slot. Detect by message; fall back to
-                    //     "treat as paymentId race" when the message is
-                    //     opaque (some mongo versions / drivers strip it).
-                    const msg = insertErr.message || '';
-                    if (/invoiceNumber/.test(msg)) {
-                        logger.info(`${logTag}: invoice number ${invoiceNumber} race-lost, retrying`);
-                        continue;
-                    }
-                    // razorpayPaymentId race (default for any other E11000)
-                    logger.info(`${logTag}: SubscriptionInvoice already exists for payment ${payment.id} — race deduped`);
-                    return { applied, invoiceCreated: false, alreadyInvoiced: true };
-                }
-                throw insertErr;
-            }
-        }
-        if (!saved) {
-            throw new Error(`Could not allocate a unique invoiceNumber after 50 attempts (tenant ${restaurant.slug})`);
-        }
-        invoiceCreated = true;
-        logger.info(`${logTag}: SubscriptionInvoice ${invoiceNumber} created for ${restaurant.slug}`);
-    } catch (invoiceErr) {
-        logger.error(`${logTag}: SubscriptionInvoice create failed for ${restaurant.slug}: ${invoiceErr.message}`);
-        throw invoiceErr;
-    }
+    const created = await createPaidInvoice({
+        restaurant, payment, logTag,
+        billingCycle: cycle, periodStart, periodEnd,
+        razorpaySubscriptionId: '',
+    });
+    if (created.deduped) return { applied, invoiceCreated: false, alreadyInvoiced: true };
+    const invoiceCreated = true;
+    const invoiceNumber = created.invoiceNumber;
 
     return { applied, invoiceCreated, invoiceNumber, alreadyInvoiced: false };
 }
@@ -236,6 +294,7 @@ function applyScheduledDowngrade(restaurant, { force = false } = {}) {
     restaurant.subscription.planName  = sched.planName || '';
     restaurant.subscription.planSlug  = sched.planSlug || '';
     if (typeof sched.price === 'number') restaurant.subscription.price = sched.price;
+    restaurant.subscription.billingCycle = normalizeCycle(sched.billingCycle);
     restaurant.subscription.features  = sched.features || {};
     restaurant.subscription.limits    = sched.limits   || {};
     restaurant.subscription.startDate = new Date();
@@ -262,8 +321,11 @@ function applyScheduledDowngrade(restaurant, { force = false } = {}) {
 module.exports = {
     localYmd,
     addOneMonth,
+    paidTermFor,
+    createPaidInvoice,
     pendingPaymentMismatch,
     applyPendingUpgrade,
+    applyPendingUpgradeDetailed,
     applyScheduledDowngrade,
     applyPaidPlanUpgrade,
 };

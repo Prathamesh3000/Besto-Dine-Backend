@@ -306,7 +306,7 @@ describe('self-signup trial plan', () => {
             restaurantName: `Trial Hub ${Date.now()}`, ownerName: 'Asha Owner', contactEmail: email,
             contactPhone: '+91 98765 43210', city: 'Pune', password: 'Signup#Pass1234', acceptTerms: true,
         });
-        expect(res.status).toBe(202);   // accepted, pending approval
+        expect(res.status).toBe(201);   // instant-start trial (no approval wait)
         const r = await Restaurant.findOne({ contactEmail: email }).lean();
         expect(r.subscription.planSlug).toBe('gold');
     });

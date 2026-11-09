@@ -22,6 +22,7 @@ const User = require(path.join(BACKEND, 'models/user'));
 const Settings = require(path.join(BACKEND, 'models/settings'));
 const SubscriptionPlan = require(path.join(BACKEND, 'models/subscriptionPlan'));
 const { sendEmail } = require(path.join(BACKEND, 'utils/email'));
+const { normalizeMobile } = require(path.join(BACKEND, 'utils/mobile'));
 
 const ctx = useIntegrationApp();
 const PASSWORD = 'Signup#Pass1234';
@@ -37,7 +38,8 @@ const signupBody = (extra = {}) => ({
     restaurantName: `Spice Hub ${uniq()}`,
     ownerName: 'Asha Owner',
     contactEmail: `owner.${uniq()}@hotels.test`,
-    contactPhone: '+91 98765 43210',
+    // Unique per signup: one trial per phone (utils/selfSignup).
+    contactPhone: `+91 9${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`,
     city: 'Pune',
     password: PASSWORD,
     acceptTerms: true,
@@ -49,8 +51,12 @@ const staffLogin = (email, password = PASSWORD) => ctx.api.anon().post('/auth/lo
 
 beforeAll(async () => {
     process.env.SUPERADMIN_ALERT_EMAILS = 'ops1@platform.test, ops2@platform.test';
+    // This file covers the approval-queue flow; the instant-start default is
+    // covered by trialModule.test.js.
+    process.env.SELF_SIGNUP_REQUIRE_APPROVAL = 'true';
     plans = {
         free: await SubscriptionPlan.create({ name: 'Free', slug: 'free', price: 0, sortOrder: 0 }),
+        gold: await SubscriptionPlan.create({ name: 'Gold', slug: 'gold', price: 2999, sortOrder: 3, isPublic: false }),
         pro: await SubscriptionPlan.create({ name: 'Pro', slug: 'pro', price: 1999, sortOrder: 2, trialDays: 14, highlight: true, razorpayPlanId: 'plan_secret' }),
         basic: await SubscriptionPlan.create({ name: 'Basic', slug: 'basic', price: 999, sortOrder: 1 }),
         privateDeal: await SubscriptionPlan.create({ name: 'Private Deal', slug: 'private-deal', price: 500, isPublic: false }),
@@ -68,6 +74,7 @@ beforeAll(async () => {
 
 afterAll(() => {
     delete process.env.SUPERADMIN_ALERT_EMAILS;
+    delete process.env.SELF_SIGNUP_REQUIRE_APPROVAL;
 });
 
 beforeEach(() => sendEmail.mockClear());
@@ -95,9 +102,9 @@ describe('POST /public/register-restaurant → approval → login', () => {
         const r = await Restaurant.findOne({ slug: body.slug }).lean();
         expect(r).toMatchObject({
             status: 'suspended', signupSource: 'self', signupStatus: 'pending',
-            contactPhone: '9876543210', city: 'Pune',
+            contactPhone: normalizeMobile(body.contactPhone), city: 'Pune',
         });
-        expect(r.subscription.planSlug).toBe('free'); // billing not activated
+        expect(r.subscription.planSlug).toBe('gold'); // trial plan; billing not activated
         expect(String(r.requestedPlan.plan)).toBe(String(plans.pro._id));
         expect(r.signupMeta).toMatchObject({ ownerName: 'Asha Owner', source: 'home-hero', utmSource: 'google', utmCampaign: 'launch' });
         expect(r.signupMeta.termsAcceptedAt).toBeTruthy();
@@ -129,12 +136,12 @@ describe('POST /public/register-restaurant → approval → login', () => {
             name: body.restaurantName,
             slug: body.slug,
             city: 'Pune',
-            contactPhone: '9876543210',
+            contactPhone: normalizeMobile(body.contactPhone),
             contactEmail: body.contactEmail,
             ownerName: 'Asha Owner',
             requestedPlan: { _id: String(plans.pro._id), name: 'Pro' },
             signupMeta: { source: 'home-hero', utmSource: 'google', utmCampaign: 'launch', utmMedium: '' },
-            subscription: { planName: 'Free' },
+            subscription: { planName: 'Gold' },
         });
         expect(item.createdAt).toBeTruthy();
 

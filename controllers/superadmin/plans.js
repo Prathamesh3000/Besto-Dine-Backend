@@ -1,4 +1,5 @@
 // Split out of controllers/superadminController.js (task 4.7). Behaviour unchanged.
+const { priceWithGst } = require('../../utils/billingCycles');
 const mongoose = require('mongoose');
 const Restaurant = require('../../models/restaurant');
 const SubscriptionPlan = require('../../models/subscriptionPlan');
@@ -27,6 +28,21 @@ exports.listPlans = async (req, res) => {
     }
 };
 
+// Validate + normalise a `prices` body ({monthly, annual, biennial}; base
+// rupees excl. GST; null/'' = cycle not sold). Returns { prices } or { error }.
+function parsePrices(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'prices must be an object' };
+    const out = {};
+    for (const key of ['monthly', 'annual', 'biennial']) {
+        if (raw[key] === undefined) continue;
+        if (raw[key] === null || raw[key] === '') { out[key] = null; continue; }
+        const n = Number(raw[key]);
+        if (!Number.isFinite(n) || n < 0) return { error: `prices.${key} must be a number >= 0 or null` };
+        out[key] = n > 0 ? n : null;
+    }
+    return { prices: out };
+}
+
 // POST /api/v1/superadmin/plans
 exports.createPlan = async (req, res) => {
     try {
@@ -37,6 +53,12 @@ exports.createPlan = async (req, res) => {
         }
         if (price === undefined || price === null || isNaN(+price) || +price < 0) {
             return res.status(400).json({ success: false, message: 'Plan price is required and must be >= 0' });
+        }
+        let parsedPrices = null;
+        if (req.body.prices !== undefined) {
+            const r = parsePrices(req.body.prices);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            parsedPrices = r.prices;
         }
         const finalSlug = slug ? slugify(slug) : slugify(name);
         if (!SLUG_REGEX.test(finalSlug)) {
@@ -51,6 +73,8 @@ exports.createPlan = async (req, res) => {
             slug: finalSlug,
             description: (description || '').trim(),
             price: +price,
+            // `price` is the monthly list price; annual / biennial are optional extras.
+            prices: { monthly: +price > 0 ? +price : null, annual: parsedPrices?.annual ?? null, biennial: parsedPrices?.biennial ?? null },
             billingCycle: billingCycle || 'monthly',
             trialDays: Number.isFinite(+trialDays) ? +trialDays : 0,
             limits: limits || {},
@@ -106,6 +130,37 @@ exports.updatePlan = async (req, res) => {
             const afterCmp = (after && typeof after === 'object') ? JSON.stringify(after) : String(after ?? '');
             if (beforeCmp !== afterCmp) changes[key] = { from: previewVal(before), to: previewVal(after) };
             plan[key] = after;
+        }
+
+        // Per-cycle prices (base, excl. GST). A Razorpay plan is immutable, so
+        // a changed price drops that cycle's stored id (and the legacy monthly
+        // alias): the next purchase creates a fresh Razorpay plan at the new
+        // amount instead of the stale one silently charging the old one.
+        // (utils/razorpayBilling.isPlanIdFresh enforces the same at charge time.)
+        if (req.body.prices !== undefined) {
+            const r = parsePrices(req.body.prices);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            for (const [cycle, val] of Object.entries(r.prices)) {
+                const before = plan.prices?.[cycle] ?? null;
+                if (before !== val) {
+                    changes[`prices.${cycle}`] = { from: String(before ?? ''), to: String(val ?? '') };
+                    plan.set(`prices.${cycle}`, val);
+                }
+            }
+            if (r.prices.monthly) plan.price = r.prices.monthly;   // `price` mirrors the monthly list price
+        }
+        if (req.body.price !== undefined && req.body.prices === undefined && plan.prices?.monthly != null
+            && plan.prices.monthly !== plan.price) {
+            plan.set('prices.monthly', plan.price);
+        }
+        for (const cycle of ['monthly', 'annual', 'biennial']) {
+            const expected = cycle === 'monthly' ? (plan.prices?.monthly ?? plan.price) : plan.prices?.[cycle];
+            const stored = plan.razorpayPlanAmounts?.[cycle];
+            if (plan.razorpayPlanIds?.[cycle] && (expected == null || stored !== priceWithGst(expected).totalPaise)) {
+                plan.set(`razorpayPlanIds.${cycle}`, '');
+                plan.set(`razorpayPlanAmounts.${cycle}`, null);
+                if (cycle === 'monthly') plan.razorpayPlanId = '';
+            }
         }
         await plan.save();
 

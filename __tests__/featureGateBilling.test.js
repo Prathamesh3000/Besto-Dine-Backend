@@ -383,6 +383,12 @@ describe('publicPlans', () => {
             slug: 'pro',
             description: 'For busy cafes',
             price: 1999,
+            prices: { monthly: 1999, annual: null, biennial: null },
+            gstRate: 18,
+            cycles: [{
+                cycle: 'monthly', months: 1, price: 1999, gst: 359.82, total: 2358.82,
+                perMonthEquivalent: 1999, savingsPctVsMonthly: 0,
+            }],
             currency: 'INR',
             billingCycle: 'monthly',
             trialDays: 14,
@@ -501,36 +507,71 @@ describe('razorpayBilling — pure helpers', () => {
 });
 
 describe('razorpayBilling — ensureRazorpayPlan', () => {
+    // 1999 base + 18% GST = 235882 paise.
     const plan = (extra = {}) => ({
         _id: { toString: () => 'pid1' },
-        name: 'Pro', slug: 'pro', price: 1999, billingCycle: 'quarterly', description: '',
+        name: 'Pro', slug: 'pro', price: 1999, billingCycle: 'monthly', description: '',
         razorpayPlanId: '',
         save: jest.fn().mockResolvedValue(undefined),
         ...extra,
     });
 
-    test('idempotent: existing razorpayPlanId → no API call', async () => {
-        const p = plan({ razorpayPlanId: 'plan_existing' });
+    test('idempotent: a stored id created at the CURRENT GST-inclusive amount → no API call', async () => {
+        const p = plan({ razorpayPlanId: 'plan_existing', razorpayPlanIds: { monthly: 'plan_existing' }, razorpayPlanAmounts: { monthly: 235882 } });
         await expect(billing.ensureRazorpayPlan(p)).resolves.toBe(p);
         expect(mockRzp.plans.create).not.toHaveBeenCalled();
     });
 
-    test('creates a plan with the price in PAISE and stamps the id', async () => {
+    test('STALE id (price changed, or a pre-GST legacy id with no recorded amount) is never reused', async () => {
+        mockRzp.plans.create.mockResolvedValue({ id: 'plan_fresh' });
+        const legacy = plan({ razorpayPlanId: 'plan_legacy' });            // no razorpayPlanAmounts
+        await billing.ensureRazorpayPlan(legacy);
+        expect(legacy.razorpayPlanId).toBe('plan_fresh');
+        const edited = plan({ price: 2499, razorpayPlanIds: { monthly: 'plan_old' }, razorpayPlanAmounts: { monthly: 235882 } });
+        await billing.ensureRazorpayPlan(edited);
+        expect(edited.razorpayPlanIds.monthly).toBe('plan_fresh');
+        expect(edited.razorpayPlanAmounts.monthly).toBe(294882);
+        expect(mockRzp.plans.create).toHaveBeenCalledTimes(2);
+    });
+
+    test('creates a plan with the GST-INCLUSIVE price in PAISE and stamps the id', async () => {
         mockRzp.plans.create.mockResolvedValue({ id: 'plan_new' });
         const p = plan();
         await billing.ensureRazorpayPlan(p);
         expect(mockRzp.plans.create).toHaveBeenCalledWith({
-            period: 'quarterly',
+            period: 'monthly',
             interval: 1,
-            item: { name: 'Pro', amount: 199900, currency: 'INR', description: 'BestoDine Pro plan' },
-            notes: { planSlug: 'pro', planId: 'pid1' },
+            item: { name: 'Pro (monthly)', amount: 235882, currency: 'INR', description: 'BestoDine Pro plan, monthly (incl. 18% GST)' },
+            notes: { planSlug: 'pro', planId: 'pid1', billingCycle: 'monthly', basePaise: '199900', gstRate: '18' },
         });
         expect(p.razorpayPlanId).toBe('plan_new');
+        expect(p.razorpayPlanIds.monthly).toBe('plan_new');
+        expect(p.razorpayPlanAmounts.monthly).toBe(235882);
         expect(p.save).toHaveBeenCalled();
     });
 
+    test.each([
+        ['annual', 'yearly', 1, 826000],
+        ['biennial', 'yearly', 2, 1321482],
+    ])('%s cycle → Razorpay %s x %p, amount base+GST', async (cycle, period, interval, paise) => {
+        mockRzp.plans.create.mockResolvedValue({ id: 'plan_' + cycle });
+        const p = plan({ prices: { monthly: 1999, annual: 7000, biennial: 11199 } });
+        await billing.ensureRazorpayPlan(p, cycle);
+        const args = mockRzp.plans.create.mock.calls[0][0];
+        expect(args.period).toBe(period);
+        expect(args.interval).toBe(interval);
+        expect(args.item.amount).toBe(paise);
+        expect(p.razorpayPlanIds[cycle]).toBe('plan_' + cycle);
+        expect(p.razorpayPlanId).toBe('');            // the legacy alias stays monthly-only
+    });
+
+    test('a cycle the plan does not sell → refuses', async () => {
+        await expect(billing.ensureRazorpayPlan(plan({ prices: { monthly: 1999, annual: null, biennial: null } }), 'annual'))
+            .rejects.toThrow(/no annual price/);
+    });
+
     test.each([0, -5, undefined])('price %p → refuses to create a Razorpay plan', async (price) => {
-        await expect(billing.ensureRazorpayPlan(plan({ price }))).rejects.toThrow(/zero-price/);
+        await expect(billing.ensureRazorpayPlan(plan({ price }))).rejects.toThrow(/no monthly price/);
         expect(mockRzp.plans.create).not.toHaveBeenCalled();
     });
 
@@ -635,46 +676,67 @@ describe('razorpayBilling — createRazorpaySubscription', () => {
     const restaurant = { _id: { toString: () => 'rid1' }, slug: 'cafe' };
     const plan = (extra = {}) => ({
         _id: 'pid', name: 'Pro', slug: 'pro', price: 1999, currency: 'INR', billingCycle: 'monthly',
-        razorpayPlanId: 'plan_1', ...extra,
+        razorpayPlanId: 'plan_1', razorpayPlanIds: { monthly: 'plan_1' }, razorpayPlanAmounts: { monthly: 235882 }, ...extra,
     });
 
     test.each([
         ['monthly', 120],
-        ['quarterly', 40],
-        ['yearly', 10],
-        ['weird', 120],
-    ])('subscription path: %s → total_count %p, notes carry the tenant', async (cycle, count) => {
+        ['annual', 10],
+        ['biennial', 5],
+    ])('subscription path: %s cycle → total_count %p, notes carry the tenant + cycle', async (cycle, count) => {
         mockRzp.subscriptions.create.mockResolvedValue({ id: 'sub_1', status: 'created', short_url: 'https://rzp.io/x' });
-        const sub = await billing.createRazorpaySubscription({ plan: plan({ billingCycle: cycle }), restaurant, customerId: 'cust_1' });
+        const amounts = { monthly: 235882, annual: 826000, biennial: 1321482 };
+        const p = plan({
+            prices: { monthly: 1999, annual: 7000, biennial: 11199 },
+            razorpayPlanIds: { [cycle]: 'plan_' + cycle }, razorpayPlanAmounts: { [cycle]: amounts[cycle] },
+        });
+        const sub = await billing.createRazorpaySubscription({ plan: p, restaurant, customerId: 'cust_1', cycle });
         expect(sub.id).toBe('sub_1');
         expect(mockRzp.subscriptions.create).toHaveBeenCalledWith({
-            plan_id: 'plan_1', customer_notify: 1, quantity: 1, total_count: count,
-            notes: { restaurantId: 'rid1', restaurantSlug: 'cafe', planSlug: 'pro' },
+            plan_id: 'plan_' + cycle, customer_notify: 1, quantity: 1, total_count: count,
+            notes: { restaurantId: 'rid1', restaurantSlug: 'cafe', planSlug: 'pro', billingCycle: cycle },
         });
         expect(mockRzp.orders.create).not.toHaveBeenCalled();
     });
 
-    test('plan never synced → Orders-API fallback for the plan price in PAISE, stamped plan_payment', async () => {
+    test('a stale stored plan id is NOT charged: falls back instead of using the old amount', async () => {
+        mockRzp.orders.create.mockResolvedValue({ id: 'order_s', currency: 'INR' });
+        const out = await billing.createRazorpaySubscription({
+            plan: plan({ razorpayPlanAmounts: { monthly: 199900 } }), restaurant, customerId: 'cust_1',
+        });
+        expect(mockRzp.subscriptions.create).not.toHaveBeenCalled();
+        expect(out.fallbackOrder).toBe(true);
+    });
+
+    test('forceOrder (renewals) skips the Subscriptions API even with a fresh plan', async () => {
+        mockRzp.orders.create.mockResolvedValue({ id: 'order_r', currency: 'INR' });
+        const out = await billing.createRazorpaySubscription({ plan: plan(), restaurant, customerId: 'cust_1', forceOrder: true });
+        expect(mockRzp.subscriptions.create).not.toHaveBeenCalled();
+        expect(out.orderId).toBe('order_r');
+    });
+
+    test('plan never synced → Orders-API fallback for the plan price + GST in PAISE, stamped plan_payment', async () => {
         mockRzp.orders.create.mockResolvedValue({ id: 'order_1', currency: 'INR' });
-        const out = await billing.createRazorpaySubscription({ plan: plan({ razorpayPlanId: '' }), restaurant, customerId: 'cust_1' });
+        const out = await billing.createRazorpaySubscription({ plan: plan({ razorpayPlanId: '', razorpayPlanIds: {} }), restaurant, customerId: 'cust_1' });
         expect(mockRzp.subscriptions.create).not.toHaveBeenCalled();
         const args = mockRzp.orders.create.mock.calls[0][0];
-        expect(args.amount).toBe(199900);
+        expect(args.amount).toBe(235882);   // base 1,999 + 18% GST
         expect(args.currency).toBe('INR');
         expect(args.notes).toEqual({
             type: 'plan_payment', restaurantId: 'rid1', restaurantSlug: 'cafe', planSlug: 'pro', planName: 'Pro',
+            billingCycle: 'monthly', basePaise: '199900', gstRate: '18',
         });
         expect(args.receipt.length).toBeLessThanOrEqual(40);
         expect(out).toEqual({
             id: 'order_1', status: 'created', short_url: '', fallbackOrder: true,
-            orderId: 'order_1', amount: 199900, currency: 'INR', key: 'rzp_test_unit',
+            orderId: 'order_1', amount: 235882, currency: 'INR', key: 'rzp_test_unit',
         });
     });
 
     test('long slug still yields a receipt within Razorpay\'s 40-char cap', async () => {
         mockRzp.orders.create.mockResolvedValue({ id: 'order_2', currency: 'INR' });
         await billing.createRazorpaySubscription({
-            plan: plan({ razorpayPlanId: '', slug: 'enterprise-unlimited-platinum-annual-plan' }), restaurant, customerId: 'c',
+            plan: plan({ razorpayPlanId: '', razorpayPlanIds: {}, slug: 'enterprise-unlimited-platinum-annual-plan' }), restaurant, customerId: 'c',
         });
         expect(mockRzp.orders.create.mock.calls[0][0].receipt.length).toBeLessThanOrEqual(40);
     });
@@ -684,7 +746,7 @@ describe('razorpayBilling — createRazorpaySubscription', () => {
         mockRzp.orders.create.mockResolvedValue({ id: 'order_3', currency: 'INR' });
         const out = await billing.createRazorpaySubscription({ plan: plan(), restaurant, customerId: 'cust_1' });
         expect(out.fallbackOrder).toBe(true);
-        expect(out.amount).toBe(199900);
+        expect(out.amount).toBe(235882);
     });
 
     test.each([400, 500, undefined])('Subscriptions API error status %p → rethrown, no fallback order', async (statusCode) => {
@@ -702,7 +764,7 @@ describe('razorpayBilling — createRazorpaySubscription', () => {
 
     test('fallback order creation failure propagates', async () => {
         mockRzp.orders.create.mockRejectedValue(new Error('orders down'));
-        await expect(billing.createRazorpaySubscription({ plan: plan({ razorpayPlanId: '' }), restaurant, customerId: 'c' }))
+        await expect(billing.createRazorpaySubscription({ plan: plan({ razorpayPlanId: '', razorpayPlanIds: {} }), restaurant, customerId: 'c' }))
             .rejects.toThrow('orders down');
     });
 });
@@ -884,7 +946,7 @@ describe('applyScheduledDowngrade', () => {
 
 describe('applyPaidPlanUpgrade — money + invoice numbering', () => {
     const payment = (extra = {}) => ({
-        id: 'pay_1', amount: 199900, currency: 'INR', status: 'captured',
+        id: 'pay_1', amount: 235882, currency: 'INR', status: 'captured',   // 1,999 + 18% GST
         created_at: 1790000000, ...extra,
     });
 
@@ -897,7 +959,11 @@ describe('applyPaidPlanUpgrade — money + invoice numbering', () => {
         const r = restaurantDoc({ pendingUpgrade: { ...PENDING_PRO } });
         await applyPaidPlanUpgrade({ restaurant: r, payment: payment() });
         const doc = mockInvoice.create.mock.calls[0][0];
-        expect(doc.amount).toBe(199900);
+        expect(doc.amount).toBe(235882);
+        expect(doc.baseAmount).toBe(199900);
+        expect(doc.gstAmount).toBe(35982);
+        expect(doc.gstRate).toBe(18);
+        expect(doc.billingCycle).toBe('monthly');
         expect(doc.currency).toBe('INR');
         expect(doc.paidAt.getTime()).toBe(1790000000 * 1000);
         expect(doc.planSlug).toBe('pro');

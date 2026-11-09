@@ -343,7 +343,8 @@ describe('reserved restaurant slugs', () => {
         contactEmail: `signup.${Math.random().toString(16).slice(2)}@owners.test`,
         ownerName: 'Owner',
         password: 'Signup#Pass1234',
-        contactPhone: '9876543210',
+        // Unique per call: self-signup now rejects a phone already on another trial.
+        contactPhone: `9${String(Math.floor(Math.random() * 1e9)).padStart(9, '0')}`,
         city: 'Pune',
         acceptTerms: true,
         ...body,
@@ -360,7 +361,7 @@ describe('reserved restaurant slugs', () => {
 
     test('self-signup: generated reserved slug is auto-suffixed', async () => {
         const res = await signup({ restaurantName: 'Admin' });
-        expect(res.status).toBe(202);
+        expect(res.status).toBe(201);
         const slug = res.body.data.restaurant.slug;
         expect(slug).not.toBe('admin');
         expect(slug).toMatch(/^admin-[a-z0-9]+$/);
@@ -375,7 +376,7 @@ describe('reserved restaurant slugs', () => {
 
     test('self-signup: explicit free slug is used as-is', async () => {
         const res = await signup({ restaurantName: 'Anything', slug: 'my-own-cafe' });
-        expect(res.status).toBe(202);
+        expect(res.status).toBe(201);
         expect(res.body.data.restaurant.slug).toBe('my-own-cafe');
     });
 

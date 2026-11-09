@@ -25,6 +25,7 @@ const {
     PAN_REGEX,
     generateTempPassword,
     ADDON_MRR_EXPR,
+    monthlyPriceExpr,
     buildRestaurantPayload,
 } = require('./_shared');
 
@@ -83,8 +84,9 @@ exports.listRestaurants = async (req, res) => {
                                     { $eq: ['$status', 'active'] },
                                     // Agreed (snapshot) price first; live plan price only as a legacy fallback.
                                     // Plus any active paid add-ons.
+                                    // Annual / 2-year prices are normalised to per-month.
                                     { $add: [
-                                        { $ifNull: ['$subscription.price', { $ifNull: [{ $arrayElemAt: ['$planDoc.price', 0] }, 0] }] },
+                                        monthlyPriceExpr({ $ifNull: ['$subscription.price', { $ifNull: [{ $arrayElemAt: ['$planDoc.price', 0] }, 0] }] }),
                                         ADDON_MRR_EXPR,
                                     ] },
                                     0,

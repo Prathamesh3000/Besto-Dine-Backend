@@ -159,7 +159,7 @@ exports.approveSignup = async (req, res) => {
         // Welcome email — uses self-signup template (no temp password,
         // they set their own). trialDays = the full, freshly started trial.
         try {
-            const { restaurantSelfSignupWelcome } = require('../utils/emailTemplates');
+            const { restaurantSelfSignupWelcome } = require('../../utils/emailTemplates');
             await sendEmail({
                 to: restaurant.contactEmail,
                 ...restaurantSelfSignupWelcome({

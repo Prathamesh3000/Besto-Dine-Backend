@@ -29,7 +29,7 @@ const APP_ROUTE_SEGMENTS = [
     'force-change-password', 'health', 'home', 'kiosk', 'login',
     'notifications', 'otp', 'privacy', 'r', 'register-restaurant',
     'request-demo', 'reset-password', 'scan', 'search', 'splash', 'staff-login',
-    'superadmin', 'switch-restaurant', 'terms', 'unauthorized', 'waiter',
+    'superadmin', 'switch-restaurant', 'terms', 'trial-expired', 'unauthorized', 'waiter',
 ];
 
 // Platform / infrastructure / marketing / SEO paths (current + likely future).

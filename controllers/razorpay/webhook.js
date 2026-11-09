@@ -11,7 +11,8 @@ const paymentState = require('../../utils/paymentState');
 const { invalidateTenant } = require('../../middlewares/tenantContext');
 const { notifyTenantHalted, notifyTenantCancelled } = require('../../utils/alerts');
 const { createTipForPaidOrder, revokeTipsForOrder } = require('../../utils/tipHelpers');
-const { applyPendingUpgrade, applyPaidPlanUpgrade, applyScheduledDowngrade, pendingPaymentMismatch, localYmd } = require('../../utils/planPaymentApply');
+const { applyPendingUpgradeDetailed, applyPaidPlanUpgrade, applyScheduledDowngrade, pendingPaymentMismatch, paidTermFor, createPaidInvoice } = require('../../utils/planPaymentApply');
+const { normalizeCycle } = require('../../utils/billingCycles');
 const { orderCheckoutIds, checkCaptureCoversDue, paiseToRupees } = require('../../utils/paymentChecks');
 const { claimPayment } = require('../../utils/paymentClaim');
 const { roundPaise } = require('../../utils/orderRefund');
@@ -559,20 +560,32 @@ async function handleSubscriptionEvent(event, payload) {
             const upgradeMismatch = chargedPayment
                 ? pendingPaymentMismatch(restaurant.subscription?.pendingUpgrade, chargedPayment)
                 : '';
-            let upgradeApplied = false;
+            let detail = { applied: false, cycle: null, renewal: false };
+            const previousPeriodEnd = restaurant.subscription?.currentPeriodEnd || null;
             if (upgradeMismatch) {
                 logger.error(`Subscription charged: payment ${chargedPayment.id} NOT applied to pending upgrade for ${restaurant.slug}: ${upgradeMismatch}`);
             } else {
-                upgradeApplied = applyPendingUpgrade(restaurant);
+                detail = applyPendingUpgradeDetailed(restaurant);
             }
+            const upgradeApplied = detail.applied;
+            const cycle = detail.cycle || normalizeCycle(restaurant.subscription?.billingCycle);
             if (upgradeApplied) {
                 logger.info(`Subscription charged: applied pending upgrade for ${restaurant.slug} → ${restaurant.subscription.planName}`);
             }
 
-            // `current_end` is a unix seconds timestamp of the next billing date.
-            if (sub.current_end) {
-                restaurant.subscription.currentPeriodEnd = new Date(sub.current_end * 1000);
-            }
+            // `current_end` is a unix seconds timestamp of the next billing date
+            // (end of the monthly / annual / 2-yearly cycle just paid). Without
+            // it, derive the term from the cycle so the period never defaults
+            // to a month for a prepaid annual plan.
+            const term = paidTermFor(restaurant, { cycle, renewal: detail.renewal || !upgradeApplied });
+            const periodEnd = sub.current_end ? new Date(sub.current_end * 1000) : term.periodEnd;
+            // Cycle start = Razorpay's current_start (NOT sub.start_at, which is
+            // the very first charge and made every renewal invoice start there).
+            const periodStart = sub.current_start
+                ? new Date(sub.current_start * 1000)
+                : (previousPeriodEnd && new Date(previousPeriodEnd) < periodEnd ? new Date(previousPeriodEnd) : term.periodStart);
+            restaurant.subscription.currentPeriodEnd = periodEnd;
+            restaurant.subscription.renewalReminderSentFor = [];
             restaurant.subscription.lastChargedAt = new Date();
             // If the tenant was previously suspended for non-payment
             // (razorpayStatus === 'halted'), auto-reactivate now that
@@ -580,7 +593,8 @@ async function handleSubscriptionEvent(event, payload) {
             // Also covers the 24h grace period (decision 5): a tenant still
             // `past_due` after a halt is restored, and the scheduled lockout
             // and halt counters are cleared.
-            const inHaltGrace = restaurant.status === 'past_due' && previousRzpStatus === 'halted';
+            // Also a paid term that lapsed to past_due (utils/renewalReminderJob).
+            const inHaltGrace = restaurant.status === 'past_due';
             const suspendedForHalt = restaurant.status === 'suspended' && previousRzpStatus === 'halted';
             if (inHaltGrace || suspendedForHalt) {
                 restaurant.status = restaurant.subscription.trialEndDate && restaurant.subscription.trialEndDate > new Date()
@@ -589,6 +603,7 @@ async function handleSubscriptionEvent(event, payload) {
                 restaurant.suspendedAt = undefined;
                 restaurant.suspendedReason = '';
             }
+            if (restaurant.subscription.status === 'past_due') restaurant.subscription.status = 'active';
             restaurant.subscription.haltedCount = 0;
             restaurant.subscription.firstHaltedAt = undefined;
             restaurant.subscription.scheduledSuspendAt = undefined;
@@ -608,68 +623,13 @@ async function handleSubscriptionEvent(event, payload) {
             try {
                 const pmt = payload?.payment?.entity;
                 if (pmt && pmt.id) {
-                    // Per-day, per-tenant invoice counter. Cheap
-                    // enough to just count existing rows for today —
-                    // we're nowhere near scale where this would be a
-                    // hotspot.
-                    const startOfDay = new Date();
-                    startOfDay.setHours(0, 0, 0, 0);
-                    const todayCount = await SubscriptionInvoice.countDocuments({
-                        restaurant: restaurant._id,
-                        createdAt: { $gte: startOfDay },
+                    // Shared with the Orders-API path: numbering, dedupe,
+                    // cycle + GST split (utils/planPaymentApply.createPaidInvoice).
+                    await createPaidInvoice({
+                        restaurant, payment: pmt, logTag: 'subscription.charged',
+                        billingCycle: cycle, periodStart, periodEnd,
+                        razorpaySubscriptionId: sub.id,
                     });
-                    // Local calendar date — the same basis as the local
-                    // midnight `startOfDay` (toISOString() gave the UTC
-                    // date, i.e. yesterday east of UTC).
-                    const ymd = localYmd(startOfDay);
-
-                    // Period end the charge paid for is the
-                    // `sub.current_end` we just set. Period start is
-                    // the previous period end if we have one on file
-                    // (the old value of currentPeriodEnd before the
-                    // update above — we kept it in `previousRzpStatus`
-                    // case but not here; read it off the doc fresh).
-                    // Fallback to sub.start_at or the charge time.
-                    const periodEnd = sub.current_end ? new Date(sub.current_end * 1000) : null;
-                    const periodStart = sub.start_at ? new Date(sub.start_at * 1000) : new Date();
-
-                    // countDocuments + 1 races with a concurrent invoice for
-                    // the same tenant/day: on an invoiceNumber E11000 take the
-                    // next slot (bounded, same as applyPaidPlanUpgrade). A
-                    // razorpayPaymentId E11000 falls through to the outer
-                    // catch as the expected retried-webhook no-op.
-                    let invoiceNumber = '';
-                    let saved = null;
-                    for (let attempt = 0, seq = todayCount + 1; attempt < 50 && !saved; attempt++, seq++) {
-                        invoiceNumber = `INV-${ymd}-${String(seq).padStart(4, '0')}`;
-                        try {
-                            saved = await SubscriptionInvoice.create({
-                                restaurant: restaurant._id,
-                                restaurantName: restaurant.name,
-                                invoiceNumber,
-                                planName: restaurant.subscription?.planName || '',
-                                planSlug: restaurant.subscription?.planSlug || '',
-                                amount: pmt.amount || 0,
-                                currency: pmt.currency || 'INR',
-                                periodStart,
-                                periodEnd,
-                                razorpayPaymentId: pmt.id,
-                                razorpaySubscriptionId: sub.id,
-                                status: 'paid',
-                                paidAt: pmt.created_at ? new Date(pmt.created_at * 1000) : new Date(),
-                            });
-                        } catch (insertErr) {
-                            if (insertErr?.code === 11000 && /invoiceNumber/.test(insertErr.message || '')) {
-                                logger.info(`SubscriptionInvoice number ${invoiceNumber} race-lost for ${restaurant.slug}, retrying`);
-                                continue;
-                            }
-                            throw insertErr;
-                        }
-                    }
-                    if (!saved) {
-                        throw new Error(`Could not allocate a unique invoiceNumber after 50 attempts (tenant ${restaurant.slug})`);
-                    }
-                    logger.info(`SubscriptionInvoice created for ${restaurant.slug}: ${invoiceNumber}`);
                 } else {
                     logger.warn(`subscription.charged for ${restaurant.slug} had no payment entity — skipping invoice creation`);
                 }
@@ -719,8 +679,14 @@ async function handleSubscriptionEvent(event, payload) {
             // request), apply the new plan now. `force: true` because
             // we trust the Razorpay event timing — Razorpay only
             // fires `completed` once the actual cycle has ended.
+            // Prepaid terms (annual / biennial) are keyed on currentPeriodEnd
+            // (effectiveAt), NOT on this event: Razorpay's cancel / completed
+            // timing is not the date the tenant paid through. Only monthly
+            // tenants keep the old force-on-completed behaviour; the daily
+            // renewal job and the lazy page-load check apply the rest.
             if (event === 'subscription.completed' && restaurant.subscription?.scheduledDowngrade?.planSlug) {
-                const result = applyScheduledDowngrade(restaurant, { force: true });
+                const prepaid = normalizeCycle(restaurant.subscription.billingCycle) !== 'monthly';
+                const result = applyScheduledDowngrade(restaurant, { force: !prepaid });
                 if (result.applied) {
                     logger.info(`Scheduled downgrade applied for ${restaurant.slug} → ${restaurant.subscription.planName}`);
                 }

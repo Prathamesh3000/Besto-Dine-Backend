@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Restaurant = require('../models/restaurant');
 const Branch = require('../models/branch');
 const logger = require('../utils/logger');
+const { isTrialLocked, allowedWhileLocked, v1PathOf, trialExpiredBody } = require('../utils/trialLock');
 const cacheBus = require('../utils/cacheBus');
 const {
     getContext,
@@ -380,8 +381,19 @@ function readSlugFromRequest(req) {
     return null;
 }
 
-function ensureNotLocked(restaurant, res) {
+function ensureNotLocked(restaurant, res, req) {
     if (!restaurant) return true;
+    // Free trial ended unpaid: data kept, everything but the owner's billing /
+    // export routes answers TRIAL_EXPIRED (utils/trialLock). Checked before
+    // the generic suspension below, which the sweeper's lock would trip.
+    if (isTrialLocked(restaurant)) {
+        if (req && allowedWhileLocked(req.user, v1PathOf(req))) {
+            req.trialLocked = true;
+            return true;
+        }
+        res.status(403).json(trialExpiredBody(restaurant));
+        return false;
+    }
     if (restaurant.status === 'suspended' || restaurant.status === 'cancelled') {
         res.status(403).json({
             success: false,
@@ -542,7 +554,7 @@ const attachTenant = async (req, res, next) => {
                     message: 'Your restaurant account is no longer available.',
                 });
             }
-            if (!ensureNotLocked(r, res)) return;
+            if (!ensureNotLocked(r, res, req)) return;
             req.restaurant = r;
             const bres = await resolveActiveBranch(req);
             if (!bres.ok) {
@@ -601,7 +613,7 @@ const attachTenant = async (req, res, next) => {
                 domainVerified: true,
             });
             if (byDomain) {
-                if (!ensureNotLocked(byDomain, res)) return;
+                if (!ensureNotLocked(byDomain, res, req)) return;
                 req.restaurant = byDomain;
                 const bres = await resolveActiveBranch(req);
                 if (!bres.ok) {
@@ -617,7 +629,7 @@ const attachTenant = async (req, res, next) => {
         if (slug) {
             const r = await resolveBySlug(slug);
             if (r) {
-                if (!ensureNotLocked(r, res)) return;
+                if (!ensureNotLocked(r, res, req)) return;
                 req.restaurant = r;
                 const bres = await resolveActiveBranch(req);
                 if (!bres.ok) {

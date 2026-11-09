@@ -7,6 +7,7 @@ const { recordAudit } = require('../../utils/audit');
 const { isBillingConfigured, cancelRazorpaySubscription } = require('../../utils/razorpayBilling');
 const logger = require('../../utils/logger');
 const { snapshotPlan, buildRestaurantPayload } = require('./_shared');
+const { monthlyEquivalent, addCycle } = require('../../utils/billingCycles');
 
 // POST /api/v1/superadmin/restaurants/:id/plan-change-request
 // Body: { planId, note? }
@@ -118,7 +119,8 @@ exports.approvePlanChangeRequest = async (req, res) => {
         // tenants without a snapshotted price.
         let currentPrice = 0;
         if (typeof restaurant.subscription?.price === 'number') {
-            currentPrice = restaurant.subscription.price;
+            // Monthly equivalent: an annual snapshot is 12 months in one number.
+            currentPrice = monthlyEquivalent(restaurant.subscription.price, restaurant.subscription.billingCycle);
         } else if (restaurant.subscription?.plan) {
             const currentPlanDoc = await SubscriptionPlan.findById(restaurant.subscription.plan).select('price');
             currentPrice = currentPlanDoc?.price ?? 0;
@@ -146,9 +148,17 @@ exports.approvePlanChangeRequest = async (req, res) => {
             // subscription.completed webhook will apply the new plan
             // server-side.
             const currentPeriodEnd = restaurant.subscription?.currentPeriodEnd;
-            const effectiveAt = currentPeriodEnd
-                ? new Date(currentPeriodEnd)
-                : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // safety fallback: +30d
+            // Safety fallback when no period end is on file: one paid cycle
+            // after the last charge / start (monthly +1, annual +12 months);
+            // never earlier than now.
+            let effectiveAt;
+            if (currentPeriodEnd) {
+                effectiveAt = new Date(currentPeriodEnd);
+            } else {
+                const anchor = restaurant.subscription?.lastChargedAt || restaurant.subscription?.startDate || new Date();
+                effectiveAt = addCycle(anchor, restaurant.subscription?.billingCycle);
+                if (effectiveAt < new Date()) effectiveAt = addCycle(new Date(), 'monthly');
+            }
 
             const liveSubId = restaurant.subscription?.razorpaySubscriptionId;
             let cancelResult = { attempted: false, ok: false };
@@ -172,6 +182,7 @@ exports.approvePlanChangeRequest = async (req, res) => {
                 planName: plan.name,
                 planSlug: plan.slug,
                 price: typeof plan.price === 'number' ? plan.price : 0,
+                billingCycle: 'monthly',   // renewal on the lower plan starts monthly; owner picks a cycle at checkout
                 features: plan.features?.toObject ? plan.features.toObject() : { ...(plan.features || {}) },
                 limits:   plan.limits?.toObject   ? plan.limits.toObject()   : { ...(plan.limits   || {}) },
                 effectiveAt,

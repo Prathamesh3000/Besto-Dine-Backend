@@ -343,7 +343,14 @@ function drawInvoice(doc, invoice, tenant) {
     fillRect(doc, tableX, y, tableW, rowH, '#FFFFFF');
     strokeLine(doc, tableX, y + rowH, tableX + tableW, y + rowH);
 
-    value(doc, `${invoice.planName || 'Subscription'} Plan`, colDescX, y + 10, {
+    // Cycle + GST split (rows from before annual billing have neither:
+    // read as monthly, whole amount as subtotal, no tax).
+    const cycleLabel = { monthly: 'Monthly', annual: 'Annual', biennial: '2-year' }[invoice.billingCycle] || 'Monthly';
+    const hasGst = typeof invoice.baseAmount === 'number' && typeof invoice.gstAmount === 'number';
+    const subtotal = hasGst ? invoice.baseAmount : invoice.amount;
+    const taxAmount = hasGst ? invoice.gstAmount : 0;
+
+    value(doc, `${invoice.planName || 'Subscription'} Plan (${cycleLabel})`, colDescX, y + 10, {
         width: colDesc - 20, size: 11, bold: true,
     });
     value(doc,
@@ -353,10 +360,10 @@ function drawInvoice(doc, invoice, tenant) {
     doc.font('Helvetica').fontSize(11).fillColor(COLOR_BODY)
         .text('1', colQtyX, y + 16, { width: colQty - 6, align: 'right', lineBreak: false });
     doc.font('Helvetica').fontSize(11).fillColor(COLOR_BODY)
-        .text(formatAmount(invoice.amount, invoice.currency),
+        .text(formatAmount(subtotal, invoice.currency),
             colUnitX, y + 16, { width: colUnit - 6, align: 'right' });
     doc.font('Helvetica-Bold').fontSize(11).fillColor(COLOR_INK)
-        .text(formatAmount(invoice.amount, invoice.currency),
+        .text(formatAmount(subtotal, invoice.currency),
             colAmtX, y + 16, { width: colAmount - 14, align: 'right' });
 
     y += rowH + 14;
@@ -376,8 +383,8 @@ function drawInvoice(doc, invoice, tenant) {
         y += size + 8;
     };
 
-    drawTotalRow('Subtotal', formatAmount(invoice.amount, invoice.currency));
-    drawTotalRow('Tax', formatAmount(0, invoice.currency));   // SaaS billing — tax handled out-of-band today
+    drawTotalRow('Subtotal', formatAmount(subtotal, invoice.currency));
+    drawTotalRow(hasGst && invoice.gstRate ? `GST (${invoice.gstRate}%)` : 'Tax', formatAmount(taxAmount, invoice.currency));
     strokeLine(doc, totalsX, y, totalsX + totalsW, y, COLOR_LINE, 1);
     y += 8;
     drawTotalRow('Total Paid', formatAmount(invoice.amount, invoice.currency), { bold: true, large: true });

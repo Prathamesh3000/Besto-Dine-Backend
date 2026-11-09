@@ -14,6 +14,11 @@
  *      the new `campaigns` key set to whatever couponPromotions was (that
  *      bundle used to include campaigns) and the other new keys off.
  *   2. Creates (or refreshes) Silver, Gold and Premium from the line-up.
+ *      Each also gets its per-cycle `prices` (monthly / annual / 2-year,
+ *      before GST); re-running rewrites them, so a price change in
+ *      config/planLineup.js is applied by re-running. Stale Razorpay plan ids
+ *      are left alone: utils/razorpayBilling re-creates any id whose stored
+ *      amount no longer matches.
  *   3. Enterprise gets the new module keys switched on; its price and
  *      limits are left alone.
  *
@@ -71,6 +76,7 @@ async function applyPlanLineup({ SubscriptionPlan, Restaurant }, { dryRun = fals
             if (!dryRun) {
                 await SubscriptionPlan.updateOne({ _id: existing._id }, { $set: {
                     name: spec.name, description: spec.description, price: spec.price,
+                    prices: spec.prices,
                     billingCycle: spec.billingCycle, trialDays: spec.trialDays, sortOrder: spec.sortOrder,
                     isPublic: spec.isPublic, highlight: spec.highlight, isActive: true,
                     features: spec.features, limits: spec.limits,
@@ -78,7 +84,7 @@ async function applyPlanLineup({ SubscriptionPlan, Restaurant }, { dryRun = fals
             }
         } else {
             report.created.push(spec.slug);
-            log(`• create: ${spec.slug} (₹${spec.price}/mo)`);
+            log(`• create: ${spec.slug} (₹${spec.price}/mo, ₹${spec.prices?.annual}/yr, ₹${spec.prices?.biennial}/2yr)`);
             if (!dryRun) await SubscriptionPlan.create(spec);
         }
     }

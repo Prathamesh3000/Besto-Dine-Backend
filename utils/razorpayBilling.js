@@ -1,5 +1,9 @@
 const Razorpay = require('razorpay');
 const logger = require('./logger');
+const {
+    normalizeCycle, priceWithGst, priceForPlan,
+    RAZORPAY_INTERVAL, RAZORPAY_TOTAL_COUNT,
+} = require('./billingCycles');
 
 /**
  * Razorpay Subscriptions SDK wrapper for BestoDine SaaS billing.
@@ -64,12 +68,35 @@ function toPaise(amount) {
 // Subscriptions need a total_count — the number of billing cycles the
 // subscription runs for. We default to a very high number (effectively
 // "until the customer cancels") rather than binding the tenant to a
-// fixed term.
-const DEFAULT_TOTAL_COUNT = {
-    monthly:   120,   // 10 years of monthly charges
-    quarterly: 40,    // 10 years of quarterly charges
-    yearly:    10,    // 10 years of yearly charges
-};
+// fixed term. Per BestoDine cycle (utils/billingCycles): monthly 120,
+// annual 10, biennial 5 — about 10 years each.
+const DEFAULT_TOTAL_COUNT = RAZORPAY_TOTAL_COUNT;
+
+// Razorpay plan id stored for a BestoDine billing cycle ('' when none).
+// The monthly cycle falls back to the legacy single `razorpayPlanId`.
+function storedPlanId(plan, cycle) {
+    const id = plan?.razorpayPlanIds?.[cycle];
+    if (id) return id;
+    return cycle === 'monthly' ? (plan?.razorpayPlanId || '') : '';
+}
+
+// What Razorpay must charge per cycle: base price + GST, in paise.
+function chargeForPlan(plan, cycle) {
+    const base = priceForPlan(plan, cycle);
+    if (base === null) return null;
+    return priceWithGst(base);
+}
+
+// A stored Razorpay plan id is usable only if we know the amount it was
+// created at AND that amount still equals the current GST-inclusive price.
+// Razorpay plans are immutable, so an edited price (or a pre-GST plan id
+// from before annual billing) must never be reused: it keeps charging the
+// old amount.
+function isPlanIdFresh(plan, cycle) {
+    const charge = chargeForPlan(plan, cycle);
+    if (!charge || !storedPlanId(plan, cycle)) return false;
+    return plan?.razorpayPlanAmounts?.[cycle] === charge.totalPaise;
+}
 
 // ── Plan sync ─────────────────────────────────────────────────────────
 
@@ -81,38 +108,49 @@ const DEFAULT_TOTAL_COUNT = {
  * Returns the plan document (for chaining).
  * Throws if billing is not configured or the API call fails.
  */
-async function ensureRazorpayPlan(plan) {
+async function ensureRazorpayPlan(plan, cycle = 'monthly') {
     const client = getClient();
     if (!client) throw new Error('Razorpay billing not configured');
     if (!plan || !plan._id) throw new Error('ensureRazorpayPlan requires a plan doc');
 
-    if (plan.razorpayPlanId) return plan;
+    const c = normalizeCycle(cycle);
+    const charge = chargeForPlan(plan, c);
 
-    // Free plans (price === 0) deliberately do not get a Razorpay plan
-    // — they're comps and should never be auto-charged.
-    if (!plan.price || plan.price <= 0) {
-        throw new Error('Cannot create Razorpay plan for a zero-price plan');
+    // Free plans (no price) deliberately do not get a Razorpay plan
+    // — they're comps and should never be auto-charged. Same for a
+    // cycle the plan does not sell.
+    if (!charge || charge.basePaise <= 0) {
+        throw new Error(`Cannot create Razorpay plan: ${plan.slug} has no ${c} price`);
     }
 
+    if (isPlanIdFresh(plan, c)) return plan;
+
     try {
+        const { period, interval } = RAZORPAY_INTERVAL[c];
         const rzpPlan = await client.plans.create({
-            period: toRazorpayPeriod(plan.billingCycle),
-            interval: 1,
+            period,
+            interval,
             item: {
-                name: plan.name,
-                amount: toPaise(plan.price),
+                name: `${plan.name} (${c})`,
+                amount: charge.totalPaise,          // base + GST
                 currency: plan.currency || 'INR',
-                description: plan.description || `BestoDine ${plan.name} plan`,
+                description: plan.description || `BestoDine ${plan.name} plan, ${c} (incl. ${charge.gstRate}% GST)`,
             },
             notes: {
                 planSlug: plan.slug,
                 planId: plan._id.toString(),
+                billingCycle: c,
+                basePaise: String(charge.basePaise),
+                gstRate: String(charge.gstRate),
             },
         });
 
-        plan.razorpayPlanId = rzpPlan.id;
+        const plain = (v) => (v && v.toObject ? v.toObject() : { ...(v || {}) });
+        plan.razorpayPlanIds = { ...plain(plan.razorpayPlanIds), [c]: rzpPlan.id };
+        plan.razorpayPlanAmounts = { ...plain(plan.razorpayPlanAmounts), [c]: charge.totalPaise };
+        if (c === 'monthly') plan.razorpayPlanId = rzpPlan.id;
         await plan.save();
-        logger.info(`Razorpay plan created for "${plan.slug}": ${rzpPlan.id}`);
+        logger.info(`Razorpay plan created for "${plan.slug}" (${c}): ${rzpPlan.id}`);
         return plan;
     } catch (err) {
         // If 401, the Subscriptions product isn't enabled. Let the
@@ -216,25 +254,32 @@ async function ensureRazorpayCustomer(restaurant, owner) {
  * `fallbackOrder: true` + `orderId` instead of `short_url`, and the
  * frontend opens the standard Razorpay Checkout popup.
  */
-async function createRazorpaySubscription({ plan, restaurant, customerId }) {
+async function createRazorpaySubscription({ plan, restaurant, customerId, cycle = 'monthly', forceOrder = false }) {
     const client = getClient();
     if (!client) throw new Error('Razorpay billing not configured');
+    const c = normalizeCycle(cycle);
+    const charge = chargeForPlan(plan, c);
+    if (!charge) throw new Error(`Plan ${plan?.slug} has no ${c} price`);
 
     // Try the Subscriptions API first (requires the Subscriptions
     // product to be enabled on the Razorpay account).
     try {
-        if (!plan?.razorpayPlanId) {
-            // Plan not yet synced — will trigger ensureRazorpayPlan
-            // which may fail if Subscriptions isn't enabled.
+        // Renewals extend the current paid term with a one-time Order (no
+        // recurring subscription whose first period would overlap it).
+        if (forceOrder) throw { statusCode: 401, error: 'One-time order requested' };
+        if (!isPlanIdFresh(plan, c)) {
+            // Plan not yet synced for this cycle (or synced at an older
+            // price, which must never be charged) — will trigger
+            // ensureRazorpayPlan which may fail if Subscriptions isn't enabled.
             throw { statusCode: 401, error: 'Plan not synced and subscriptions may not be available' };
         }
 
         if (!customerId) throw new Error('createRazorpaySubscription requires a customerId');
 
-        const totalCount = DEFAULT_TOTAL_COUNT[plan.billingCycle] || DEFAULT_TOTAL_COUNT.monthly;
+        const totalCount = DEFAULT_TOTAL_COUNT[c] || DEFAULT_TOTAL_COUNT.monthly;
 
         const sub = await client.subscriptions.create({
-            plan_id: plan.razorpayPlanId,
+            plan_id: storedPlanId(plan, c),
             customer_notify: 1,
             quantity: 1,
             total_count: totalCount,
@@ -242,6 +287,7 @@ async function createRazorpaySubscription({ plan, restaurant, customerId }) {
                 restaurantId: restaurant._id.toString(),
                 restaurantSlug: restaurant.slug,
                 planSlug: plan.slug,
+                billingCycle: c,
             },
         });
 
@@ -260,7 +306,9 @@ async function createRazorpaySubscription({ plan, restaurant, customerId }) {
             `Subscriptions API unavailable (401) for ${restaurant.slug} — falling back to Orders API`
         );
 
-        const amountInPaise = toPaise(plan.price);
+        // Charge the cycle total INCLUDING GST. No auto-renew on this path:
+        // utils/renewalReminderJob emails the owner before the term ends.
+        const amountInPaise = charge.totalPaise;
         const order = await client.orders.create({
             amount: amountInPaise,
             currency: plan.currency || 'INR',
@@ -271,10 +319,13 @@ async function createRazorpaySubscription({ plan, restaurant, customerId }) {
                 restaurantSlug: restaurant.slug,
                 planSlug: plan.slug,
                 planName: plan.name,
+                billingCycle: c,
+                basePaise: String(charge.basePaise),
+                gstRate: String(charge.gstRate),
             },
         });
 
-        logger.info(`Fallback order created for ${restaurant.slug}: ${order.id} (₹${plan.price})`);
+        logger.info(`Fallback order created for ${restaurant.slug}: ${order.id} (${c}, ${amountInPaise} paise incl. GST)`);
 
         // Return a shape compatible with the subscription result so
         // callers can handle both paths. `fallbackOrder: true` tells
@@ -359,4 +410,7 @@ module.exports = {
     fetchRazorpayPayment,
     toRazorpayPeriod,
     toPaise,
+    storedPlanId,
+    chargeForPlan,
+    isPlanIdFresh,
 };
