@@ -9,7 +9,7 @@ const Coupon = require('../models/coupon');
 const Request = require('../models/request');
 const logger = require('../utils/logger');
 
-const { tenantFilter, analyticsBranchFilter, pinnedBranchId, strictBranchFilter } = require('../utils/tenantScope');
+const { tenantFilter, analyticsBranchFilter, pinnedBranchId, strictBranchFilter, branchScopeClause } = require('../utils/tenantScope');
 const { tenantLookup } = require('../utils/tenantSafe');
 const { sendServerError } = require('../utils/httpErrors');
 const { featureTier } = require('../utils/featureAccess');
@@ -101,18 +101,32 @@ exports.getStats = async (req, res) => {
     // no-op (already migrated) or a leak (older deploys still mid-
     // migration). Branches that never opted into "Copy menu from Main"
     // now correctly show 0.
-    const menuBranchFilter = pinned
-      ? { $or: [{ branch: pinned }, { 'branchPrices.branch': pinned }] }
-      : (activeBranch
-          ? { $or: [{ branch: activeBranch }, { 'branchPrices.branch': activeBranch }] }
-          : {});
+    //
+    // Exception (browser QA 2026-11-16): items saved as "Shared across all
+    // branches" keep branch:null and belong to the tenant's MAIN branch
+    // (utils/tenantScope.branchScopeClause — the same rule the Menu page and
+    // staff pinned to Main use). A Main view must therefore count them too,
+    // otherwise the dashboard read "0 active / 0 inactive" next to a Menu page
+    // listing 12 items. Any other branch stays strict, so nothing leaks.
+    const scopedBranch = pinned || activeBranch;
+    const scopedIsMain = !!scopedBranch && !!req?.mainBranchId
+      && String(req.mainBranchId) === String(scopedBranch._id || scopedBranch);
+    const menuBranchFilter = scopedBranch
+      ? {
+          $or: [
+            { branch: scopedBranch },
+            { 'branchPrices.branch': scopedBranch },
+            ...(scopedIsMain ? [{ branch: null }] : []),
+          ],
+        }
+      : {};
     const tfbMenu = { ...tf, ...menuBranchFilter };
 
-    // STRICT for Coupons — branch admin sees only their own branch's
-    // active offers. Tenant owner via switcher also gets strict scope
-    // (`?branch=<id>` honored); without this, picking a sub-branch
-    // still surfaced Main's 6 active offers in the dashboard count.
-    const couponBranchFilter = activeBranch ? { branch: activeBranch } : {};
+    // Coupons follow the same rule: a Main view includes tenant-wide
+    // (branch:null) coupons, a sub-branch view stays strict — branch admin
+    // sees only their own branch's active offers, and picking a sub-branch
+    // does not surface Main's offers.
+    const couponBranchFilter = activeBranch ? branchScopeClause(req, activeBranch) : {};
     const tfbCoupon = { ...tf, ...couponBranchFilter };
 
     // Validate query params
