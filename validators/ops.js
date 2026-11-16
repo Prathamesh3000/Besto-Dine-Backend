@@ -8,7 +8,7 @@
 // checked. Routes whose controllers already return 400/404 for malformed ids
 // (print jobs/bills, invoice generate, shift staff ids) are not re-guarded.
 // Required-field messages stay in the controllers; unknown keys are allowed.
-const { validate, param, objectIdParam, optionalObjectId } = require('../middlewares/validate');
+const { validate, body, param, objectIdParam, optionalObjectId } = require('../middlewares/validate');
 const {
     optionalAmount, optionalText, optionalBool, optionalDate, optionalArray,
     lines, ruleOid, ruleNum,
@@ -112,7 +112,14 @@ const inventoryFields = [
     optionalAmount('minStock', { max: STOCK_MAX, label: 'Min stock' }),
     optionalAmount('maxStock', { max: STOCK_MAX, label: 'Max stock' }),
     optionalAmount('costPerUnit', { max: MAX_MONEY, label: 'Cost per unit' }),
-    optionalText('supplier', 200, { label: 'Supplier' }),
+    // The item's supplier is the nested { name, contact } the model stores and the
+    // Add/Edit Item form sends -- not a single string (a string check rejected
+    // every create/edit from the UI with "Supplier must be text").
+    body('supplier')
+        .optional({ values: 'null' })
+        .custom((v) => v && typeof v === 'object' && !Array.isArray(v)
+            && ['name', 'contact'].every((k) => v[k] == null || (typeof v[k] === 'string' && v[k].length <= 200)))
+        .withMessage('Supplier must be an object with text name and contact (max 200 characters each)'),
     optionalDate('expiryDate', { label: 'Expiry date' }),
     optionalObjectId('body', 'branch', 'Invalid branch'),
     optionalBool('expiryTracking', { label: 'expiryTracking' }),
