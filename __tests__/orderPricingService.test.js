@@ -661,3 +661,36 @@ describe('bill recompute when settings cannot be read', () => {
         expect(order.total).toBe(300.3);
     });
 });
+
+// ── BUG-37: two sizes of one dish are two lines, never merged ────────
+describe('same dish, different sizes (Half + Full)', () => {
+    const biryani = () => menu({
+        _id: 'bir', name: 'Veg Biryani', basePrice: 160, finalPrice: 160,
+        sizes: [{ name: 'Half', price: 160 }, { name: 'Full', price: 260 }], toppings: [],
+    });
+    const lines = () => ([
+        { menuItem: 'bir', quantity: 1, price: 999, selectedSizes: [{ name: 'Half', price: 1 }] },
+        { menuItem: 'bir', quantity: 1, price: 999, selectedSizes: [{ name: 'Full', price: 1 }] },
+    ]);
+    const withGst = (subtotal) => computeBill({ subtotal, taxConfig: toTaxConfig({ gst: { enabled: true, value: 5 } }), orderType: 'dine-in' }).total;
+
+    test('create: priceCartItems keeps both lines and prices them 160 + 260 = 420 (+5% GST = 441)', () => {
+        const items = lines();
+        const subtotal = pricing.priceCartItems(items, byId(biryani()), null);
+        expect(items).toHaveLength(2);
+        expect(items.map((i) => i.price)).toEqual([160, 260]);
+        expect(subtotal).toBe(420);
+        expect(withGst(subtotal)).toBe(441);
+        const enriched = pricing.enrichCartItems(items, byId(biryani()));
+        expect(enriched).toHaveLength(2);
+        expect(enriched.map((i) => [i.selectedSizes[0].name, i.price])).toEqual([['Half', 160], ['Full', 260]]);
+    });
+
+    test('append: buildAppendItems keeps both lines, 160 and 260, delta 420 (+5% GST = 441)', () => {
+        const { enrichedItems, deltaTotal } = pricing.buildAppendItems(lines(), byId(biryani()), null);
+        expect(enrichedItems).toHaveLength(2);
+        expect(enrichedItems.map((i) => [i.selectedSizes[0].name, i.price])).toEqual([['Half', 160], ['Full', 260]]);
+        expect(deltaTotal).toBe(420);
+        expect(withGst(deltaTotal)).toBe(441);
+    });
+});
