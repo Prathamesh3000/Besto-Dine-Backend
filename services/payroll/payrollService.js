@@ -6,6 +6,8 @@
  * ctx = { restaurantId, timezone, actorId, pinnedBranchId }
  */
 const mongoose = require('mongoose');
+const Branch = require('../../models/branch');
+const { refOwned } = require('../../utils/tenantRefs');
 const StaffPayProfile = require('../../models/staffPayProfile');
 const PayrollRun = require('../../models/payrollRun');
 const PayrollPayout = require('../../models/payrollPayout');
@@ -107,7 +109,7 @@ async function createDraft(ctx, body = {}) {
 
     let branchId = ctx.pinnedBranchId || null;
     if (!branchId && body.branch) {
-        if (!mongoose.Types.ObjectId.isValid(body.branch)) throw httpErr(400, 'Invalid branch id.');
+        if (!(await refOwned(Branch, body.branch, ctx.restaurantId))) throw httpErr(400, 'Invalid branch id.');
         branchId = body.branch;
     }
 
@@ -224,6 +226,15 @@ function assertBranchAccess(ctx, run) {
     }
 }
 
+// A run whose lines add up to no net pay (no attendance, no incentives) must
+// not be finalized or paid out: it would lock the staff/period for nothing.
+// Lines with 0 net pay are fine as long as the run pays something overall.
+const EMPTY_RUN_MSG = 'No attendance in this period: nothing to pay. Check the period dates and that staff have attendance (clock-in shifts) before finalizing.';
+function assertRunHasPay(run) {
+    const net = round2((run.lines || []).reduce((s, l) => s + (Number(l.netPay) || 0), 0));
+    if (!(net > 0)) throw httpErr(409, EMPTY_RUN_MSG, 'EMPTY_RUN');
+}
+
 // ---------------------------------------------------------------- finalize
 async function finalize(ctx, runId) {
     if (!mongoose.Types.ObjectId.isValid(runId)) throw httpErr(400, 'Invalid run id.');
@@ -232,6 +243,7 @@ async function finalize(ctx, runId) {
     assertBranchAccess(ctx, run);
     if (run.status !== 'draft') throw httpErr(409, 'Only a draft run can be finalized.', 'RUN_LOCKED');
     if (!run.lines.length) throw httpErr(400, 'Cannot finalize an empty run.');
+    assertRunHasPay(run);
 
     const staffIds = run.lines.map((l) => l.staff);
     const clash = await lockedOverlaps(ctx.restaurantId, staffIds, run.periodStart, run.periodEnd, run._id);
@@ -275,6 +287,7 @@ async function markPaid(ctx, runId, body = {}) {
         throw httpErr(409, `Run is already paid via ${existing.payoutMethod}.`, 'ALREADY_PAID');
     }
     if (existing.status !== 'finalized') throw httpErr(409, 'Only a finalized run can be marked paid.', 'RUN_NOT_FINALIZED');
+    assertRunHasPay(existing);
     const run = await PayrollRun.findOneAndUpdate(
         { _id: runId, restaurant: ctx.restaurantId, status: 'finalized' },
         { $set: { status: 'paid', paidBy: ctx.actorId || null, paidAt: new Date(), payoutMethod: method, payoutReference: reference } },
@@ -305,6 +318,7 @@ async function payViaWallet(ctx, runId) {
             throw httpErr(409, `Run is already paid via ${run.payoutMethod}.`, 'ALREADY_PAID');
         }
         if (run.status !== 'finalized') throw httpErr(409, 'Only a finalized run can be marked paid.', 'RUN_NOT_FINALIZED');
+        assertRunHasPay(run);
 
         const payLines = run.lines.filter((l) => l.netPay > 0);
         const users = await User.find({ _id: { $in: payLines.map((l) => l.staff) }, restaurant: ctx.restaurantId })
