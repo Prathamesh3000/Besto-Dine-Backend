@@ -256,7 +256,20 @@ exports.receive = asyncHandler(async (req, res) => {
         if (!(qty > 0)) continue; // skip zero rows
         const poLine = po.lines.find(l => String(l.inventoryItem) === String(rl.inventoryItem));
         if (!poLine) return res.status(400).json({ success: false, message: 'A received line does not match any PO line' });
-        poLine.receivedQty = roundQty((poLine.receivedQty || 0) + qty);
+        // No over-delivery tolerance exists on the PO model: cumulative received
+        // (including earlier rows of this same request) may not exceed ordered.
+        const ordered = roundQty(poLine.orderedQty || 0);
+        const already = roundQty(poLine.receivedQty || 0);
+        const remaining = roundQty(Math.max(0, ordered - already));
+        if (qty > remaining) {
+            return res.status(400).json({
+                success: false,
+                code: 'OVER_RECEIPT',
+                message: `Cannot receive ${qty} of "${poLine.name}": ordered ${ordered}, already received ${already}, remaining ${remaining}`,
+                details: { inventoryItem: String(poLine.inventoryItem), ordered, received: already, remaining, attempted: qty },
+            });
+        }
+        poLine.receivedQty = roundQty(already + qty);
         grnLines.push({
             inventoryItem: poLine.inventoryItem,
             name: poLine.name,
