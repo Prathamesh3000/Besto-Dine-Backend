@@ -158,6 +158,10 @@ exports.createItem = async (req, res) => {
         if (validationErrors.length > 0) {
             return res.status(400).json({ success: false, message: validationErrors[0], errors: validationErrors });
         }
+        // Both are required by the model; omitting them used to surface a raw
+        // Mongoose "Cast to Number failed for value NaN" message (BUG-18).
+        if (minStock === undefined || minStock === null || minStock === '') validationErrors.push('Min stock is required');
+        if (costPerUnit === undefined || costPerUnit === null || costPerUnit === '') validationErrors.push('Cost per unit is required');
 
         const tf = tenantFilter(req);
         const safeName = escapeRegex(name.trim());
