@@ -422,6 +422,10 @@ const getTableByToken = async (req, res) => {
 
         // Auto-occupy the table on QR scan so the admin dashboard updates in real time.
         // Skip if it's already occupied/merged/reserved (don't clobber existing state).
+        // Remember whether the table was already taken BEFORE this scan: the
+        // response below reflects the auto-occupy, so the customer app cannot
+        // tell "this scan just seated me" from "someone left a bill here".
+        const wasFreeBeforeScan = effectiveTable.status === 'free';
         if (effectiveTable.status === 'free') {
             effectiveTable.status = 'occupied';
             await effectiveTable.save();
@@ -438,6 +442,17 @@ const getTableByToken = async (req, res) => {
         // modules the tenant hasn't paid for (Wallet, Bookings, Coupons)
         // so customers don't tap through to a 403.
         const tableObj = effectiveTable.toObject();
+        // `openBill` is true only when a previous party left an unpaid order
+        // on this table. A table this very scan occupied (or one that is
+        // merely seated, with no order) is NOT an open bill.
+        tableObj.openBill = !wasFreeBeforeScan && effectiveTable.status === 'occupied'
+            ? Boolean(await Order.exists({
+                table: effectiveTable._id,
+                status: { $in: ['awaiting-payment', 'new', 'preparing', 'ready', 'served'] },
+                paymentStatus: { $ne: 'Paid' },
+                restaurant: effectiveTable.restaurant?._id || effectiveTable.restaurant,
+            }))
+            : false;
 
         // Resolve the customer-facing logo. Three possible sources, in
         // priority order, mirroring what Settings.getSettings would return
