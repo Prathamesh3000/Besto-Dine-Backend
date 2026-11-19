@@ -485,6 +485,17 @@ function parseYmd(s) {
   return { y, m, d };
 }
 
+// A sale belongs to the day it was PAID (paidAt), falling back to createdAt
+// for unpaid / legacy orders: same rule as the GST report, ledger and cash
+// closing, so a bill straddling midnight lands on one day in every report.
+const EFFECTIVE_AT = { $ifNull: ['$paidAt', '$createdAt'] };
+const effectiveRange = (from, to) => ({
+  $or: [
+    { paidAt: { $gte: from, $lt: to } },
+    { paidAt: null, createdAt: { $gte: from, $lt: to } },
+  ],
+});
+
 // Build the earnings series for an arbitrary [fromUTC, toExclUTC) window.
 // Bucket granularity auto-scales with the span so the chart stays readable:
 //   single day  → hourly (9am–11pm, same window as the live dashboard)
@@ -492,13 +503,13 @@ function parseYmd(s) {
 //   longer      → one point per calendar month
 async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}, REPORT_TZ = DEFAULT_REPORT_TZ) {
   const spanDays = Math.round((toExclUTC.getTime() - fromUTC.getTime()) / 86400000);
-  const matchPaid = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tf };
+  const matchPaid = { ...effectiveRange(fromUTC, toExclUTC), paymentStatus: 'Paid', status: { $nin: NOT_A_SALE }, ...tf };
 
   if (spanDays <= 1) {
     // Hourly — reuse the same 9–23 window the dashboard uses.
     const result = await Order.aggregate([
       { $match: matchPaid },
-      { $group: { _id: { $hour: { date: '$createdAt', timezone: REPORT_TZ } }, total: { $sum: '$total' } } },
+      { $group: { _id: { $hour: { date: EFFECTIVE_AT, timezone: REPORT_TZ } }, total: { $sum: '$total' } } },
     ]);
     const hourMap = Object.fromEntries(result.map(r => [r._id, r.total]));
     const data = [];
@@ -513,7 +524,7 @@ async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}, REPORT_TZ = DEFAU
     const result = await Order.aggregate([
       { $match: matchPaid },
       { $group: {
-        _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } },
+        _id: { $dateToString: { format: '%Y-%m-%d', date: EFFECTIVE_AT, timezone: REPORT_TZ } },
         total: { $sum: '$total' },
       }},
     ]);
@@ -534,7 +545,7 @@ async function buildRangeEarnings(fromUTC, toExclUTC, tf = {}, REPORT_TZ = DEFAU
   const result = await Order.aggregate([
     { $match: matchPaid },
     { $group: {
-      _id: { $dateToString: { format: '%Y-%m', date: '$createdAt', timezone: REPORT_TZ } },
+      _id: { $dateToString: { format: '%Y-%m', date: EFFECTIVE_AT, timezone: REPORT_TZ } },
       total: { $sum: '$total' },
     }},
   ]);
@@ -598,7 +609,7 @@ exports.getReports = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Date range too large (max 2 years).' });
     }
 
-    const rangeMatch = { createdAt: { $gte: fromUTC, $lt: toExclUTC }, status: { $ne: HELD_STATUS }, ...tfb };
+    const rangeMatch = { ...effectiveRange(fromUTC, toExclUTC), status: { $ne: HELD_STATUS }, ...tfb };
     const spanMs = toExclUTC.getTime() - fromUTC.getTime();
     const rangeDays = Math.max(1, Math.round(spanMs / 86400000));
 
@@ -621,7 +632,7 @@ exports.getReports = async (req, res) => {
     // Previous equal-length window, immediately before `from` — powers the
     // period-over-period trend (is the business up or down vs last time?).
     const prevFromUTC = new Date(fromUTC.getTime() - spanMs);
-    const prevRangeMatch = { createdAt: { $gte: prevFromUTC, $lt: fromUTC }, status: { $ne: HELD_STATUS }, ...tfb };
+    const prevRangeMatch = { ...effectiveRange(prevFromUTC, fromUTC), status: { $ne: HELD_STATUS }, ...tfb };
 
     const [earnings, itemFacetArr, orderFacetArr, prevAgg] = await Promise.all([
       // 1. Earnings time-series (auto-bucketed by span) — the headline trend.
@@ -682,11 +693,11 @@ exports.getReports = async (req, res) => {
           ],
           byWeekday: [
             { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
-            { $group: { _id: { $dayOfWeek: { date: '$createdAt', timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
+            { $group: { _id: { $dayOfWeek: { date: EFFECTIVE_AT, timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byHour: [
             { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
-            { $group: { _id: { $hour: { date: '$createdAt', timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
+            { $group: { _id: { $hour: { date: EFFECTIVE_AT, timezone: REPORT_TZ } }, orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
           ],
           byChannel: [
             { $group: { _id: '$_channel', orders: { $sum: 1 }, earnings: { $sum: { $cond: [PAID, '$total', 0] } } } },
@@ -696,11 +707,25 @@ exports.getReports = async (req, res) => {
           ],
           byPayment: [
             { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
-            { $group: { _id: '$paymentMethod', orders: { $sum: 1 }, earnings: { $sum: '$total' } } },
+            // Per-tender lines (payments[]) so a cash 300 + UPI 700 bill shows
+            // cash 300 / upi 700; legacy orders without payments[] fall back
+            // to their single paymentMethod for the whole total.
+            { $addFields: { _tenders: { $cond: [
+              { $gt: [{ $size: { $ifNull: ['$payments', []] } }, 0] },
+              '$payments',
+              [{ method: '$paymentMethod', amount: '$total' }],
+            ] } } },
+            { $unwind: '$_tenders' },
+            { $group: {
+              _id: { $ifNull: ['$_tenders.method', '$paymentMethod'] },
+              orderIds: { $addToSet: '$_id' },
+              earnings: { $sum: { $ifNull: ['$_tenders.amount', 0] } },
+            } },
+            { $project: { _id: 1, orders: { $size: '$orderIds' }, earnings: 1 } },
           ],
           byDay: [
             { $match: { paymentStatus: 'Paid', status: { $nin: NOT_A_SALE } } },
-            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: REPORT_TZ } }, earnings: { $sum: '$total' }, orders: { $sum: 1 } } },
+            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: EFFECTIVE_AT, timezone: REPORT_TZ } }, earnings: { $sum: '$total' }, orders: { $sum: 1 } } },
             { $sort: { earnings: -1 } },
           ],
         }},
@@ -791,9 +816,18 @@ exports.getReports = async (req, res) => {
       if (row) byHour.push({ hour: h, label: formatHourLabel(h), orders: row.orders, earnings: Math.round(row.earnings || 0) });
     }
 
-    const shapeGroup = (rows, fallback = 'Unknown') => (rows || [])
-      .map(r => ({ label: r._id || fallback, orders: r.orders || 0, earnings: Math.round(r.earnings || 0) }))
-      .sort((a, b) => b.earnings - a.earnings);
+    // Largest-remainder rounding: the rows sum to round(sum of unrounded), so
+    // a breakdown never disagrees with the headline total by a rupee.
+    const shapeGroup = (rows, fallback = 'Unknown') => {
+      const list = (rows || []).map(r => ({ label: r._id || fallback, orders: r.orders || 0, raw: Number(r.earnings) || 0 }));
+      const target = Math.round(Math.round(list.reduce((s, r) => s + r.raw, 0) * 1e6) / 1e6);
+      const floors = list.map(r => Math.floor(r.raw));
+      let left = target - floors.reduce((s, n) => s + n, 0);
+      const byFrac = list.map((r, i) => i).sort((a, b) => (list[b].raw - floors[b]) - (list[a].raw - floors[a]));
+      for (let k = 0; left > 0 && k < byFrac.length; k++, left--) floors[byFrac[k]] += 1;
+      return list.map((r, i) => ({ label: r.label, orders: r.orders, earnings: floors[i] }))
+        .sort((a, b) => b.earnings - a.earnings);
+    };
 
     const byDayRows = orderFacet.byDay || [];
     const bestDay = byDayRows[0] ? { date: byDayRows[0]._id, earnings: Math.round(byDayRows[0].earnings), orders: byDayRows[0].orders } : null;

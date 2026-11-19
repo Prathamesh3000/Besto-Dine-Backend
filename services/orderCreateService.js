@@ -1362,8 +1362,18 @@ async function createOrder(req) {
   const {
     authoritativeDeliveryFee, authoritativeDeliverySlab, authoritativeDeliveryDistance, authoritativeDeliveryCoords,
   } = await pricing.resolveDeliveryFee(req, { wantsDelivery, deliveryReq, branchId, cleanDeliveryAddress, settings, authoritativeSubtotal });
+  // A takeaway is stamped at the body branchId when it is a live branch of
+  // this tenant (resolvePlacement) — coupon scope must follow that branch,
+  // not only the X-Branch-Id header.
+  let couponBranchId = pricingBranchId;
+  if (type === 'takeaway' && !pinnedBranchId(req) && branchId && isValidObjectId(branchId)) {
+    try {
+      const Branch = require('../models/branch');
+      if (await Branch.exists({ _id: branchId, ...tenantFilter(req), isActive: true })) couponBranchId = branchId;
+    } catch { /* keep the header-derived branch */ }
+  }
   const { authoritativeCouponCode, authoritativeCouponDiscount, couponId } = await pricing.resolveCartCoupon(req, {
-    items, menuById, authoritativeSubtotal, branchId: pricingBranchId,
+    items, menuById, authoritativeSubtotal, branchId: couponBranchId,
   });
   const { authoritativePointsRedeemed, authoritativePointsValue } = await pricing.resolvePointsRedemption(req, {
     validUserId, settings, authoritativeSubtotal, authoritativeCouponDiscount,

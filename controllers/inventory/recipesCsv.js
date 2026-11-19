@@ -2,6 +2,8 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const Inventory = require('../../models/inventory');
+const Branch = require('../../models/branch');
+const { refOwned } = require('../../utils/tenantRefs');
 const Recipe = require('../../models/recipe');
 const MenuItem = require('../../models/menuItem');
 const logger = require('../../utils/logger');
@@ -75,7 +77,14 @@ exports.importRecipesCsv = async (req, res) => {
         let branchId = pinnedBranchId(req);
         if (!branchId) {
             const rawBranchParam = req?.query?.branch || req?.body?.branch;
+            if (rawBranchParam && rawBranchParam !== 'all' && rawBranchParam !== 'none' && rawBranchParam !== 'tenant-only' && !mongoose.isValidObjectId(rawBranchParam)) {
+                return res.status(400).json({ success: false, message: 'Invalid branch' });
+            }
             if (rawBranchParam && mongoose.isValidObjectId(rawBranchParam)) {
+                // A body/query branch must belong to this tenant (never stored unchecked).
+                if (!(await refOwned(Branch, rawBranchParam, tenantId(req)))) {
+                    return res.status(400).json({ success: false, message: 'Invalid branch' });
+                }
                 branchId = new mongoose.Types.ObjectId(String(rawBranchParam));
             } else if (req?.branch?._id) {
                 branchId = req.branch._id;

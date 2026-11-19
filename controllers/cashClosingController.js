@@ -1,13 +1,15 @@
+const mongoose = require('mongoose');
 const CashClosing = require('../models/cashClosing');
 const { loadSources, summarizeCash } = require('../services/ledgerSources');
 const { computeCash } = require('../utils/cashMath');
 const { tenantFilter, tenantId, strictBranchFilter } = require('../utils/tenantScope');
-const { resolveBranchId, branchClauseFor, restaurantTz, businessDateParam } = require('../utils/ledgerScope');
+const { pinnedBranchGuard, resolveBranchId, branchClauseFor, restaurantTz, businessDateParam } = require('../utils/ledgerScope');
 const { dayBounds, isValidYmd, businessDateOf } = require('../utils/businessDate');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 
-const isMoney = (v) => v !== '' && v !== null && v !== undefined && Number.isFinite(Number(v)) && Number(v) >= 0;
+const isMoney = (v) => ((typeof v === 'number') || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) && Number(v) >= 0;
+const validId = (v) => mongoose.isValidObjectId(v);
 
 function dateOrThrow(req, value) {
     const d = businessDateParam(req, value);
@@ -42,7 +44,7 @@ async function findDay(req, businessDate, branchId) {
 // GET /cash-closings/preview?businessDate=&openingCash= - live expected cash, nothing saved.
 exports.preview = asyncHandler(async (req, res) => {
     const businessDate = dateOrThrow(req, req.query.businessDate);
-    const branchId = resolveBranchId(req);
+    const branchId = await resolveBranchId(req);
     const existing = await findDay(req, businessDate, branchId);
     const cash = await liveCash(req, businessDate, branchId);
     const opening = existing ? existing.openingCash : (isMoney(req.query.openingCash) ? Number(req.query.openingCash) : 0);
@@ -52,7 +54,7 @@ exports.preview = asyncHandler(async (req, res) => {
 // POST /cash-closings/open { businessDate?, openingCash? } - openingCash defaults to the last closed count.
 exports.open = asyncHandler(async (req, res) => {
     const businessDate = dateOrThrow(req, req.body?.businessDate);
-    const branchId = resolveBranchId(req);
+    const branchId = await resolveBranchId(req);
     let openingCash = req.body?.openingCash;
     if (openingCash === undefined || openingCash === '' || openingCash === null) {
         const prev = await CashClosing.findOne({
@@ -81,7 +83,7 @@ exports.close = asyncHandler(async (req, res) => {
     const b = req.body || {};
     if (!isMoney(b.countedCash)) throw new AppError(400, 'INVALID_AMOUNT', 'countedCash must be a number of 0 or more');
     const businessDate = dateOrThrow(req, b.businessDate);
-    const branchId = resolveBranchId(req);
+    const branchId = await resolveBranchId(req);
     const existing = await findDay(req, businessDate, branchId);
     if (existing && existing.status === 'closed') {
         throw new AppError(409, 'ALREADY_CLOSED', `${businessDate} is already closed. An admin can amend it with a reason.`);
@@ -113,7 +115,8 @@ exports.close = asyncHandler(async (req, res) => {
 // Open day: any admin / manager. Closed day: tenant admin role only, `reason` required, recorded in edits[].
 exports.amend = asyncHandler(async (req, res) => {
     const b = req.body || {};
-    const doc = await CashClosing.findOne({ _id: req.params.id, ...tenantFilter(req) });
+    if (!validId(req.params.id)) throw new AppError(404, 'NOT_FOUND', 'Cash closing not found');
+    const doc = await CashClosing.findOne({ _id: req.params.id, ...tenantFilter(req), ...pinnedBranchGuard(req) });
     if (!doc) throw new AppError(404, 'NOT_FOUND', 'Cash closing not found');
     const closed = doc.status === 'closed';
     const reason = String(b.reason || '').trim();
@@ -125,9 +128,11 @@ exports.amend = asyncHandler(async (req, res) => {
         if (b[k] !== undefined && !isMoney(b[k])) throw new AppError(400, 'INVALID_AMOUNT', `${k} must be a number of 0 or more`);
     }
     const before = { openingCash: doc.openingCash, countedCash: doc.countedCash, expectedCash: doc.expectedCash, variance: doc.variance, notes: doc.notes };
+    // An open day's stored cash figures are stale (zero until close): use the live day's cash for a counted figure.
+    const src = (!closed && b.countedCash !== undefined) ? await liveCash(req, doc.businessDate, doc.branch ? String(doc.branch) : null) : doc;
     const calc = computeCash({
         openingCash: b.openingCash !== undefined ? Number(b.openingCash) : doc.openingCash,
-        cashSales: doc.cashSales, cashRefunds: doc.cashRefunds, cashPaidOuts: doc.cashPaidOuts,
+        cashSales: src.cashSales, cashRefunds: src.cashRefunds, cashPaidOuts: src.cashPaidOuts,
         countedCash: b.countedCash !== undefined ? Number(b.countedCash) : doc.countedCash,
     });
     const set = { openingCash: calc.openingCash };
@@ -136,7 +141,7 @@ exports.amend = asyncHandler(async (req, res) => {
     const update = { $set: set };
     if (closed) update.$push = { edits: { at: new Date(), by: req.user?._id, reason: reason.slice(0, 300), before, after: { ...before, ...set } } };
     const saved = await CashClosing.findOneAndUpdate(
-        { _id: doc._id, ...tenantFilter(req), status: doc.status }, update, { returnDocument: 'after' },
+        { _id: doc._id, ...tenantFilter(req), ...pinnedBranchGuard(req), status: doc.status }, update, { returnDocument: 'after' },
     );
     if (!saved) throw new AppError(409, 'CONFLICT', 'The cash closing changed while you were editing it. Reload and retry.');
     res.json({ success: true, closing: saved });
@@ -154,7 +159,8 @@ exports.list = asyncHandler(async (req, res) => {
 }, 'Failed to list cash closings');
 
 exports.getOne = asyncHandler(async (req, res) => {
-    const closing = await CashClosing.findOne({ _id: req.params.id, ...tenantFilter(req) }).lean();
+    if (!validId(req.params.id)) throw new AppError(404, 'NOT_FOUND', 'Cash closing not found');
+    const closing = await CashClosing.findOne({ _id: req.params.id, ...tenantFilter(req), ...pinnedBranchGuard(req) }).lean();
     if (!closing) throw new AppError(404, 'NOT_FOUND', 'Cash closing not found');
     res.json({ success: true, closing });
 }, 'Failed to load cash closing');

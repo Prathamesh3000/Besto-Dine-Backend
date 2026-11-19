@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { isPlainId } = require('../utils/tenantRefs');
 const Request = require('../models/request');
 const Table = require('../models/table');
 const User = require('../models/user');
@@ -346,6 +347,9 @@ exports.getActiveRequestsForTable = async (req, res) => {
     if (!tableId) {
       return res.status(400).json({ success: false, message: 'Table ID is required' });
     }
+    if (!isPlainId(tableId)) {
+      return res.status(400).json({ success: false, message: 'Invalid table' });
+    }
     // Limit the window so the client only sees requests from this sitting,
     // not every water call the table has ever made.
     const windowStart = new Date(Date.now() - 30 * 60 * 1000);
@@ -370,6 +374,7 @@ exports.updateRequestStatus = async (req, res) => {
   try {
     const { id } = req.params;
     const { status, waiterId } = req.body;
+    if (!isPlainId(id)) return res.status(400).json({ success: false, message: 'Invalid request id' });
 
     if (!['accepted', 'completed'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Status must be accepted or completed' });

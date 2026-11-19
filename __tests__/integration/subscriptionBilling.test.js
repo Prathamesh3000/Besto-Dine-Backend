@@ -319,11 +319,21 @@ describe('POST /tenant/billing/upgrade/verify — amount / order binding', () =>
 
 // ═══════════════════════════════════════════════════════════════════════
 describe('invoices — ownership + numbering', () => {
+    // applyPaidPlanUpgrade with NO pending upgrade is a plain renewal: it must
+    // be INR and pay the CURRENT plan price incl. 18% GST (round-1 payments fix),
+    // so these numbering tests seed a priced plan and pay exactly that.
+    const PLAN_PRICE = 999;
+    const PAID = 117882; // 999 + 18% GST, paise
+    async function seedPriced(label) {
+        const t = await seedTenant({ label });
+        await Restaurant.updateOne({ _id: t.restaurant._id }, { $set: { 'subscription.price': PLAN_PRICE } });
+        return t;
+    }
     test('another tenant cannot list or download my invoice (404), bad id → 400', async () => {
-        const a = await seedTenant({ label: 'iva' });
-        const b = await seedTenant({ label: 'ivb' });
+        const a = await seedPriced('iva');
+        const b = await seedPriced('ivb');
         const r = await Restaurant.findById(a.restaurant._id);
-        const { invoiceNumber } = await applyPaidPlanUpgrade({ restaurant: r, payment: { id: 'pay_own_a', amount: 99900, currency: 'INR' } });
+        const { invoiceNumber } = await applyPaidPlanUpgrade({ restaurant: r, payment: { id: 'pay_own_a', amount: PAID, currency: 'INR' } });
         const inv = await SubscriptionInvoice.findOne({ invoiceNumber, restaurant: a.restaurant._id }).lean();
 
         const dl = await owner(b).get(`/tenant/billing/invoices/${inv._id}/download`);
@@ -337,22 +347,22 @@ describe('invoices — ownership + numbering', () => {
     });
 
     test('per tenant per day: two tenants both start at -0001', async () => {
-        const a = await seedTenant({ label: 'ina' });
-        const b = await seedTenant({ label: 'inb' });
-        const ra = await applyPaidPlanUpgrade({ restaurant: await Restaurant.findById(a.restaurant._id), payment: { id: 'pay_na', amount: 1 } });
-        const rb = await applyPaidPlanUpgrade({ restaurant: await Restaurant.findById(b.restaurant._id), payment: { id: 'pay_nb', amount: 1 } });
+        const a = await seedPriced('ina');
+        const b = await seedPriced('inb');
+        const ra = await applyPaidPlanUpgrade({ restaurant: await Restaurant.findById(a.restaurant._id), payment: { id: 'pay_na', amount: PAID } });
+        const rb = await applyPaidPlanUpgrade({ restaurant: await Restaurant.findById(b.restaurant._id), payment: { id: 'pay_nb', amount: PAID } });
         expect(ra.invoiceNumber).toMatch(/-0001$/);
         expect(rb.invoiceNumber).toMatch(/-0001$/);
-        const rb2 = await applyPaidPlanUpgrade({ restaurant: await Restaurant.findById(b.restaurant._id), payment: { id: 'pay_nb2', amount: 1 } });
+        const rb2 = await applyPaidPlanUpgrade({ restaurant: await Restaurant.findById(b.restaurant._id), payment: { id: 'pay_nb2', amount: PAID } });
         expect(rb2.invoiceNumber).toMatch(/-0002$/);
     });
 
     test('6 concurrent charges for one tenant → 6 invoices, 6 distinct numbers (retry on the unique index)', async () => {
-        const t = await seedTenant({ label: 'conc' });
+        const t = await seedPriced('conc');
         await SubscriptionInvoice.init(); // make sure the unique indexes exist
         const runs = await Promise.all(Array.from({ length: 6 }, async (_, i) => {
             const r = await Restaurant.findById(t.restaurant._id);
-            return applyPaidPlanUpgrade({ restaurant: r, payment: { id: `pay_conc_${i}`, amount: 99900 } });
+            return applyPaidPlanUpgrade({ restaurant: r, payment: { id: `pay_conc_${i}`, amount: PAID } });
         }));
         expect(runs.every(r => r.invoiceCreated)).toBe(true);
         const numbers = runs.map(r => r.invoiceNumber);
@@ -362,10 +372,10 @@ describe('invoices — ownership + numbering', () => {
     });
 
     test('same payment applied twice concurrently → exactly one invoice', async () => {
-        const t = await seedTenant({ label: 'dupe' });
+        const t = await seedPriced('dupe');
         const runs = await Promise.all([0, 1].map(async () => applyPaidPlanUpgrade({
             restaurant: await Restaurant.findById(t.restaurant._id),
-            payment: { id: 'pay_same_twice', amount: 99900 },
+            payment: { id: 'pay_same_twice', amount: PAID },
         })));
         expect(runs.filter(r => r.invoiceCreated)).toHaveLength(1);
         expect(await SubscriptionInvoice.countDocuments({ razorpayPaymentId: 'pay_same_twice' })).toBe(1);

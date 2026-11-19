@@ -262,8 +262,28 @@ exports.handleWebhook = async (req, res) => {
         }
 
         // 4. Handle Events
+        // A capture for an order that is already settled (Paid / Refunded)
+        // by a DIFFERENT payment is a double payment (two tabs, retried
+        // checkout, staff cash + online): the money is real and is not the
+        // order's revenue. Never drop it silently — log it and alert the
+        // restaurant so the surplus payment can be refunded.
+        if (event === 'payment.captured'
+            && ['Paid', 'Refunded'].includes(order.paymentStatus)
+            && payment.id && payment.id !== order.razorpayPaymentId) {
+            await flagDuplicatePayment(order, payment);
+            return res.status(200).json({ status: 'ok' });
+        }
+
         if (event === 'payment.captured' && order.paymentStatus !== 'Paid') {
             const capturedAmount = paiseToRupees(payment.amount);
+
+            // Same rule as verify-payment: only INR captures settle an order.
+            if (payment.currency && payment.currency !== 'INR') {
+                logger.error('Webhook: non-INR capture — not settling order', {
+                    paymentId: payment.id, orderId: order.orderId, currency: payment.currency,
+                });
+                return res.status(200).json({ status: 'ok' });
+            }
 
             // Same coverage rule as verify-payment: an underpaid capture
             // (e.g. a stale checkout after items were added) must not
@@ -329,6 +349,21 @@ exports.handleWebhook = async (req, res) => {
                 logger.warn('Webhook: capture on a cancelled order — refund request queued', {
                     paymentId: payment.id,
                     orderId: paidOrder.orderId,
+                });
+                return res.status(200).json({ status: 'ok' });
+            }
+
+            // The refund.processed event arrived BEFORE this capture (events are
+            // not ordered): the refund is already on the order, so a fully
+            // refunded capture ends Refunded, not a Paid sale.
+            if (roundPaise(paidOrder.refundedAmount) > 0
+                && roundPaise(paidOrder.refundedAmount) >= roundPaise(paidOrder.amountPaid)) {
+                await Order.updateOne(
+                    { _id: paidOrder._id, paymentStatus: 'Paid' },
+                    { $set: { paymentStatus: 'Refunded' } },
+                );
+                logger.info('Webhook: capture landed on an already fully refunded order — marked Refunded', {
+                    paymentId: payment.id, orderId: paidOrder.orderId,
                 });
                 return res.status(200).json({ status: 'ok' });
             }
@@ -412,6 +447,8 @@ exports.handleWebhook = async (req, res) => {
                             reason: refundEntity?.notes?.reason || 'Razorpay refund',
                             razorpayRefundId: refundId,
                             source: 'webhook',
+                            destination: 'gateway',
+                            method: 'original',
                             createdAt: new Date(),
                         },
                     },
@@ -445,6 +482,34 @@ exports.handleWebhook = async (req, res) => {
         return res.json({ status: 'ok' });
     }
 };
+
+// A second, different payment captured for an already-settled order.
+async function flagDuplicatePayment(order, payment) {
+    const amount = paiseToRupees(payment.amount);
+    logger.error('Webhook: duplicate payment captured for an already-settled order — needs a manual refund', {
+        paymentId: payment.id,
+        orderId: order.orderId,
+        settledWith: order.razorpayPaymentId || order.paymentMethod || null,
+        amount,
+    });
+    try {
+        const { notify } = require('../../services/notificationService');
+        await notify({
+            restaurant: order.restaurant || null,
+            branch: order.branch || null,
+            notification: {
+                recipientRole: 'admin',
+                title: 'Duplicate payment received',
+                description: `Order ${order.orderId} was already paid, but another payment of ₹${amount} (${payment.id}) was captured. Refund it from the payment gateway.`,
+                category: 'Payment',
+                priority: 'high',
+                meta: { orderId: order.orderId, amount },
+            },
+        });
+    } catch (err) {
+        logger.warn(`Webhook: duplicate-payment alert failed: ${err.message}`);
+    }
+}
 
 // ─── Subscription webhook handler ──────────────────────────────────────
 //

@@ -259,7 +259,7 @@ describe('public API v1 router', () => {
         keyDoc = { _id: oid(1), restaurant: RID, name: 'K', prefix: issued.prefix, hash: issued.hash,
             scopes: ['read:orders', 'read:menu', 'read:sales', 'read:inventory', 'read:bookings'], revokedAt: null, expiresAt: null, lastUsedAt: new Date() };
         restaurant = { _id: RID, status: 'active', timezone: 'Asia/Kolkata', subscription: { features: { publicApi: true } } };
-        jest.spyOn(ApiKey, 'findOne').mockImplementation((q) => ({ select: () => ({ setOptions: () => Promise.resolve(q.prefix === keyDoc.prefix ? keyDoc : null) }) }));
+        jest.spyOn(ApiKey, 'findOne').mockImplementation((q) => ({ select: () => Promise.resolve(q.prefix === keyDoc.prefix ? keyDoc : null) }));
         jest.spyOn(Restaurant, 'findById').mockImplementation(() => Promise.resolve(restaurant));
     });
 

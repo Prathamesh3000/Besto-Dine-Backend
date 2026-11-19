@@ -34,6 +34,10 @@ async function recordAudit(req, {
         // Strip obvious secrets from the details payload before persisting.
         const safeDetails = sanitizeDetails(details);
 
+        // Lets the platform-staff activity middleware know this request already
+        // has a specific audit row, so it does not add a generic one.
+        req._audited = true;
+
         return await AuditLog.create({
             actor: req.user._id,
             actorEmail: req.user.email || '',

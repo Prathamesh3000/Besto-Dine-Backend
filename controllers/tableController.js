@@ -39,7 +39,7 @@ const { billingStatesForTables } = require('../utils/paymentState');
 const SCAN_TOKEN_TTL = process.env.SCAN_TOKEN_TTL || '4h';
 
 const { tenantFilter, tenantId, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
-const { tenantBulkWrite, tenantInsertMany } = require('../utils/tenantSafe');
+const { tenantBulkWrite, tenantInsertMany, runAsSystem } = require('../utils/tenantSafe');
 const { getMainBranchId } = require('../utils/mainBranch');
 const { revokeTipsForOrder } = require('../utils/tipHelpers');
 const { resolveMergeLeader, freeTableOrUnmergeGroup, mergeGroupIdsOf } = require('../utils/tableMerge');
@@ -64,6 +64,8 @@ function emitTableUnavailable(tableIds, reason) {
 const { claimSeat, releaseSeats } = require('../utils/tableSeats');
 const { devError } = require('../utils/AppError');
 const { pickAllowed, TABLE_UPDATE_FIELDS } = require('../utils/bodyAllowlist');
+const { refOwned } = require('../utils/tenantRefs');
+const { isTrialLocked, trialExpiredBody } = require('../utils/trialLock');
 
 /**
  * Phase 6 step 2 — validate that a branch id supplied in the body
@@ -124,6 +126,10 @@ const createTable = async (req, res) => {
         const branchCheck = await resolveBranch(req, rawBranch);
         if (!branchCheck.ok) {
             return res.status(400).json({ success: false, message: branchCheck.message });
+        }
+
+        if (!(await refOwned(Area, area, tenantId(req)))) {
+            return res.status(400).json({ success: false, message: 'Invalid area' });
         }
 
         // ── Enforce the plan's maxTables limit (0 / missing = uncapped,
@@ -340,12 +346,12 @@ const getTableByToken = async (req, res) => {
         }
         // qrToken is globally unique + cryptographically random; this lookup
         // is what ESTABLISHES the tenant for the customer session.
-        // AUDIT-EXEMPT: global QR-token lookup (tenant discovery)
-        const table = await Table.findOne({ qrToken }, null, { skipTenantScope: true })
+        // System context so the populates (area / branch) are not scoped to a stray ambient tenant either.
+        const table = await runAsSystem('qr-token-tenant-discovery', async () => await Table.findOne({ qrToken }) // AUDIT-EXEMPT: global QR-token lookup (tenant discovery)
             .select('+qrToken')
-            .populate('area', 'name isActive')
+            .populate('area', 'name isActive restaurant')
             .populate('restaurant', 'name slug status subscription featureOverrides addons operations operationsByBranch logo branding')
-            .populate('branch', 'name slug displayLabel city addressLine1');
+            .populate('branch', 'name slug displayLabel city addressLine1'));
 
         // Soft-deleted tables keep their document (and qrToken) for
         // billing history, so the sticker still resolves — refuse it.
@@ -365,6 +371,11 @@ const getTableByToken = async (req, res) => {
                 code: 'TENANT_SUSPENDED',
                 message: 'This restaurant is temporarily unavailable. Please try again later.',
             });
+        }
+
+        // Free trial ended unpaid but the sweeper has not flipped the status yet.
+        if (table.restaurant && isTrialLocked(table.restaurant)) {
+            return res.status(403).json(trialExpiredBody(table.restaurant));
         }
 
         // Merged tables share ONE active order across the group. If the
@@ -442,6 +453,11 @@ const getTableByToken = async (req, res) => {
         // modules the tenant hasn't paid for (Wallet, Bookings, Coupons)
         // so customers don't tap through to a 403.
         const tableObj = effectiveTable.toObject();
+
+        // Public response: never expose the seated guest's identity, and never
+        // hydrate an area that belongs to another tenant (legacy bad data).
+        tableObj.occupied = Boolean(tableObj.currentDiner && (tableObj.currentDiner.name || tableObj.currentDiner.phone || tableObj.currentDiner.user));
+        delete tableObj.currentDiner;
         // `openBill` is true only when a previous party left an unpaid order
         // on this table. A table this very scan occupied (or one that is
         // merely seated, with no order) is NOT an open bill.
@@ -453,6 +469,11 @@ const getTableByToken = async (req, res) => {
                 restaurant: effectiveTable.restaurant?._id || effectiveTable.restaurant,
             }))
             : false;
+        if (tableObj.area && typeof tableObj.area === 'object') {
+            const ownerId = String(tableObj.restaurant?._id || tableObj.restaurant || '');
+            if (String(tableObj.area.restaurant || '') !== ownerId) tableObj.area = null;
+            else delete tableObj.area.restaurant;
+        }
 
         // Resolve the customer-facing logo. Three possible sources, in
         // priority order, mirroring what Settings.getSettings would return
@@ -647,6 +668,11 @@ const updateTable = async (req, res) => {
                 return res.status(400).json({ success: false, message: branchCheck.message });
             }
             updates.branch = branchCheck.branchId;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(updates, 'area') && updates.area !== undefined
+            && !(await refOwned(Area, updates.area, tenantId(req)))) {
+            return res.status(400).json({ success: false, message: 'Invalid area' });
         }
 
         // If name or area is changed, we'd ideally validate uniqueness again,

@@ -57,6 +57,8 @@ async function operationsBranchFor(restaurant, branchId) {
 }
 exports.operationsBranchFor = operationsBranchFor;
 
+const { isTrialLocked } = require('../utils/trialLock');
+
 exports.getMenuBootstrap = async (req, res) => {
     try {
         const slug = String(req.query.slug || '').trim().toLowerCase();
@@ -71,9 +73,10 @@ exports.getMenuBootstrap = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug,
             status: { $in: ['active', 'trial'] },
-        }).select('_id name slug city contactPhone logo branding subscription featureOverrides addons operations operationsByBranch').lean();
+        }).select('_id name slug status city contactPhone logo branding subscription featureOverrides addons operations operationsByBranch').lean();
 
-        if (!restaurant) {
+        // Trial ended unpaid (sweeper lag): closed like any inactive tenant.
+        if (!restaurant || isTrialLocked(restaurant)) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
         }
 
@@ -247,7 +250,11 @@ exports.getMenuBootstrap = async (req, res) => {
         const branchSettings = ok(settingsRes, 'settings');
         const tenantSettings = ok(tenantSettingsRes, 'tenantSettings');
         const promotions     = ok(promotionsRes, 'promotions') || [];
-        const coupons        = ok(couponsRes, 'coupons') || [];
+        const coupons        = (ok(couponsRes, 'coupons') || []).map((c) => {
+            // Redemption counters / targeting / tenant id are admin data.
+            const { usageCount, usageLimit, targetUsers, restaurant: _r, ...pub } = c;
+            return pub;
+        });
 
         // Merge settings: pick the branch-level doc, then fall back to
         // the tenant-level doc field-by-field for inherited sections.

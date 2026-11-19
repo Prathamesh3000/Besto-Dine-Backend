@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const Restaurant = require('../models/restaurant');
 const Branch = require('../models/branch');
 const logger = require('../utils/logger');
-const { isTrialLocked, allowedWhileLocked, v1PathOf, trialExpiredBody } = require('../utils/trialLock');
+const { isTrialLocked, trialState, trialVerdict, v1PathOf } = require('../utils/trialLock');
 const cacheBus = require('../utils/cacheBus');
 const {
     getContext,
@@ -239,6 +239,9 @@ const STRICT_EXEMPT_PREFIXES = [
 // any controller using `tenantFilter(req)` then got an empty Mongo
 // filter that returned every tenant's documents at once.
 
+// /auth routes a locked tenant's staff may still call (session hygiene).
+const AUTH_STAFF_SAFE_PATHS = new Set(['/auth/me', '/auth/logout', '/auth/logout-all', '/auth/csrf', '/auth/login', '/auth/refresh']);
+
 function isStrictExempt(req) {
     // Segment-boundary match: '/public' and '/public/...' are exempt,
     // '/publicXYZ' is not.
@@ -366,7 +369,8 @@ async function resolveBySlug(slug) {
     const cached = getCached(slug);
     if (cached) {
         const r = await Restaurant.findById(cached);
-        if (r) return r;
+        // Validate on hit: the slug may have been re-assigned to another tenant.
+        if (r && r.slug === slug) return r;
         slugCache.delete(slug);
     }
     const r = await Restaurant.findOne({ slug }).exec();
@@ -383,15 +387,24 @@ function readSlugFromRequest(req) {
 
 function ensureNotLocked(restaurant, res, req) {
     if (!restaurant) return true;
-    // Free trial ended unpaid: data kept, everything but the owner's billing /
-    // export routes answers TRIAL_EXPIRED (utils/trialLock). Checked before
-    // the generic suspension below, which the sweeper's lock would trip.
-    if (isTrialLocked(restaurant)) {
-        if (req && allowedWhileLocked(req.user, v1PathOf(req))) {
-            req.trialLocked = true;
-            return true;
+    // Free trial ended unpaid (utils/trialLock, plan §6): data kept. In the
+    // read-only window GET/HEAD/OPTIONS pass and writes answer 403
+    // SUBSCRIPTION_READ_ONLY; after lockAt everything answers 403
+    // SUBSCRIPTION_BLOCKED. /auth stays open for every role and the owner
+    // (admin) keeps billing / export in both windows. Checked before the
+    // generic suspension below, which the sweeper's lock would trip.
+    const st = trialState(restaurant);
+    if (st.state === 'read_only' || st.state === 'locked') {
+        if (req) {
+            req.trialState = st.state;
+            req.trialReadOnly = st.state === 'read_only';
+            req.trialLocked = st.state === 'locked';
         }
-        res.status(403).json(trialExpiredBody(restaurant));
+        const verdict = trialVerdict(restaurant, {
+            user: req?.user, method: req?.method, v1Path: req ? v1PathOf(req) : '',
+        });
+        if (!verdict) return true;
+        res.status(403).json(verdict);
         return false;
     }
     if (restaurant.status === 'suspended' || restaurant.status === 'cancelled') {
@@ -531,6 +544,18 @@ const attachTenant = async (req, res, next) => {
         // or suspended tenant would 403 even on /auth/login, locking
         // the user out of their own account with no way to recover.
         if (isStrictExempt(req)) {
+            // /auth stays tenant-exempt so login / me / logout / refresh
+            // keep working, but an authenticated STAFF caller of a
+            // suspended / cancelled / trial-locked tenant is stopped on
+            // the account-mutating /auth routes (2FA reset, profile,
+            // password change, ...). Superadmins are never blocked.
+            const p = req.path || '';
+            if (req.user?.restaurant && req.user.role !== 'superadmin'
+                && (p === '/auth' || p.startsWith('/auth/'))
+                && !AUTH_STAFF_SAFE_PATHS.has(p.replace(/\/+$/, ''))) {
+                const own = await Restaurant.findById(req.user.restaurant);
+                if (own && !ensureNotLocked(own, res, req)) return;
+            }
             req.restaurant = null;
             req.branch = null;
             return proceed(req, next);
@@ -668,6 +693,7 @@ const attachTenant = async (req, res, next) => {
 const requireTenant = attachTenant;
 
 module.exports = {
+    isTrialLocked, // shared lock-on-expiry predicate (re-exported from utils/trialLock)
     attachTenant,
     requireTenant,
     getTenantFallbackStats,

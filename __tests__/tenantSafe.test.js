@@ -170,11 +170,12 @@ describe('plugin native insertMany / bulkWrite hooks', () => {
         expect(String(docs[0].restaurant)).toBe(String(A));
         expect(String(ops[0].updateOne.filter.restaurant)).toBe(String(A));
     });
-    test('mismatch is only logged by default, thrown in strict mode', () => {
+    test('a mismatching restaurant inside a tenant context is rejected by default (and in strict mode)', () => {
         const mk = () => [{ restaurant: B }];
-        expect(() => runAsTenant(A, () => hooks.insertMany.call(self, mk()))).not.toThrow();
+        expect(() => runAsTenant(A, () => hooks.insertMany.call(self, mk()))).toThrow(TenantMismatchError);
         process.env.TENANT_STRICT_CONTEXT = 'true';
         expect(() => runAsTenant(A, () => hooks.insertMany.call(self, mk()))).toThrow(TenantMismatchError);
+        expect(() => runAsSystem('x', () => hooks.insertMany.call(self, mk()))).not.toThrow();
     });
     test('no tenant + no restaurant: warn by default, throw in strict, system always allowed', () => {
         const docs = () => [{ n: 1 }];

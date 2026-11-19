@@ -1,5 +1,7 @@
 const Reservation = require('../models/reservation');
 const Table = require('../models/table');
+const Area = require('../models/area');
+const { refOwned } = require('../utils/tenantRefs');
 const logger = require('../utils/logger');
 const { notify } = require('../services/notificationService');
 const { getSettings } = require('../utils/settingsCache');
@@ -46,6 +48,10 @@ const createReservation = async (req, res) => {
         const table = await Table.findOne({ _id: selectedTable, ...tf });
         if (!table) {
             return res.status(404).json({ success: false, message: 'Table not found' });
+        }
+
+        if (!(await refOwned(Area, selectedArea, tenantId(req)))) {
+            return res.status(400).json({ success: false, message: 'Invalid area' });
         }
 
         // Guest count vs table capacity — over-booking guard.

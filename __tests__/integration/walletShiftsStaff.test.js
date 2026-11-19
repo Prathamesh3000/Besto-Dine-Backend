@@ -381,7 +381,8 @@ describe('wallet: customer view, search, history, reports', () => {
         expect(res.status).toBe(200);
         expect(res.body.stats).toMatchObject({
             totalWalletBalance: 140.25, totalCustomers: 2, activeCustomers: 2,
-            totalRecharge: 150, totalSpent: 9.75, totalTransactions: 3, avgBalance: 70.125,
+            totalRecharge: 150, totalSpent: 0, totalTransactions: 3, // admin deduct is an 'admin_adjustment', not wallet spend
+            avgBalance: 70.125,
         });
     });
 

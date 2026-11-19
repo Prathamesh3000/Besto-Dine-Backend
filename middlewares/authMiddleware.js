@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/user');
 const logger = require('../utils/logger');
+const { isPlainId } = require('../utils/tenantRefs');
 const { updateContext } = require('../utils/requestContext');
 
 // DB error names that indicate a connectivity problem, not an auth problem
@@ -22,7 +23,7 @@ const TOKEN_TYPES = Object.freeze({ USER: 'user', SCAN: 'scan', KIOSK: 'kiosk', 
 // ACCESS_TOKEN_TTL / SUPERADMIN_ACCESS_TOKEN_TTL accept jsonwebtoken
 // `expiresIn` strings ('15m', '1h', …).
 function accessTokenTtl(role) {
-    if (role === 'superadmin') return process.env.SUPERADMIN_ACCESS_TOKEN_TTL || '15m';
+    if (role === 'superadmin' || role === 'platformstaff') return process.env.SUPERADMIN_ACCESS_TOKEN_TTL || '15m';
     return process.env.ACCESS_TOKEN_TTL || '30m';
 }
 
@@ -92,6 +93,9 @@ function verifyTypedToken(token, typ) {
  * treated as version 0.
  */
 async function loadUserForToken(decoded) {
+    // The id claim must be a plain ObjectId string: an object such as
+    // {"$ne":null} would otherwise be passed to Mongo as a query operator.
+    if (!isPlainId(decoded && decoded.id)) return null;
     const user = await User.findById(decoded.id).select('-password');
     if (!user) return null;
     const tokenTv = Number(decoded.tv) || 0;
@@ -380,6 +384,68 @@ const superAdminFull = (req, res, next) => {
     });
 };
 
+/**
+ * Super-admin portal gate: a super admin (full or support) OR a delegated
+ * platform-staff user. Mount AFTER `protect`, only on the /superadmin router.
+ * Platform staff are narrowed by `platformStaffGate` right after it.
+ */
+const superAdminPanel = (req, res, next) => {
+    if (req.user && (req.user.role === 'superadmin' || req.user.role === 'platformstaff')) {
+        return next();
+    }
+    return res.status(403).json({
+        success: false,
+        message: 'Access denied. Super Admin only.'
+    });
+};
+
+/**
+ * Deny-by-default gate for delegated platform staff (PLATFORM_STAFF_PLAN.md).
+ * A no-op for super admins. A platformstaff request passes only if it matches a
+ * rule in config/platformModules.js AND the user was given that module at the
+ * needed level. Blocked attempts are written to the audit log
+ * (`platformstaff.denied`) so the owner can see them.
+ */
+const platformStaffGate = async (req, res, next) => {
+    if (req.user?.role !== 'platformstaff') return next();
+    const { resolveRequest, allows } = require('../config/platformModules');
+    const hit = resolveRequest(req.method, req.path);
+    if (hit && allows(req.user.platformAccess, hit.module, hit.access)) {
+        req.platformModule = hit.module;
+        return next();
+    }
+    try {
+        await require('../utils/audit').recordAudit(req, {
+            action: 'platformstaff.denied',
+            targetType: 'platform',
+            details: { method: req.method, path: req.path, module: hit?.module || null, needed: hit?.access || null },
+        });
+    } catch { /* recordAudit never throws; belt and braces */ }
+    return res.status(403).json({
+        success: false,
+        code: 'PLATFORM_ACCESS_DENIED',
+        message: 'You do not have access to this section.',
+    });
+};
+
+/**
+ * Route-level guard for a delegable WRITE: a full super admin, or platform
+ * staff holding `manage` on `moduleKey`. Support super admins stay read-only.
+ * Replaces `superAdminFull` on the routes listed in config/platformModules.js.
+ */
+const superAdminOrModule = (moduleKey) => (req, res, next) => {
+    const u = req.user;
+    if (u && u.role === 'superadmin' && u.superadminLevel === 'full') return next();
+    if (u && u.role === 'platformstaff'
+        && require('../config/platformModules').allows(u.platformAccess, moduleKey, 'manage')) {
+        return next();
+    }
+    return res.status(403).json({
+        success: false,
+        message: 'Access denied. Full Super Admin privileges required.'
+    });
+};
+
 // CRIT-05 — server-side enforcement of mustChangePassword.
 //
 // Previously this flag was only honored by the frontend ProtectedRoute,
@@ -479,6 +545,9 @@ module.exports = {
     checkPermission,
     superAdminOnly,
     superAdminFull,
+    superAdminPanel,
+    platformStaffGate,
+    superAdminOrModule,
     requirePasswordCurrent,
     // #15 token helpers
     TOKEN_TYPES,

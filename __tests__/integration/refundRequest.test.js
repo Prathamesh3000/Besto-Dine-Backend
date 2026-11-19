@@ -92,7 +92,7 @@ async function pendingRequest(t, order, fields = {}) {
     })).toObject();
 }
 
-const create = (user, t, body) => ctx.api.as(user, t).post('/refund-requests').send(body);
+const create = (user, t, body) => ctx.api.as(user, t).post('/refund-requests').send({ reason: 'test refund', ...body });
 const approve = (user, rr, body = {}) => ctx.api.as(user).post(`/refund-requests/${rr._id}/approve`).send(body);
 const reject = (user, rr, body = {}) => ctx.api.as(user).post(`/refund-requests/${rr._id}/reject`).send(body);
 const reloadOrder = (o) => Order.findById(o._id).lean();

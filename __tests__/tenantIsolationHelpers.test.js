@@ -1002,19 +1002,19 @@ describe('tenantScopePlugin — gaps', () => {
         ['updateMany', () => Scoped.updateMany({ restaurant: B_ID }, { $set: { status: 'x' } })],
         ['deleteMany', () => Scoped.deleteMany({ restaurant: B_ID })],
         ['findOneAndUpdate', () => Scoped.findOneAndUpdate({ restaurant: B_ID }, { $set: { status: 'x' } })],
-    ])('%s with an explicit tenant-B filter inside tenant A is kept (by design) and logged as a mismatch', async (_op, build) => {
+    ])('%s with an explicit tenant-B filter inside tenant A is confined to A (tenant ANDed on top) and logged as a mismatch', async (_op, build) => {
         await inTenant(A_ID, async () => {
             const [q] = await runQueryPre(build());
-            expect(q.getFilter()).toEqual({ restaurant: B_ID });
+            expect(q.getFilter()).toEqual({ restaurant: B_ID, $and: [{ restaurant: A_ID }] });
         });
 
         expect(logger.warn).toHaveBeenCalledWith('tenantScope.explicit-mismatch', expect.any(Object));
     });
 
-    test('tenant B condition hidden in $and is kept but NOT logged as a mismatch', async () => {
+    test('tenant B condition hidden in $and gets tenant A ANDed at top level (not logged as a scalar mismatch)', async () => {
         await inTenant(A_ID, async () => {
             const [q] = await runQueryPre(Scoped.updateMany({ $and: [{ restaurant: B_ID }] }, { $set: { status: 'x' } }));
-            expect(q.getFilter()).toEqual({ $and: [{ restaurant: B_ID }] });
+            expect(q.getFilter()).toEqual({ $and: [{ restaurant: B_ID }], restaurant: A_ID });
         });
 
         expect(logger.warn).not.toHaveBeenCalledWith('tenantScope.explicit-mismatch', expect.anything());
@@ -1039,10 +1039,10 @@ describe('tenantScopePlugin — gaps', () => {
         });
     });
 
-    test('aggregate with an explicit tenant-B $match inside tenant A is not rewritten', async () => {
+    test('aggregate with an explicit tenant-B $match inside tenant A gets the tenant ANDed into the leading $match', async () => {
         await inTenant(A_ID, async () => {
             const [agg] = await runAggregatePre(Scoped.aggregate([{ $match: { restaurant: B_ID } }]));
-            expect(agg.pipeline()).toEqual([{ $match: { restaurant: B_ID } }]);
+            expect(agg.pipeline()).toEqual([{ $match: { $and: [{ restaurant: B_ID }, { restaurant: A_ID }] } }]);
         });
     });
 

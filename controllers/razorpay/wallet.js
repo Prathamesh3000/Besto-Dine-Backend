@@ -94,7 +94,11 @@ exports.verifyWalletRecharge = async (req, res) => {
         }
 
         // ── Signature verification ───────────────────────────────────────
-        const body = razorpay_order_id + '|' + razorpay_payment_id;
+        if (!process.env.RAZORPAY_KEY_SECRET) {
+            logger.error('verifyWalletRecharge: RAZORPAY_KEY_SECRET is not configured');
+            return res.status(503).json({ success: false, message: 'Payment verification is temporarily unavailable' });
+        }
+        const body =razorpay_order_id + '|' + razorpay_payment_id;
         const expectedSignature = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
             .update(body)

@@ -229,6 +229,94 @@ exports.assignPlan = async (req, res) => {
     }
 };
 
+// POST /api/v1/superadmin/restaurants/:id/extend-trial
+// Body: { days } (1..90, validated by the route)
+//
+// TRIAL_SIGNUP_AND_LEADS_PLAN §6. Adds `days` to the trial end — counted
+// from today when the trial already ended — and lifts the trial lock
+// (status 'suspended' + subscription 'expired', or trialExpiredAt set) so
+// the tenant is back on an active trial at once. Reminder markers are
+// cleared so the 3-day / 1-day mails can go out again for the new end
+// date. A tenant that has paid (subscription active / ever charged) is
+// not on a trial and is refused; use assign-plan for those.
+exports.extendTrial = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const days = Number(req.body?.days);
+        if (!mongoose.isValidObjectId(id)) {
+            return res.status(400).json({ success: false, message: 'Invalid restaurant id' });
+        }
+        if (!Number.isInteger(days) || days < 1 || days > 90) {
+            return res.status(400).json({ success: false, message: 'days must be a whole number between 1 and 90' });
+        }
+
+        const restaurant = await Restaurant.findById(id);
+        if (!restaurant) return res.status(404).json({ success: false, message: 'Restaurant not found' });
+
+        const sub = restaurant.subscription || {};
+        if (sub.status === 'active' || sub.lastChargedAt) {
+            return res.status(400).json({
+                success: false,
+                code: 'NOT_ON_TRIAL',
+                message: 'This restaurant has a paid subscription; there is no trial to extend.',
+            });
+        }
+
+        const now = new Date();
+        const currentEnd = sub.trialEndDate ? new Date(sub.trialEndDate) : null;
+        const base = currentEnd && currentEnd.getTime() > now.getTime() ? currentEnd : now;
+        const newEnd = new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
+        const wasLocked = (restaurant.status === 'suspended' && sub.status === 'expired') || !!sub.trialExpiredAt;
+
+        if (!restaurant.subscription) restaurant.subscription = {};
+        restaurant.subscription.trialEndDate = newEnd;
+        if (!restaurant.subscription.trialStartDate) restaurant.subscription.trialStartDate = now;
+        // The reminder job re-sends for the new end date; the legacy
+        // trialRemindersSent markers are no longer read and stay as they are.
+        restaurant.subscription.trialReminders = [];
+        if (wasLocked || restaurant.status === 'trial') {
+            restaurant.status = 'trial';
+            restaurant.subscription.status = 'trial';
+            restaurant.subscription.trialExpiredAt = undefined;
+            restaurant.suspendedAt = undefined;
+            restaurant.suspendedReason = '';
+        }
+        await restaurant.save();
+
+        // The request-time backstop reads the cached tenant: drop it so the
+        // very next request sees the new end date (same hook the sweeper uses).
+        const { invalidateTenant } = require('../../middlewares/tenantContext');
+        invalidateTenant(restaurant._id);
+
+        await recordAudit(req, {
+            action: 'restaurant.trial_extended',
+            targetType: 'restaurant',
+            targetId: restaurant._id,
+            targetName: restaurant.name,
+            details: {
+                days,
+                from: currentEnd ? currentEnd.toISOString() : null,
+                to: newEnd.toISOString(),
+                wasLocked,
+            },
+        });
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                trialEndDate: restaurant.subscription.trialEndDate,
+                trialStartDate: restaurant.subscription.trialStartDate,
+                status: restaurant.status,
+                subscriptionStatus: restaurant.subscription.status,
+                restaurant: buildRestaurantPayload(restaurant),
+            },
+        });
+    } catch (err) {
+        logger.error('extendTrial error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to extend trial' });
+    }
+};
+
 // POST /api/v1/superadmin/restaurants/:id/cancel-subscription
 // Body: { immediate? } — default is "at cycle end" so the tenant
 //                        keeps access until the current period expires.

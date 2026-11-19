@@ -898,7 +898,11 @@ async function appendOrderItems(req) {
     throw httpError(400, { success: false, message: 'At least one item is required' });
   }
 
-  const order = await Order.findOne({ _id: id, ...tenantFilter(req) });
+  const tfAppend = tenantFilter(req);
+  let order = isValidObjectId(id)
+    ? await Order.findOne({ _id: id, ...tfAppend })
+    : null;
+  if (!order) order = await Order.findOne({ orderId: id, ...tfAppend });
   if (!order) {
     throw httpError(404, { success: false, message: 'Order not found' });
   }

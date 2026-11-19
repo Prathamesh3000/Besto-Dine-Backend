@@ -706,6 +706,9 @@ function sanitizePublicSettings(settings) {
   delete copy.printers;
   // The restaurant's UPI payee is never customer-facing.
   delete copy.payments;
+  // Back-office config: Tally ledger mapping, staff notification switches.
+  delete copy.taxExport;
+  delete copy.notifications;
   return copy;
 }
 

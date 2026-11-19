@@ -93,6 +93,7 @@ async function runRenewalReminders({ now = new Date(), model = Restaurant } = {}
     const sent = [];
     let checked = 0;
     for (const t of candidates) {
+      try {
         if (hasLiveRecurringSub(t.subscription)) continue;
         checked += 1;
         const end = new Date(t.subscription.currentPeriodEnd);
@@ -122,6 +123,10 @@ async function runRenewalReminders({ now = new Date(), model = Restaurant } = {}
             continue;
         }
         sent.push({ id: String(t._id), days: threshold });
+      } catch (err) {
+        // One tenant's failure must never stop the other tenants' reminders.
+        logger.warn(`renewal reminder failed for ${t.slug}: ${err.message}`);
+      }
     }
     return { checked, sent };
 }
@@ -141,17 +146,21 @@ async function runLapseCheck({ now = new Date(), model = Restaurant, onLapsed } 
     const lapsed = [];
     for (const c of candidates) {
         if (hasLiveRecurringSub(c.subscription)) continue;
-        // Conditional: a payment that landed in the meantime moved the period end.
-        const updated = await model.findOneAndUpdate(
-            { _id: c._id, ...due },
-            { $set: { status: 'past_due', 'subscription.status': 'past_due' } },
-            { returnDocument: 'after' },
-        );
-        if (!updated) continue;
-        lapsed.push(String(updated._id));
-        logger.warn(`Paid term lapsed for ${updated.slug} (period end + ${LAPSE_GRACE_DAYS}d passed, no live subscription) - past_due`);
-        if (onLapsed) {
-            try { await onLapsed(updated); } catch (err) { logger.warn(`Post-lapse hook failed for ${updated.slug}: ${err.message}`); }
+        try {
+            // Conditional: a payment that landed in the meantime moved the period end.
+            const updated = await model.findOneAndUpdate(
+                { _id: c._id, ...due },
+                { $set: { status: 'past_due', 'subscription.status': 'past_due' } },
+                { returnDocument: 'after' },
+            );
+            if (!updated) continue;
+            lapsed.push(String(updated._id));
+            logger.warn(`Paid term lapsed for ${updated.slug} (period end + ${LAPSE_GRACE_DAYS}d passed, no live subscription) - past_due`);
+            if (onLapsed) {
+                try { await onLapsed(updated); } catch (err) { logger.warn(`Post-lapse hook failed for ${updated.slug}: ${err.message}`); }
+            }
+        } catch (err) {
+            logger.warn(`Lapse check failed for ${c.slug}: ${err.message}`);
         }
     }
     return { checked: candidates.length, lapsed };
@@ -162,15 +171,19 @@ async function runDueDowngrades({ now = new Date(), model = Restaurant, onApplie
     const candidates = await model.find({ 'subscription.scheduledDowngrade.effectiveAt': { $lte: now } }).select('_id');
     const applied = [];
     for (const c of candidates) {
-        const doc = await model.findById(c._id);
-        if (!doc) continue;
-        const r = applyScheduledDowngrade(doc);
-        if (!r.applied) continue;
-        await doc.save();
-        applied.push(String(doc._id));
-        logger.info(`Scheduled downgrade applied for ${doc.slug} -> ${doc.subscription.planName}`);
-        if (onApplied) {
-            try { await onApplied(doc); } catch (err) { logger.warn(`Post-downgrade hook failed for ${doc.slug}: ${err.message}`); }
+        try {
+            const doc = await model.findById(c._id);
+            if (!doc) continue;
+            const r = applyScheduledDowngrade(doc);
+            if (!r.applied) continue;
+            await doc.save();
+            applied.push(String(doc._id));
+            logger.info(`Scheduled downgrade applied for ${doc.slug} -> ${doc.subscription.planName}`);
+            if (onApplied) {
+                try { await onApplied(doc); } catch (err) { logger.warn(`Post-downgrade hook failed for ${doc.slug}: ${err.message}`); }
+            }
+        } catch (err) {
+            logger.warn(`Scheduled downgrade failed for tenant ${c._id}: ${err.message}`);
         }
     }
     return { applied };
@@ -180,9 +193,13 @@ async function runRenewalJob(opts = {}) {
     const invalidate = (tenant) => {
         try { require('../middlewares/tenantContext').invalidateTenant(tenant._id); } catch (_) { /* cache only */ }
     };
-    const reminders = await runRenewalReminders(opts);
-    const lapse = await runLapseCheck({ ...opts, onLapsed: invalidate });
-    const downgrades = await runDueDowngrades({ ...opts, onApplied: invalidate });
+    // Each phase is independent: a failing query in one must not skip the others.
+    const phase = async (name, fn, empty) => {
+        try { return await fn(); } catch (err) { logger.error(`renewal job phase "${name}" failed: ${err.message}`); return empty; }
+    };
+    const reminders = await phase('reminders', () => runRenewalReminders(opts), { checked: 0, sent: [] });
+    const lapse = await phase('lapse', () => runLapseCheck({ ...opts, onLapsed: invalidate }), { checked: 0, lapsed: [] });
+    const downgrades = await phase('downgrades', () => runDueDowngrades({ ...opts, onApplied: invalidate }), { applied: [] });
     return { reminders, lapse, downgrades };
 }
 

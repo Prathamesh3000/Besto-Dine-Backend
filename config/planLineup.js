@@ -20,7 +20,15 @@
  * 2-year prepay, PRICING_PACKAGING §3), all BEFORE 18% GST and unchanged at
  * renewal. Per-outlet billing is not modelled yet, so maxBranches keeps the
  * previous 1 / 3 / 10 outlet ladder.
+ *
+ * `tier` is the numeric rank (TRIAL_SIGNUP_AND_LEADS_PLAN §1: silver 10,
+ * gold 20, premium 25, enterprise 30; any free plan 0) and `trial` the
+ * free-trial switch the public card and /start-trial read; `trialDays` is
+ * the legacy mirror the model keeps in sync.
  */
+
+const TRIAL_LENGTH_DAYS = 14;
+const trialOf = (days) => ({ enabled: days > 0, durationDays: TRIAL_LENGTH_DAYS });
 
 // Every boolean module, off. Each plan below switches on what it sells.
 const ALL_OFF = {
@@ -72,6 +80,8 @@ const LINEUP = [
         prices: { monthly: 699, annual: 6999, biennial: 11199 },
         billingCycle: 'monthly',
         trialDays: 14,
+        trial: trialOf(14),
+        tier: 10,
         sortOrder: 1,
         isPublic: true,
         highlight: false,
@@ -86,6 +96,8 @@ const LINEUP = [
         prices: { monthly: 1799, annual: 17999, biennial: 28799 },
         billingCycle: 'monthly',
         trialDays: 14,
+        trial: trialOf(14),
+        tier: 20,
         sortOrder: 2,
         isPublic: true,
         highlight: true,
@@ -100,6 +112,8 @@ const LINEUP = [
         prices: { monthly: 2999, annual: 29999, biennial: 47999 },
         billingCycle: 'monthly',
         trialDays: 14,
+        trial: trialOf(14),
+        tier: 25,
         sortOrder: 3,
         isPublic: true,
         highlight: false,
@@ -114,6 +128,8 @@ const LINEUP = [
         prices: { monthly: null, annual: null, biennial: null },
         billingCycle: 'monthly',
         trialDays: 0,
+        trial: trialOf(0),
+        tier: 30,
         sortOrder: 4,
         isPublic: true,
         highlight: false,
@@ -131,4 +147,4 @@ const LEGACY_PLANS = [
     { slug: 'premium',  newSlug: 'premium-legacy', newName: 'Premium (legacy)' },
 ];
 
-module.exports = { LINEUP, LEGACY_PLANS, ALL_OFF, SILVER_FEATURES, GOLD_FEATURES, PREMIUM_FEATURES };
+module.exports = { LINEUP, LEGACY_PLANS, ALL_OFF, SILVER_FEATURES, GOLD_FEATURES, PREMIUM_FEATURES, TRIAL_LENGTH_DAYS };

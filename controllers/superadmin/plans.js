@@ -43,6 +43,60 @@ function parsePrices(raw) {
     return { prices: out };
 }
 
+// `tier` rank — 0 is a valid value, so presence is tested with
+// `!== undefined`, never `||`. Returns { tier } or { error }.
+function parseTier(raw) {
+    if (raw === undefined || raw === null || raw === '') return { error: 'Tier is required' };
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) return { error: 'Tier must be a whole number >= 0' };
+    return { tier: n };
+}
+
+// `trial` body: { enabled, durationDays }. `fallbackDays` (legacy trialDays)
+// fills durationDays when the client sends only the switch.
+function parseTrial(raw, fallbackDays) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'trial must be an object' };
+    const out = {};
+    if (raw.enabled !== undefined) {
+        if (typeof raw.enabled !== 'boolean' && raw.enabled !== 'true' && raw.enabled !== 'false') {
+            return { error: 'trial.enabled must be true or false' };
+        }
+        out.enabled = raw.enabled === true || raw.enabled === 'true';
+    }
+    if (raw.durationDays !== undefined && raw.durationDays !== null && raw.durationDays !== '') {
+        const d = Number(raw.durationDays);
+        if (!Number.isInteger(d) || d < 0 || d > 3650) return { error: 'trial.durationDays must be a whole number between 0 and 3650' };
+        out.durationDays = d;
+    } else if (Number.isFinite(+fallbackDays) && +fallbackDays > 0) {
+        out.durationDays = +fallbackDays;
+    }
+    return { trial: out };
+}
+
+// Public-card bullets: strings only, trimmed, empties dropped, max 8.
+function normaliseHighlights(raw) {
+    if (raw === null || raw === undefined) return { highlights: [] };
+    if (!Array.isArray(raw)) return { error: 'highlights must be a list' };
+    const out = [];
+    for (const h of raw) {
+        if (typeof h !== 'string') return { error: 'Each highlight must be text' };
+        const t = h.trim();
+        if (!t) continue;
+        if (t.length > 120) return { error: 'A highlight cannot exceed 120 characters' };
+        out.push(t);
+    }
+    if (out.length > 8) return { error: 'At most 8 highlights' };
+    return { highlights: out };
+}
+
+function normaliseBadge(raw) {
+    if (raw === null || raw === undefined) return { badge: '' };
+    if (typeof raw !== 'string') return { error: 'badge must be text' };
+    const t = raw.trim();
+    if (t.length > 40) return { error: 'badge cannot exceed 40 characters' };
+    return { badge: t };
+}
+
 // POST /api/v1/superadmin/plans
 exports.createPlan = async (req, res) => {
     try {
@@ -68,6 +122,22 @@ exports.createPlan = async (req, res) => {
             return res.status(400).json({ success: false, message: 'A plan with this slug already exists' });
         }
 
+        // Public-card fields (TRIAL_SIGNUP_AND_LEADS_PLAN §2). The route
+        // validator already rejects wrong types; these re-checks keep a
+        // direct caller from reaching plan.save() with a bad value.
+        const tierR = parseTier(req.body.tier);
+        if (tierR.error) return res.status(400).json({ success: false, message: tierR.error });
+        let trial;
+        if (req.body.trial !== undefined && req.body.trial !== null) {
+            const r = parseTrial(req.body.trial, trialDays);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            trial = r.trial;
+        }
+        const badgeR = normaliseBadge(req.body.badge);
+        if (badgeR.error) return res.status(400).json({ success: false, message: badgeR.error });
+        const hlR = normaliseHighlights(req.body.highlights);
+        if (hlR.error) return res.status(400).json({ success: false, message: hlR.error });
+
         const plan = await SubscriptionPlan.create({
             name: name.trim(),
             slug: finalSlug,
@@ -76,7 +146,13 @@ exports.createPlan = async (req, res) => {
             // `price` is the monthly list price; annual / biennial are optional extras.
             prices: { monthly: +price > 0 ? +price : null, annual: parsedPrices?.annual ?? null, biennial: parsedPrices?.biennial ?? null },
             billingCycle: billingCycle || 'monthly',
+            // When `trial` is sent it wins (the model hook syncs trialDays);
+            // a legacy client sending only trialDays has `trial` derived.
             trialDays: Number.isFinite(+trialDays) ? +trialDays : 0,
+            ...(trial ? { trial } : {}),
+            tier: tierR.tier,
+            badge: badgeR.badge,
+            highlights: hlR.highlights,
             limits: limits || {},
             features: features || {},
             sortOrder: Number.isFinite(+sortOrder) ? +sortOrder : 0,
@@ -89,7 +165,12 @@ exports.createPlan = async (req, res) => {
             targetType: 'plan',
             targetId: plan._id,
             targetName: plan.name,
-            details: { slug: plan.slug, price: plan.price },
+            details: {
+                slug: plan.slug,
+                price: plan.price,
+                tier: plan.tier,
+                trial: { enabled: plan.trial?.enabled === true, durationDays: plan.trial?.durationDays },
+            },
         });
 
         publicPlansCache.invalidate();
@@ -114,7 +195,31 @@ exports.updatePlan = async (req, res) => {
         if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
 
         // Slug is immutable once created (it's referenced by tenant snapshots).
-        const editable = ['name', 'description', 'price', 'billingCycle', 'trialDays', 'limits', 'features', 'sortOrder', 'isActive', 'isPublic', 'highlight'];
+        const editable = ['name', 'description', 'price', 'billingCycle', 'trialDays', 'limits', 'features', 'sortOrder', 'isActive', 'isPublic', 'highlight', 'tier', 'badge', 'highlights'];
+
+        // Normalise the public-card fields in place so the generic loop below
+        // stores clean values and logs them. 0 is a valid tier.
+        if (req.body.tier !== undefined) {
+            const r = parseTier(req.body.tier);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            req.body.tier = r.tier;
+        }
+        if (req.body.badge !== undefined) {
+            const r = normaliseBadge(req.body.badge);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            req.body.badge = r.badge;
+        }
+        if (req.body.highlights !== undefined) {
+            const r = normaliseHighlights(req.body.highlights);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            req.body.highlights = r.highlights;
+        }
+        let trialPatch = null;
+        if (req.body.trial !== undefined && req.body.trial !== null) {
+            const r = parseTrial(req.body.trial, req.body.trialDays);
+            if (r.error) return res.status(400).json({ success: false, message: r.error });
+            trialPatch = r.trial;
+        }
         // Capture what actually changed (old → new) for the audit log. Objects
         // (limits/features) are compared by JSON so a nested tweak still shows.
         const changes = {};
@@ -130,6 +235,13 @@ exports.updatePlan = async (req, res) => {
             const afterCmp = (after && typeof after === 'object') ? JSON.stringify(after) : String(after ?? '');
             if (beforeCmp !== afterCmp) changes[key] = { from: previewVal(before), to: previewVal(after) };
             plan[key] = after;
+        }
+        if (trialPatch) {
+            for (const [k, v] of Object.entries(trialPatch)) {
+                const before = plan.trial?.[k];
+                if (String(before ?? '') !== String(v)) changes[`trial.${k}`] = { from: previewVal(before), to: previewVal(v) };
+                plan.set(`trial.${k}`, v);
+            }
         }
 
         // Per-cycle prices (base, excl. GST). A Razorpay plan is immutable, so

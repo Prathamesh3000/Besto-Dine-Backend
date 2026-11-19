@@ -49,9 +49,23 @@ class TenantContextError extends Error {
     }
 }
 
-function strictContext() {
+/** TENANT_STRICT_CONTEXT explicitly switched on (opt-in; never implied). */
+function strictContextExplicit() {
     const v = String(process.env.TENANT_STRICT_CONTEXT || '').toLowerCase();
     return v === 'true' || v === '1' || v === 'on';
+}
+
+/**
+ * Strict mode for tenant-less writes: explicit opt-in via
+ * TENANT_STRICT_CONTEXT=true, or the DEFAULT when NODE_ENV=production
+ * (override with TENANT_STRICT_CONTEXT=false). The plugin applies the
+ * production default only to models whose `restaurant` is required.
+ */
+function strictContext() {
+    if (strictContextExplicit()) return true;
+    const v = String(process.env.TENANT_STRICT_CONTEXT || '').toLowerCase();
+    if (v === 'false' || v === '0' || v === 'off') return false;
+    return process.env.NODE_ENV === 'production';
 }
 
 function toObjectId(id) {
@@ -325,6 +339,7 @@ module.exports = {
     scopeLookupSpec,
     scopePipelineStrict,
     strictContext,
+    strictContextExplicit,
     TenantMismatchError,
     TenantContextError,
 };

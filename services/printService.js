@@ -20,6 +20,8 @@ const PrintJob = require('../models/printJob');
 const Settings = require('../models/settings');
 const Table = require('../models/table');
 const User = require('../models/user');
+const Branch = require('../models/branch');
+const { refOwned } = require('../utils/tenantRefs');
 const { getSettings, invalidateCache } = require('../utils/settingsCache');
 const { getMainBranchId } = require('../utils/mainBranch');
 const { getMergeGroupNames } = require('../utils/tableMerge');
@@ -56,7 +58,10 @@ function io() {
 async function resolveScope(restaurantId, branchId) {
     const rid = idOf(restaurantId);
     const mainId = idOf(await getMainBranchId({ restaurant: { _id: rid } }));
-    const bid = idOf(branchId) || mainId;
+    let bid = idOf(branchId) || mainId;
+    // A branch id that does not belong to this restaurant never selects
+    // another tenant's print scope: fall back to the restaurant's main branch.
+    if (bid && bid !== mainId && !(await refOwned(Branch, bid, rid))) bid = mainId;
     const scopeBranch = (!bid || bid === mainId) ? null : bid;
     return { rid, branchId: bid, scopeBranch };
 }

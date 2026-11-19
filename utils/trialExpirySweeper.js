@@ -1,11 +1,14 @@
-// Free-trial expiry sweeper.
+// Free-trial expiry sweeper (plan §6).
 //
-// Locks every tenant whose trial ended unpaid: status 'trial' and
-// subscription.trialEndDate in the past become status 'suspended' +
+// Locks every tenant whose trial ended unpaid AND whose read-only grace
+// window is over: status 'trial' with subscription.trialEndDate +
+// TRIAL_READONLY_GRACE_DAYS in the past becomes status 'suspended' +
 // subscription.status 'expired' + trialExpiredAt (data is kept; see
-// utils/trialLock for what the owner can still reach). Includes trials a
-// Super Admin created. Tenants that paid (subscription active / charged)
-// are skipped.
+// utils/trialLock for what the owner can still reach). Between trialEndDate
+// and lockAt the tenant is read-only - that is enforced per request from the
+// dates (trialLock.trialState), so this job only has to flip the final lock.
+// Includes trials a Super Admin created. Tenants that paid (subscription
+// active / charged) are skipped.
 //
 // Safe on several instances and safe to re-run: each tenant is flipped with
 // a conditional update that re-checks the due conditions, so only one
@@ -13,19 +16,28 @@
 // and activates the subscription (utils/planPaymentApply), which also
 // removes the tenant from the due set.
 //
+// No email is sent here: the "trial ended" (t+0) and "last day before lock"
+// (t+2) notices belong to utils/trialReminderJob, so the lock never produces
+// a second mail.
+//
 // Disable with TRIAL_SWEEP_DISABLED=true. Interval: TRIAL_SWEEP_INTERVAL_MINUTES
 // (default 60).
 
 const Restaurant = require('../models/restaurant');
 const logger = require('./logger');
-const { TRIAL_LOCK_REASON } = require('./trialLock');
+const { TRIAL_LOCK_REASON, TRIAL_READONLY_GRACE_DAYS, DAY_MS } = require('./trialLock');
 
 const SWEEP_INTERVAL_MINUTES_DEFAULT = 60;
+
+/** Trials whose lockAt (= trialEndDate + grace) is strictly before `now`. */
+function lockDueBefore(now) {
+    return new Date(now.getTime() - TRIAL_READONLY_GRACE_DAYS * DAY_MS);
+}
 
 function dueFilter(now) {
     return {
         status: 'trial',
-        'subscription.trialEndDate': { $lt: now },
+        'subscription.trialEndDate': { $lt: lockDueBefore(now) },
         'subscription.status': { $nin: ['active', 'cancelled', 'expired'] },
         'subscription.lastChargedAt': null, // missing or null = never charged
     };
@@ -34,8 +46,8 @@ function dueFilter(now) {
 /**
  * @param {object} [opts]
  * @param {Date}   [opts.now]      injectable clock (tests)
- * @param {function} [opts.onLocked] called with each locked tenant (cache
- *   invalidation, expiry email) - failures are logged, never thrown.
+ * @param {function} [opts.onLocked] called with each locked tenant (tenant
+ *   cache invalidation) - failures are logged, never thrown.
  * @returns {Promise<{ checked: number, locked: string[] }>}
  */
 async function runTrialExpirySweep({ now = new Date(), model = Restaurant, onLocked } = {}) {
@@ -81,11 +93,11 @@ function startTrialExpirySweeper() {
     return scheduler.scheduleJob('trial-expiry-sweeper', minutes * 60 * 1000, () =>
         runTrialExpirySweep({
             onLocked: async (tenant) => {
+                // Drop the cached tenant so the next request sees the lock.
                 const { invalidateTenant } = require('../middlewares/tenantContext');
                 invalidateTenant(tenant._id);
-                await require('./trialReminderJob').sendExpiryNotice(tenant);
             },
         }));
 }
 
-module.exports = { runTrialExpirySweep, startTrialExpirySweeper };
+module.exports = { lockDueBefore, dueFilter, runTrialExpirySweep, startTrialExpirySweeper };

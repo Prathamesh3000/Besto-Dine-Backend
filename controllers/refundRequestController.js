@@ -23,9 +23,13 @@ const { processOrderRefund, roundPaise } = require('../utils/orderRefund');
 // ─── Customer creates a refund request (explicit, separate from cancel) ───
 exports.createRefundRequest = async (req, res) => {
     try {
-        const { orderId, reason, amount: requestedAmount } = req.body;
+        const { orderId, amount: requestedAmount } = req.body;
+        const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
         if (!orderId) {
             return res.status(400).json({ success: false, message: 'orderId is required' });
+        }
+        if (!reason) {
+            return res.status(400).json({ success: false, code: 'REASON_REQUIRED', message: 'Please tell us why you are requesting a refund' });
         }
 
         const tf = tenantFilter(req);
@@ -255,6 +259,10 @@ exports.approveRefundRequest = async (req, res) => {
                 settings,
                 tenantId: tenantId(req),
                 refundRequestId: rr._id,   // carried into the refund.created webhook
+                // Recorded on order.refunds[] with the gateway refund id, so
+                // the refund.processed webhook dedupes and cash closing sees it.
+                actor: { _id: decidedBy, name: req.user?.name || '' },
+                source: 'admin',
             });
         } catch (refundErr) {
             await unclaim();
@@ -272,8 +280,13 @@ exports.approveRefundRequest = async (req, res) => {
         claimed.razorpayRefundId = result.razorpayRefundId || '';
         await claimed.save();
         rr = claimed;
+        // Fully refunded by this approval → the coupon use goes back (once).
+        try {
+            const full = await Order.findOne({ _id: rr.order, ...tenantFilter(req) }).select('paymentStatus couponCode couponDiscount restaurant').lean();
+            if (full && full.paymentStatus === 'Refunded') await require('../services/orderCancelReversal').releaseCouponUseOnce(full);
+        } catch { /* never fails the approval */ }
         // refund.created webhook is emitted by processOrderRefund (with this request's id).
-        require('../services/tenantAuditHooks').auditRefund(req, { _id: rr.order, orderId: rr.orderId, paymentStatus: null }, { amount, reason: rr.reason, mode: result.mode });
+        require('../services/tenantAuditHooks').auditRefund(req, { _id: rr.order, orderId: rr.orderIdRef, paymentStatus: null }, { amount, reason: rr.reason, mode: result.mode });
 
         // Customer notification — they're waiting for this status flip.
         if (rr.user) {

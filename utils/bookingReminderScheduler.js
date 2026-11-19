@@ -18,6 +18,7 @@
 // and trigger from an external cron instead.
 
 const AdvanceBooking = require('../models/advanceBooking');
+const Restaurant = require('../models/restaurant');
 const logger = require('./logger');
 const { notify } = require('../services/notificationService');
 
@@ -43,7 +44,11 @@ async function runBookingReminderScan() {
     let sent = 0;
 
     try {
+        // Suspended / cancelled tenants (trial-locked, non-payment, ToS) are locked out: do not
+        // nudge their customers to pay. past_due is a soft state and stays included.
+        const liveTenants = await Restaurant.find({ status: { $in: ['active', 'trial', 'past_due'] } }).select('_id').lean();
         const due = await AdvanceBooking.find({
+            restaurant: { $in: liveTenants.map((t) => t._id) },
             status: 'Confirmed',
             'payment.status': { $ne: 'Paid' },
             'payment.balanceReminderSentAt': { $in: [null, undefined] },

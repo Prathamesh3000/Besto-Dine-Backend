@@ -47,7 +47,7 @@ function isEnabled() {
 
 /** Same mapping as Frontend audienceForUser(). */
 function audienceForRole(role) {
-    if (role === 'superadmin') return 'platform';
+    if (role === 'superadmin' || role === 'platformstaff') return 'platform';
     if (role === 'customer') return 'customer';
     return 'staff';
 }

@@ -189,9 +189,21 @@ const restaurantSchema = new mongoose.Schema({
         // 'expired' = trial ended unpaid: tenant `status` is 'suspended',
         // data kept, only the owner's billing screens work (utils/trialLock).
         trialExpiredAt: { type: Date },
-        // Days-before-end thresholds (7, 3, 1) and 0 (= ended) already
-        // emailed, so each reminder goes out exactly once.
+        // Legacy (pre 2026-11-11) reminder markers; no longer written.
         trialRemindersSent: { type: [Number], default: [] },
+        // Trial reminder emails (utils/trialReminderJob, plan §7). A row is
+        // claimed (queuedAt) BEFORE sending so a restart or a second
+        // instance cannot send the same type twice; sentAt is set on
+        // success and the row is removed when sending fails so the next
+        // hourly run retries. Cleared when the trial is extended.
+        trialReminders: {
+            type: [{
+                type:     { type: String, required: true },   // t-3 | t-1 | t+0 | t+2
+                queuedAt: { type: Date, default: Date.now },
+                sentAt:   { type: Date, default: null },
+            }],
+            default: [],
+        },
         // Snapshot of plan.features at assignment time (immutable until
         // Super Admin reassigns the plan).
         features: { type: Object, default: {} },
@@ -436,6 +448,48 @@ const restaurantSchema = new mongoose.Schema({
         enum: ['admin', 'self'],
         default: 'admin',
     },
+    // Finer-grained origin (plan §4/§8). 'self_service' = free or paid plan
+    // via /register-restaurant, 'self_service_trial' = /start-trial or a
+    // trial-enabled plan via register. Lets analytics, the trial lifecycle
+    // and the Signup Leads module tell the funnels apart. signupSource stays
+    // 'self' for both so existing queries keep working.
+    registrationSource: {
+        type: String,
+        enum: ['admin', 'self_service', 'self_service_trial'],
+        default: 'admin',
+        index: true,
+    },
+    // Platform-owner follow-up on a self-registered tenant (Signup Leads,
+    // plan §8). The tenant record IS the lead; this sub-object is the
+    // owner's private CRM state. `select: false`: it never reaches a tenant
+    // response — only controllers/superadmin/signupLeads.js asks for
+    // `+lead`. Stage 'converted' is DISPLAYED for any paid tenant
+    // regardless of what is stored here.
+    lead: {
+        type: new mongoose.Schema({
+            stage: {
+                type: String,
+                enum: ['new', 'contacted', 'interested', 'converted', 'lost'],
+                default: 'new',
+            },
+            nextFollowUpAt:  { type: Date, default: null },
+            lastContactedAt: { type: Date, default: null },
+            notes: {
+                type: [{
+                    text:   { type: String, required: true, maxlength: 1000, trim: true },
+                    by:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+                    byName: { type: String, default: '', maxlength: 80 },
+                    at:     { type: Date, default: Date.now },
+                    // 'system' rows are written by jobs (e.g. trial reminder
+                    // emails) and never change stage / lastContactedAt.
+                    kind:   { type: String, enum: ['human', 'system'], default: 'human' },
+                }],
+                default: [],
+            },
+        }, { _id: false }),
+        default: () => ({}),
+        select: false,
+    },
     signupStatus: {
         type: String,
         enum: ['pending', 'approved', 'rejected'],
@@ -520,6 +574,8 @@ restaurantSchema.index({ contactPhoneNormalized: 1 },
     { unique: true, partialFilterExpression: { contactPhoneNormalized: { $type: 'string' } } });
 // Trial sweeper / reminder scans.
 restaurantSchema.index({ status: 1, 'subscription.trialEndDate': 1 });
+// Signup Leads list (self-registered tenants, newest first).
+restaurantSchema.index({ signupSource: 1, createdAt: -1 });
 
 // Paying lifts the free-trial lock. Every plan-payment path (verify, webhook,
 // Super Admin confirm) ends by setting subscription.status = 'active' on a

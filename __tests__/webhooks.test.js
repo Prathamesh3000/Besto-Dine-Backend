@@ -279,7 +279,7 @@ describe('processDueDeliveries (retry job)', () => {
 
     test('claims each due row atomically, skips ones another instance claimed, attempts the rest', async () => {
         const rows = [{ _id: 'a', restaurant: RID }, { _id: 'b', restaurant: RID }];
-        jest.spyOn(WebhookDelivery, 'find').mockReturnValue({ setOptions: () => ({ sort: () => ({ limit: () => ({ lean: async () => rows }) }) }) });
+        jest.spyOn(WebhookDelivery, 'find').mockReturnValue({ sort: () => ({ limit: () => ({ lean: async () => rows }) }) });
         const claim = jest.spyOn(WebhookDelivery, 'findOneAndUpdate')
             .mockImplementationOnce(async () => null)
             .mockImplementationOnce(async () => ({ _id: 'b', restaurant: RID, endpoint: 'e1', type: 't', payload: { id: 'evt' }, attempts: 1 }));

@@ -134,12 +134,18 @@ exports.getActiveCoupons = async (req, res) => {
             endDate: { $gte: now },
             ...tenantFilter(req),
             ...(await customerBranchFilter(req)),
-        }).sort({ createdAt: -1 });
+        }).sort({ createdAt: -1 }).lean();
+
+        // Redemption counters / targeting / tenant id are admin data.
+        const publicCoupons = coupons.map((c) => {
+            const { usageCount, usageLimit, targetUsers, restaurant: _r, ...pub } = c;
+            return pub;
+        });
 
         res.status(200).json({
             success: true,
-            count: coupons.length,
-            coupons
+            count: publicCoupons.length,
+            coupons: publicCoupons
         });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Error fetching coupons', ...devError(error) });
@@ -160,7 +166,9 @@ exports.applyCoupon = async (req, res) => {
         const { code, items } = req.body;
         const userId = req.user?._id;
 
-        if (!code) {
+        // Same normalisation as order create: trim + upper-case.
+        const normCode = typeof code === 'string' ? code.trim().toUpperCase() : '';
+        if (!normCode) {
             return res.status(400).json({ success: false, message: 'Please provide a coupon code' });
         }
         // Coerce once: a numeric string ("499") used to flow through as a
@@ -172,7 +180,7 @@ exports.applyCoupon = async (req, res) => {
         }
 
         const coupon = await Coupon.findOne({
-            code: code.toUpperCase(),
+            code: normCode,
             isActive: true,
             ...tenantFilter(req),
             ...(await customerBranchFilter(req)),
@@ -276,6 +284,16 @@ exports.applyCoupon = async (req, res) => {
         }
         if (!discountItems) {
             discountItems = [{ prepStation: 'kitchen', price: orderValue, quantity: 1 }];
+        }
+        // Only percentage / fixed_amount coupons are priced at the cart.
+        // bogo / shipping_discount would report "applied" with a ₹0 discount.
+        if (!['percentage', 'fixed_amount'].includes(coupon.discountType)) {
+            return res.status(400).json({
+                success: false,
+                applicable: false,
+                code: 'COUPON_NOT_APPLICABLE',
+                message: 'This coupon cannot be applied at the cart.',
+            });
         }
         const { discount, eligibleSubtotal } = computeCouponDiscount(coupon, discountItems);
         if (coupon.scope && coupon.scope !== 'all' && eligibleSubtotal <= 0) {
@@ -542,6 +560,9 @@ exports.updateCoupon = async (req, res) => {
         if (!stored) return res.status(404).json({ success: false, message: 'Coupon not found' });
         const mergedErr = validateCouponBody({ ...stored, ...updateData });
         if (mergedErr) return res.status(400).json({ success: false, message: mergedErr });
+        if (Number(updateData.usageLimit) > 0 && Number(updateData.usageLimit) < (Number(stored.usageCount) || 0)) {
+            return res.status(400).json({ success: false, message: 'usageLimit cannot be lower than the times already used' });
+        }
 
         if (Object.prototype.hasOwnProperty.call(updateData, 'branch')) {
             // Tenant owner: the new branch must belong to this tenant.

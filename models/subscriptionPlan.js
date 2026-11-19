@@ -106,10 +106,38 @@ const subscriptionPlanSchema = new mongoose.Schema({
         enum: ['monthly', 'quarterly', 'yearly'],
         default: 'monthly',
     },
+    // Legacy trial length. SYNCED from `trial` by the pre-validate hook
+    // below (trialDays = trial.enabled ? trial.durationDays : 0). Old
+    // clients may still send only trialDays; the hook then fills `trial`.
     trialDays: {
         type: Number,
         default: 0,
         min: [0, 'Trial days cannot be negative'],
+    },
+    // Free-trial switch (TRIAL_SIGNUP_AND_LEADS_PLAN.md §2). `enabled` is the
+    // single flag that makes a plan show "Start Free Trial"; durationDays is
+    // the trial length offered on this plan.
+    trial: {
+        enabled:      { type: Boolean, default: false },
+        durationDays: { type: Number, default: 14, min: 0, max: 3650 },
+    },
+    // Numeric rank, higher = higher plan (free 0, silver 10, gold 20,
+    // premium 25, enterprise 30). Drives upgrade-vs-downgrade and the
+    // "Contact Sales" CTA (tier >= 30). 0 is a valid value — callers must
+    // test `!== undefined`, never `||`.
+    tier: {
+        type: Number,
+        required: true,
+        default: 0,
+        min: [0, 'Tier cannot be negative'],
+    },
+    // Short marketing badge on the public card, e.g. "Most popular".
+    badge: { type: String, default: '', maxlength: 40, trim: true },
+    // Bullet points on the public card (max 8).
+    highlights: {
+        type: [{ type: String, maxlength: 120, trim: true }],
+        default: [],
+        validate: { validator: (v) => !v || v.length <= 8, message: 'At most 8 highlights' },
     },
     limits: {
         maxBranches:  { type: Number, default: 1, min: 0 },
@@ -173,6 +201,20 @@ const subscriptionPlanSchema = new mongoose.Schema({
         biennial: { type: Number, default: null },
     },
 }, { timestamps: true });
+
+// Keep the legacy `trialDays` and the `trial` object in step whichever one a
+// writer touched. `trial` wins when both changed in the same save.
+subscriptionPlanSchema.pre('validate', function () {
+    if (!this.trial) this.trial = { enabled: false, durationDays: 14 };
+    const trialChanged = this.isModified('trial.enabled') || this.isModified('trial.durationDays');
+    const legacyChanged = this.isModified('trialDays');
+    if (legacyChanged && !trialChanged) {
+        const d = Number(this.trialDays) || 0;
+        this.trial.enabled = d > 0;
+        if (d > 0) this.trial.durationDays = d;
+    }
+    this.trialDays = this.trial.enabled ? (Number(this.trial.durationDays) || 0) : 0;
+});
 
 // Base price (rupees, excl. GST) for a billing cycle, or null if not sold.
 subscriptionPlanSchema.methods.priceFor = function (cycle) {

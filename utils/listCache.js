@@ -39,6 +39,7 @@
  */
 
 const cacheBus = require('./cacheBus');
+const { getContext } = require('./requestContext');
 
 const KEY_LEGACY = '__legacy__';
 const BUS_CHANNEL = 'listCache';
@@ -70,7 +71,13 @@ function resolveBranchIdFromReq(req) {
 }
 
 function resolveKey(arg) {
-    if (!arg) return KEY_LEGACY;
+    if (!arg) {
+        // No argument: key by the active tenant context so tenants never share an
+        // entry; the shared legacy key is only for genuinely global lists
+        // (no tenant context, e.g. public plans).
+        const t = getContext()?.tenantId;
+        return t ? `${String(t)}:null` : KEY_LEGACY;
+    }
     if (typeof arg === 'object' && arg.restaurant) {
         const tenant = String(arg.restaurant._id);
         const branch = resolveBranchIdFromReq(arg);

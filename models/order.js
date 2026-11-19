@@ -390,14 +390,25 @@ const orderSchema = new mongoose.Schema({
     actor: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     actorName: { type: String, default: '' },
     source: { type: String, enum: ['admin', 'webhook'], default: 'admin' },
+    // How the money went back: gateway (original method), wallet credit, or
+    // cash / manual hand-back. Cash closing counts only destination 'cash'.
+    destination: { type: String, enum: ['gateway', 'wallet', 'cash', ''], default: '' },
+    // Refund mode the leg was routed with: original | wallet | manual.
+    method: { type: String, default: '' },
     createdAt: { type: Date, default: Date.now },
   }],
+  // Gateway capture above the bill (customer paid more than due). amountPaid
+  // is capped at total; the surplus is flagged here for a manual refund.
+  overpaidAmount: { type: Number, default: 0, min: 0 },
   tipAmount: { type: Number, default: 0, min: [0, 'Tip amount cannot be negative'] },
   // Coupon / wallet adjustments captured at checkout. Stored so the
   // admin bill view matches what the customer saw — without these the
   // table drawer was showing an inflated total with no discount line.
   couponCode: { type: String, default: '' },
   couponDiscount: { type: Number, default: 0, min: [0, 'Coupon discount cannot be negative'] },
+  // Set once when a terminal path (cancel / full refund) gave the coupon use
+  // back, so a later terminal path never releases it a second time.
+  couponReleasedAt: { type: Date, default: null },
   pointsRedeemed: { type: Number, default: 0, min: [0, 'Points redeemed cannot be negative'] },
   // Manual discount the admin/waiter applies from the table drawer. Stored
   // so it shows on the CUSTOMER's bill (bill-preview) before they pay — not

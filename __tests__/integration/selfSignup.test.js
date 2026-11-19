@@ -104,7 +104,9 @@ describe('POST /public/register-restaurant → approval → login', () => {
             status: 'suspended', signupSource: 'self', signupStatus: 'pending',
             contactPhone: normalizeMobile(body.contactPhone), city: 'Pune',
         });
-        expect(r.subscription.planSlug).toBe('gold'); // trial plan; billing not activated
+        // A trial-enabled chosen plan IS the trial plan (plan §5); billing not activated.
+        expect(r.subscription.planSlug).toBe('pro');
+        expect(r.registrationSource).toBe('self_service_trial');
         expect(String(r.requestedPlan.plan)).toBe(String(plans.pro._id));
         expect(r.signupMeta).toMatchObject({ ownerName: 'Asha Owner', source: 'home-hero', utmSource: 'google', utmCampaign: 'launch' });
         expect(r.signupMeta.termsAcceptedAt).toBeTruthy();
@@ -141,7 +143,7 @@ describe('POST /public/register-restaurant → approval → login', () => {
             ownerName: 'Asha Owner',
             requestedPlan: { _id: String(plans.pro._id), name: 'Pro' },
             signupMeta: { source: 'home-hero', utmSource: 'google', utmCampaign: 'launch', utmMedium: '' },
-            subscription: { planName: 'Gold' },
+            subscription: { planName: 'Pro' },
         });
         expect(item.createdAt).toBeTruthy();
 
@@ -158,7 +160,7 @@ describe('POST /public/register-restaurant → approval → login', () => {
         expect(welcome).toBeTruthy();
         expect(welcome.text).toContain(`${FRONTEND}/staff-login`);
         expect(welcome.text).toContain(`${FRONTEND}/${body.slug}`);
-        // Full fresh trial (Free plan has no trialDays → 14-day default).
+        // Full fresh trial (Pro offers a 14-day trial).
         expect(welcome.text).toContain('14-day free trial');
 
         const after = await Restaurant.findById(r._id).lean();

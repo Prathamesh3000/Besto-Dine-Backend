@@ -34,7 +34,7 @@ const transactionSchema = new mongoose.Schema({
     // 'wallet_status_change' is a zero-amount audit row written by
     // walletController.setWalletStatus so admins can trace who flipped
     // a customer wallet between active / suspended / blocked.
-    enum: ['order_payment', 'wallet_recharge', 'refund', 'points_earned', 'points_redeemed', 'wallet_status_change'],
+    enum: ['order_payment', 'wallet_recharge', 'refund', 'points_earned', 'points_redeemed', 'wallet_status_change', 'admin_adjustment'],
     required: true
   },
   amount: {
@@ -47,7 +47,12 @@ const transactionSchema = new mongoose.Schema({
   },
   paymentMethod: {
     type: String,
-    enum: ['upi', 'card', 'wallet', 'cash', 'points'],
+    // 'mixed' = a split-tender settle (several methods on one order; the
+    // per-leg lines live on order.payments), 'other' = any method outside
+    // the named ones (cheque, voucher, ...). Both are written by the staff
+    // settle ledger; without them a split / "other" settle 500'd after the
+    // order was already committed Paid.
+    enum: ['upi', 'card', 'wallet', 'cash', 'points', 'mixed', 'other'],
     required: true
   },
   status: {

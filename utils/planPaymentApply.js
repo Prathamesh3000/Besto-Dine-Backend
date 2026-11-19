@@ -1,6 +1,7 @@
 const Restaurant = require('../models/restaurant');
 const SubscriptionInvoice = require('../models/subscriptionInvoice');
 const logger = require('./logger');
+const { skipScope } = require('./tenantScopePlugin');
 const { describeRazorpayError } = require('./razorpayErrors');
 const {
     normalizeCycle, addMonths, addCycle, priceWithGst, invoiceAmounts,
@@ -211,11 +212,12 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
 
     // Idempotency: if this payment was already invoiced, the upgrade
     // was already applied on the first run — bail.
-    // Global idempotency on a platform-unique payment id — opt out of
-    // the #30 tenant-scope plugin so a tenant-context caller still sees it.
-    const existing = await SubscriptionInvoice.findOne({
+    // AUDIT-EXEMPT: razorpayPaymentId is platform-unique (unique index), so
+    // idempotency must see an invoice under ANY tenant; the webhook caller has
+    // no tenant context and the verify/sync callers have one. Existence only.
+    const existing = await skipScope(SubscriptionInvoice.findOne({
         razorpayPaymentId: payment.id,
-    }, null, { skipTenantScope: true }).lean();
+    }).select('_id').lean());
     if (existing) {
         logger.info(`${logTag}: payment ${payment.id} already invoiced — skipping`);
         return { applied: false, invoiceCreated: false, alreadyInvoiced: true };
@@ -226,7 +228,27 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
     // ₹1 capture, or an older cheaper plan order, would unlock whatever
     // plan is currently pending. Skip — nothing applied, nothing
     // invoiced — and leave it for manual reconciliation.
-    const mismatch = pendingPaymentMismatch(restaurant.subscription?.pendingUpgrade, payment);
+    //
+    // With NO pending upgrade the payment can only be a plain renewal of
+    // the current plan: it must be INR and pay the current plan's price
+    // incl. GST, or a ₹1 plan_payment would extend the term + mint an invoice.
+    const pendingUpgrade = restaurant.subscription?.pendingUpgrade;
+    let mismatch = '';
+    if (payment.currency && payment.currency !== 'INR') {
+        mismatch = `unsupported currency ${payment.currency}`;
+    } else if (pendingUpgrade && pendingUpgrade.planSlug) {
+        mismatch = pendingPaymentMismatch(pendingUpgrade, payment);
+    } else {
+        const current = Number(restaurant.subscription?.price);
+        if (!(Number.isFinite(current) && current > 0)) {
+            mismatch = 'no pending upgrade and the current plan has no price to match';
+        } else {
+            const required = priceWithGst(current).totalPaise;
+            if (!(Number(payment.amount) >= required)) {
+                mismatch = `no pending upgrade and amount ${payment.amount || 0} paise is below the current plan price incl. GST ${required} paise`;
+            }
+        }
+    }
     if (mismatch) {
         logger.error(`${logTag}: payment ${payment.id} NOT applied to pending upgrade for ${restaurant.slug}: ${mismatch}`);
         return { applied: false, invoiceCreated: false, alreadyInvoiced: false, skipped: true, reason: mismatch };
@@ -254,6 +276,15 @@ async function applyPaidPlanUpgrade({ restaurant, payment, logTag = 'plan-paymen
     if (restaurant.subscription.status === 'past_due') restaurant.subscription.status = 'active';
     if (restaurant.status === 'past_due') restaurant.status = 'active';
     await restaurant.save();
+
+    // The tenant just paid: drop the cached tenant (here and on every other
+    // instance, same as the trial sweeper's post-lock hook) so the very next
+    // request sees the active subscription instead of a cached trial lock.
+    try {
+        require('../middlewares/tenantContext').invalidateTenant(restaurant._id);
+    } catch (err) {
+        logger.warn(`${logTag}: tenant cache invalidation failed for ${restaurant.slug}: ${err.message}`);
+    }
 
     if (applied) {
         logger.info(`${logTag}: applied pending upgrade for ${restaurant.slug} → ${restaurant.subscription.planName} (payment ${payment.id})`);

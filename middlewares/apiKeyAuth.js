@@ -33,6 +33,7 @@ const { hasFeature } = require('../utils/featureAccess');
 const { makeLimiter } = require('../utils/rateLimitStore');
 const { runWithContext, contextFromRequest } = require('../utils/requestContext');
 const logger = require('../utils/logger');
+const { skipScope } = require('../utils/tenantScopePlugin');
 
 const LAST_USED_WRITE_INTERVAL_MS = 60 * 1000;
 // Compared against when the prefix is unknown, to keep timing flat.
@@ -77,7 +78,8 @@ const apiKeyAuth = (scope) => async (req, res, next) => {
         const parsed = parseApiKey(raw);
         if (!parsed) return deny(res, 401, 'API_KEY_INVALID', 'The API key is not valid.');
 
-        const key = await ApiKey.findOne({ prefix: parsed.prefix }).select('+hash').setOptions({ skipTenantScope: true });
+        // AUDIT-EXEMPT: API-key lookup by its globally unique prefix IS how the tenant is discovered (no tenant context exists yet).
+        const key = await skipScope(ApiKey.findOne({ prefix: parsed.prefix }).select('+hash'));
         const secretOk = verifySecret(parsed.secret, key ? key.hash : DUMMY_HASH);
         if (!key || !secretOk) return deny(res, 401, 'API_KEY_INVALID', 'The API key is not valid.');
         if (key.revokedAt) return deny(res, 401, 'API_KEY_REVOKED', 'This API key has been revoked.');

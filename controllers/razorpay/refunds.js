@@ -9,12 +9,12 @@ const idGen = require('../../utils/idGenerator');
 const AdvanceBooking = require('../../models/advanceBooking');
 const { notify } = require('../../services/notificationService');
 const { getSettings } = require('../../utils/settingsCache');
-const { tenantFilter, tenantId } = require('../../utils/tenantScope');
+const { tenantFilter, tenantId, strictBranchFilter } = require('../../utils/tenantScope');
 const { resolveLoyaltySettings } = require('../../utils/paymentDefaults');
 const { revokeTipsForOrder } = require('../../utils/tipHelpers');
 const { checkOrphanRefundEligibility, isValidCheckoutSignature } = require('../../utils/paymentChecks');
 const { claimPayment, releaseClaim, findClaim } = require('../../utils/paymentClaim');
-const { roundPaise, isWalletPaid, ledgerPaymentMethod, loyaltyPointsToClawBack } = require('../../utils/orderRefund');
+const { roundPaise, processOrderRefund } = require('../../utils/orderRefund');
 const { describeRazorpayError } = require('../../utils/razorpayErrors');
 const {
     verifiedScanSessionId,
@@ -34,17 +34,23 @@ const {
 
 exports.refundPayment = async (req, res) => {
     try {
-        const { orderId, amount, reason } = req.body;
+        const { orderId, amount } = req.body;
+        const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
 
         if (!orderId) {
             return res.status(400).json({ success: false, message: 'Order ID is required' });
+        }
+        if (!reason) {
+            return res.status(400).json({ success: false, code: 'REASON_REQUIRED', message: 'A refund reason is required' });
         }
         // Validate amount — required, must be a positive finite number
         if (amount === undefined || amount === null || typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
             return res.status(400).json({ success: false, message: 'Refund amount is required and must be a positive number' });
         }
 
-        const tf = tenantFilter(req);
+        // Tenant + branch scope: a branch-pinned admin only refunds orders of
+        // their own branch (same rule as approving a refund request).
+        const tf = { ...tenantFilter(req), ...strictBranchFilter(req) };
         let order = mongoose.Types.ObjectId.isValid(orderId)
             ? await Order.findOne({ _id: orderId, ...tf })
             : null;
@@ -70,111 +76,36 @@ exports.refundPayment = async (req, res) => {
             });
         }
 
-        let razorpayRefundId = null;
-
         // ── Process refund based on settings and payment method (per-tenant) ──
+        // The shared helper reserves the amount atomically, calls the gateway
+        // for the online leg, credits the wallet for the wallet leg, and
+        // records the refund (with its destination) on the order.
         const settings = await getSettings(req);
         const loyalty = resolveLoyaltySettings(settings);
         const refundMode = loyalty.refundMode;
-        const walletRefund = !!order.user && (isWalletPaid(order) || refundMode === 'wallet');
-
-        // Step 1: External API call (Razorpay) — must happen OUTSIDE the DB session
-        //         because we can't roll back an external API call.
-        if (order.paymentMethod === 'online' && order.razorpayPaymentId && refundMode === 'original') {
-            try {
-                // SDK 2.9.x: refunds go through payments.refund(); there is
-                // no refunds.create.
-                const refund = await razorpay.payments.refund(order.razorpayPaymentId, {
-                    amount: Math.round(refundAmount * 100),
-                    notes: { reason: reason || 'Refund', orderId: order.orderId },
-                });
-                razorpayRefundId = refund.id;
-                logger.info(`Razorpay refund initiated: ${razorpayRefundId} for ₹${refundAmount}`);
-            } catch (rzpErr) {
-                logger.error('Razorpay API Refund Error:', describeRazorpayError(rzpErr));
-                return res.status(400).json({
-                    success: false,
-                    message: 'Refund could not be processed via payment gateway. Please try again or contact support.'
-                });
-            }
-        } else if (order.paymentMethod === 'online' && !order.razorpayPaymentId) {
-            return res.status(400).json({ success: false, message: 'Online payment record has no transaction ID to refund' });
-        } else if (walletRefund && !order.restaurant) {
-            return res.status(400).json({ success: false, message: 'Cannot process wallet refund — order has no restaurant context' });
+        const beforeStatus = order.paymentStatus;
+        const result = await processOrderRefund(order, {
+            amount: refundAmount,
+            reason,
+            settings,
+            tenantId: tenantId(req),
+            actor: { _id: req.user?._id || req.user?.id || null, name: req.user?.name || '' },
+            source: 'admin',
+        });
+        if (!result.success) {
+            const message = result.code === 'GATEWAY_FAILED'
+                ? 'Refund could not be processed via payment gateway. Please try again or contact support.'
+                : result.code === 'NO_PAYMENT_ID'
+                    ? 'Online payment record has no transaction ID to refund'
+                    : (result.error || 'Refund could not be processed');
+            return res.status(result.status || 400).json({ success: false, message });
         }
-
-        // Step 2: All DB writes in a transaction session for atomicity.
-        //         If any write fails, everything rolls back.
-        const session = await mongoose.startSession();
-        try {
-            await session.withTransaction(async () => {
-                // ── Update order ──────────────────────────────────────────
-                order.refundedAmount = roundPaise(alreadyRefunded + refundAmount);
-                order.paymentStatus = order.refundedAmount >= order.amountPaid ? 'Refunded' : 'Paid';
-                order.refunds = order.refunds || [];
-                order.refunds.push({
-                    amount: refundAmount,
-                    reason: reason || '',
-                    razorpayRefundId: razorpayRefundId || null,
-                    actor: req.user?._id || req.user?.id || null,
-                    actorName: req.user?.name || '',
-                    source: 'admin',
-                    createdAt: new Date(),
-                });
-                await order.save({ session });
-
-                // ── Credit wallet if wallet refund ────────────────────────
-                if (walletRefund) {
-                    const walletScope = { user: order.user, restaurant: order.restaurant };
-                    await Wallet.findOneAndUpdate(
-                        walletScope,
-                        { $inc: { balance: refundAmount }, $setOnInsert: { restaurant: order.restaurant } },
-                        { upsert: true, returnDocument: 'after', session }
-                    );
-                    logger.info(`Wallet refund credited: ₹${refundAmount} to user ${order.user}`);
-                }
-
-                // ── Deduct loyalty points proportionally ──────────────────
-                if (order.user) {
-                    // Only a share of what THIS order earned.
-                    const pointsToDeduct = await loyaltyPointsToClawBack(order, refundAmount, loyalty, session);
-                    if (pointsToDeduct > 0) {
-                        await Wallet.findOneAndUpdate(
-                            { user: order.user, loyaltyPoints: { $gte: pointsToDeduct }, ...tf },
-                            { $inc: { loyaltyPoints: -pointsToDeduct } },
-                            { session }
-                        );
-                    }
-                }
-
-                // ── Record transaction ────────────────────────────────────
-                if (order.user) {
-                    const wallet = await Wallet.findOne({ user: order.user, ...tf }).session(session);
-                    const currentBalance = wallet ? wallet.balance : 0;
-                    const balanceBefore = walletRefund ? roundPaise(currentBalance - refundAmount) : currentBalance;
-
-                    await Transaction.create([{
-                        user: order.user,
-                        restaurant: order.restaurant || tenantId(req),
-                        order: order._id,
-                        type: 'refund',
-                        amount: refundAmount,
-                        paymentMethod: ledgerPaymentMethod(order.paymentMethod),
-                        status: 'completed',
-                        description: `Refund of ₹${refundAmount} for order ${order.orderId}: ${reason || 'No reason'}`,
-                        transactionId: idGen.transactionId(),
-                        balanceBefore,
-                        balanceAfter: currentBalance,
-                    }], { session });
-                }
-            });
-        } finally {
-            await session.endSession();
+        const razorpayRefundId = result.razorpayRefundId || null;
+        // A full refund gives the coupon use back (once, whichever terminal path got there first).
+        if (order.paymentStatus === 'Refunded') {
+            try { await require('../../services/orderCancelReversal').releaseCouponUseOnce(order); } catch { /* never fails the refund */ }
         }
-
-        // Revoke still-pending tips so the waiter isn't settled for a
-        // refunded transaction. Settled tips are left alone.
-        await revokeTipsForOrder(order, { reason: `admin refund: ${reason || 'no reason'}` });
+        const walletRefund = (result.legs || []).some((l) => l.destination === 'wallet');
 
         // Step 3: Notifications — outside the session (non-critical, best-effort)
         const notifTenant = order.restaurant || tenantId(req);
@@ -210,12 +141,7 @@ exports.refundPayment = async (req, res) => {
 
         broadcastPaymentEvent(order, 'Refund Processed',
             `₹${refundAmount} refunded for ${order.orderId}. Mode: ${refundMode}`);
-        require('../../services/tenantAuditHooks').auditRefund(req, order, { amount: refundAmount, reason, mode: refundMode });
-        try {
-            require('../../utils/webhookService').emitRefundCreated(order, {
-                amount: refundAmount, mode: razorpayRefundId ? 'original' : (walletRefund ? 'wallet' : 'manual'), refundedAmount: order.refundedAmount,
-            });
-        } catch { /* webhooks never affect the refund */ }
+        require('../../services/tenantAuditHooks').auditRefund(req, order, { amount: refundAmount, reason, mode: refundMode, beforeStatus });
 
         return res.status(200).json({
             success: true,

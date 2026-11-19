@@ -607,7 +607,12 @@ describe('GET /tenant/export', () => {
         const manifest = JSON.parse(await zip.file('manifest.json').async('string'));
         const tenantModels = mongoose.modelNames()
             .map((n) => mongoose.model(n))
-            .filter((m) => m.schema.path('restaurant') && m.modelName !== 'IdempotencyRecord');
+            // Secret-bearing / operational collections are deliberately NOT exported
+            // (tenantExportController DENYLIST, 2026-11 strict-tenancy audit).
+            .filter((m) => m.schema.path('restaurant') && ![
+                'IdempotencyRecord', 'PasswordResetToken', 'Otp', 'RefreshSession',
+                'ApiKey', 'WebhookEndpoint', 'LoginAttempt', 'JobLock',
+            ].includes(m.modelName));
         expect(tenantModels.length).toBeGreaterThan(10);
         for (const m of tenantModels) {
             const key = m.collection.collectionName;

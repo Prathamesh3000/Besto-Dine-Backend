@@ -26,6 +26,8 @@ const {
 } = require('../utils/paymentChecks');
 const { claimPayment, releaseClaim } = require('../utils/paymentClaim');
 const { devError } = require('../utils/AppError');
+const { refOwned, refsOwned } = require('../utils/tenantRefs');
+const Package = require('../models/package');
 
 // CUS-073 — build an RFC-5545 .ics calendar invite for a booking. Times
 // are emitted in local-floating format (no Z) so the user's calendar app
@@ -379,6 +381,27 @@ const createAdvanceBooking = async (req, res) => {
         // [start, start + duration) windows overlap. If either start time
         // can't be determined we fall back to the safe whole-day block.
         const tf = tenantFilter(req);
+
+        // Every id stored as a reference must belong to this tenant (strict
+        // tenancy, 2026-11). Reject the whole request rather than store it.
+        {
+            const rid = tenantId(req);
+            const tableIds = Array.isArray(selectedTableIds) ? selectedTableIds : [];
+            if (selectedTableIds !== undefined && selectedTableIds !== null && !Array.isArray(selectedTableIds)) {
+                return res.status(400).json({ success: false, message: 'Invalid table selection' });
+            }
+            if (tableIds.length > 0 && !(await refsOwned(Table, tableIds, rid))) {
+                return res.status(400).json({ success: false, message: 'Invalid table selection' });
+            }
+            const pkgId = selectedPackage?._id || selectedPackage?.id;
+            if (pkgId && !(await refOwned(Package, pkgId, rid))) {
+                return res.status(400).json({ success: false, message: 'Invalid package' });
+            }
+            const areaRef = (selectedTypes && selectedTypes.length > 0) ? selectedTypes[0] : req.body.areaId;
+            if (areaRef && !(await refOwned(Area, areaRef, rid))) {
+                return res.status(400).json({ success: false, message: 'Invalid area' });
+            }
+        }
         const startHour = bookingStartHour(req.body.selectedStartTime, selectedTime);
         let durationHours = null;
         if (bookingType === 'hall') {

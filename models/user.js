@@ -208,9 +208,18 @@ const userSchema = new mongoose.Schema({
     // full superadmin. NEVER assignable through public registration.
     role: {
         type: String,
-        enum: ['customer', 'admin', 'manager', 'chef', 'waiter', 'captain', 'superadmin'],
+        enum: ['customer', 'admin', 'manager', 'chef', 'waiter', 'captain', 'superadmin', 'platformstaff'],
         default: 'customer'
     },
+    // 'platformstaff' = a delegated super-admin-portal user (PLATFORM_STAFF_PLAN.md).
+    // Deliberately NOT role 'superadmin': ~50 backend call sites treat that
+    // role as "may do anything", so a separate role is denied by default
+    // everywhere except the portal routes listed in config/platformModules.js.
+    // Not tied to a restaurant. Created only by a full super admin.
+    //   platformAccess = { <moduleKey>: 'view' | 'manage' }
+    platformAccess: { type: Object, default: undefined },
+    // Who created this platform-staff account (a full super admin).
+    createdByPlatform: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: undefined },
     // Super-admin sub-level. Only meaningful when role === 'superadmin'.
     //   'full'    — can manage restaurants, plans, billing, impersonation
     //   'support' — read-only impersonation + audit log; cannot mutate plans/billing
@@ -455,6 +464,12 @@ userSchema.set('toJSON', {
 userSchema.methods.comparePassword = async function (candidatePassword) {
     return bcrypt.compare(candidatePassword, this.password);
 };
+
+// Staff rows are tenant data, customers / superadmins have restaurant=null, so use
+// the nullable mode: inside a tenant context reads are limited to
+// restaurant in [tenant, null]. Auth / login lookups run with no tenant context
+// and are unaffected. See utils/tenantScopePlugin.js and docs/tenant-isolation.md.
+userSchema.plugin(require('../utils/tenantScopePlugin'), { allowNull: true });
 
 const User = mongoose.model('User', userSchema);
 

@@ -91,7 +91,7 @@ function stubGatewayRefund(id = `rfnd_${rid()}`) {
     return id;
 }
 
-const refund = (t, body, user = t.users.admin) => ctx.api.as(user).post('/razorpay/refund').send(body);
+const refund = (t, body, user = t.users.admin) => ctx.api.as(user).post('/razorpay/refund').send({ reason: 'test refund', ...body });
 const reload = (order) => Order.findById(order._id).lean();
 const walletOf = (t, user) => Wallet.findOne({ user: user._id, restaurant: t.restaurant._id }).lean();
 const refundRows = (order) => Transaction.find({ order: order._id, type: 'refund' }).lean();

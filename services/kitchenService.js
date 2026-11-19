@@ -265,7 +265,11 @@ async function getCompletedKitchenOrders(req) {
 async function reprintKOT(req) {
   const { id } = req.params;
 
-  const order = await Order.findOne({ _id: id, ...tenantFilter(req) })
+  const tfKot = tenantFilter(req);
+  const kotQuery = require('mongoose').isValidObjectId(id)
+    ? { $or: [{ _id: id }, { orderId: id }] }
+    : { orderId: id };
+  const order = await Order.findOne({ ...kotQuery, ...tfKot })
     .populate('table', 'name mergedWith status')
     .lean();
   if (!order) throw httpError(404, { success: false, message: 'Order not found' });

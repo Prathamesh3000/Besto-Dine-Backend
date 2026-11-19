@@ -3,6 +3,8 @@
  * sources, unique-closing / amend rules in the controller (models mocked).
  */
 jest.mock('../utils/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
+// Branch ownership is exercised in the strictTenant integration tests; here it is a pass-through.
+jest.mock('../utils/tenantRefs', () => ({ refOwned: jest.fn().mockResolvedValue(true) }));
 
 const { computeCash } = require('../utils/cashMath');
 
@@ -131,9 +133,9 @@ describe('cash closing controller', () => {
 
         test('closed day needs the admin role and a reason', async () => {
             CashClosing.findOne.mockResolvedValue(closedDoc());
-            await expect(call(ctrl.amend, req({ user: { _id: 'm', role: 'manager' }, params: { id: 'c1' }, body: { countedCash: 1200, reason: 'x' } })))
+            await expect(call(ctrl.amend, req({ user: { _id: 'm', role: 'manager' }, params: { id: '64b000000000000000000001' }, body: { countedCash: 1200, reason: 'x' } })))
                 .rejects.toMatchObject({ code: 'ADMIN_ONLY' });
-            await expect(call(ctrl.amend, req({ params: { id: 'c1' }, body: { countedCash: 1200 } })))
+            await expect(call(ctrl.amend, req({ params: { id: '64b000000000000000000001' }, body: { countedCash: 1200 } })))
                 .rejects.toMatchObject({ code: 'REASON_REQUIRED' });
             expect(CashClosing.findOneAndUpdate).not.toHaveBeenCalled();
         });
@@ -141,7 +143,7 @@ describe('cash closing controller', () => {
         test('admin amend recomputes variance and records the edit with its reason', async () => {
             CashClosing.findOne.mockResolvedValue(closedDoc());
             CashClosing.findOneAndUpdate.mockResolvedValue({ ok: true });
-            await call(ctrl.amend, req({ params: { id: 'c1' }, body: { countedCash: 1200, reason: 'Recounted drawer' } }));
+            await call(ctrl.amend, req({ params: { id: '64b000000000000000000001' }, body: { countedCash: 1200, reason: 'Recounted drawer' } }));
             const [filter, update] = CashClosing.findOneAndUpdate.mock.calls[0];
             expect(filter.status).toBe('closed');
             expect(update.$set.variance).toBe(0);

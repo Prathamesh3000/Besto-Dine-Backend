@@ -1,11 +1,13 @@
 /**
- * 14-day free trial module:
+ * 14-day free trial module (TRIAL_SIGNUP_AND_LEADS_PLAN.md §6 / §7):
  *   - instant start: self-signup logs the owner in at once (no approval wait)
  *   - abuse guard: Gmail dot/+tag email aliases and phone variants -> 409
- *   - trialExpirySweeper locks only expired unpaid trials, idempotently
- *   - locked tenant: TRIAL_EXPIRED on normal routes, owner keeps billing/me
+ *   - read-only window (trialEnd .. trialEnd + 3d): GET passes, writes answer
+ *     403 SUBSCRIPTION_READ_ONLY; billing / export (owner) and /auth stay open
+ *   - locked (after lockAt): 403 SUBSCRIPTION_BLOCKED; owner keeps billing / export
+ *   - trialExpirySweeper locks only after lockAt, idempotently and once
  *   - paying (applyPaidPlanUpgrade) lifts the lock with data intact
- *   - reminders at 7 / 3 / 1 days and on expiry, each sent once
+ *   - reminders t-3 / t-1 / t+0 / t+2: one claim per type, retried on failure
  */
 jest.mock('../../utils/email', () => ({
     sendEmail: jest.fn(async () => ({ sent: true, provider: 'test', dev: true })),
@@ -22,13 +24,16 @@ const SubscriptionPlan = require(path.join(BACKEND, 'models/subscriptionPlan'));
 const Notification = require(path.join(BACKEND, 'models/notification'));
 const { sendEmail } = require(path.join(BACKEND, 'utils/email'));
 const { runTrialExpirySweep } = require(path.join(BACKEND, 'utils/trialExpirySweeper'));
-const { runTrialReminders, sendExpiryNotice } = require(path.join(BACKEND, 'utils/trialReminderJob'));
+const { runTrialReminders } = require(path.join(BACKEND, 'utils/trialReminderJob'));
 const { applyPaidPlanUpgrade } = require(path.join(BACKEND, 'utils/planPaymentApply'));
-const { TRIAL_LOCK_REASON } = require(path.join(BACKEND, 'utils/trialLock'));
+const { TRIAL_LOCK_REASON, TRIAL_DAYS, TRIAL_READONLY_GRACE_DAYS } = require(path.join(BACKEND, 'utils/trialLock'));
 
 const ctx = useIntegrationApp();
 const PASSWORD = 'Signup#Pass1234';
+const STAFF_PASSWORD = 'Integration#Pass123';
 const DAY = 24 * 60 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
+const GRACE = TRIAL_READONLY_GRACE_DAYS * DAY;
 
 let gold;
 const uniq = () => Math.random().toString(16).slice(2, 8);
@@ -45,6 +50,8 @@ const signupBody = (extra = {}) => ({
     ...extra,
 });
 const signup = (body) => ctx.api.anon().post('/public/register-restaurant').send(body);
+const login = (user) => ctx.api.anon().post('/auth/login')
+    .send({ email: user.email, password: STAFF_PASSWORD, loginType: 'staff' });
 
 /** A seeded tenant turned into a trial ending `endsInMs` from `now`. */
 async function trialTenant(label, endsInMs, { now = new Date(), sub = {} } = {}) {
@@ -53,7 +60,7 @@ async function trialTenant(label, endsInMs, { now = new Date(), sub = {} } = {})
         $set: {
             status: 'trial',
             'subscription.status': 'trial',
-            'subscription.trialStartDate': new Date(now.getTime() - 14 * DAY + endsInMs),
+            'subscription.trialStartDate': new Date(now.getTime() - TRIAL_DAYS * DAY + endsInMs),
             'subscription.trialEndDate': new Date(now.getTime() + endsInMs),
             ...sub,
         },
@@ -61,8 +68,13 @@ async function trialTenant(label, endsInMs, { now = new Date(), sub = {} } = {})
     return t;
 }
 // Reminder runs see every trial tenant in the shared DB: look at one only.
-const mine = (run, t) => run.sent.filter((x) => x.id === String(t.restaurant._id));
+const mine = (list, t) => list.filter((x) => x.id === String(t.restaurant._id));
 const reload = (t) => Restaurant.findById(t.restaurant._id).lean();
+const reloadWithLead = (t) => Restaurant.findById(t.restaurant._id).select('+lead').lean();
+const mailsTo = (to) => sendEmail.mock.calls.filter(([m]) => m.to === to).map(([m]) => m);
+
+// A fixed clock inside the 09:00-18:00 Asia/Kolkata send window (11:00 IST).
+const SEND_HOUR = new Date('2026-11-17T05:30:00.000Z');
 
 beforeAll(async () => {
     gold = await SubscriptionPlan.create({
@@ -80,13 +92,16 @@ describe('instant start', () => {
         const res = await signup(body);
         expect(res.status).toBe(201);
         expect(res.body.data).toMatchObject({
-            signupStatus: 'approved', trialStarted: true, autoLogin: true, trialDays: 14, planName: 'Gold',
+            signupStatus: 'approved', trialStarted: true, autoLogin: true, trialDays: TRIAL_DAYS, planName: 'Gold',
         });
         expect(res.body.data.trialEndDate).toBeTruthy();
         expect(res.body.token).toBeTruthy();
         expect(res.body.refreshToken).toBeTruthy();
-        expect(res.body.tenant).toMatchObject({ status: 'trial', trialExpired: false, planSlug: 'gold' });
-        expect(res.body.tenant.daysLeft).toBe(14);
+        expect(res.body.tenant).toMatchObject({
+            status: 'trial', trialState: 'active', readOnly: false, trialExpired: false, planSlug: 'gold',
+        });
+        expect(res.body.tenant.daysLeft).toBe(TRIAL_DAYS);
+        expect(res.body.tenant.lockAt).toBeTruthy();
 
         const r = await Restaurant.findOne({ slug: res.body.data.restaurant.slug }).lean();
         expect(r).toMatchObject({ status: 'trial', signupStatus: 'approved', signupSource: 'self' });
@@ -96,10 +111,10 @@ describe('instant start', () => {
         // Token works immediately, and a normal login does too.
         const me = await ctx.api.as(res.body.token).get('/auth/me');
         expect(me.status).toBe(200);
-        expect(me.body.user.tenant).toMatchObject({ trialExpired: false, subscriptionStatus: 'trial' });
-        const login = await ctx.api.anon().post('/auth/login')
+        expect(me.body.user.tenant).toMatchObject({ trialState: 'active', trialExpired: false, subscriptionStatus: 'trial' });
+        const owner = await ctx.api.anon().post('/auth/login')
             .send({ email: body.contactEmail, password: PASSWORD, loginType: 'staff' });
-        expect(login.status).toBe(200);
+        expect(owner.status).toBe(200);
 
         await settle();
         const welcome = sendEmail.mock.calls.find(([m]) => m.to === body.contactEmail);
@@ -143,75 +158,158 @@ describe('abuse guard', () => {
 });
 
 describe('trialExpirySweeper', () => {
-    test('locks only expired unpaid trials, and is idempotent', async () => {
+    test('locks only trials past lockAt (end + grace) that never paid, and is idempotent', async () => {
         const now = new Date();
-        const expired = await trialTenant('exp', -2 * DAY, { now });
+        const pastLock = await trialTenant('exp', -(GRACE + HOUR), { now });
+        const readOnly = await trialTenant('ro', -2 * DAY, { now });               // ended, inside the grace
+        const justBeforeLock = await trialTenant('edge', -(GRACE - 60 * 1000), { now });
         const live = await trialTenant('live', 3 * DAY, { now });
-        const paid = await trialTenant('paid', -2 * DAY, { now, sub: { 'subscription.lastChargedAt': new Date(now.getTime() - DAY) } });
-        const activeSub = await trialTenant('actsub', -2 * DAY, { now, sub: { 'subscription.status': 'active' } });
+        const paid = await trialTenant('paid', -(GRACE + DAY), { now, sub: { 'subscription.lastChargedAt': new Date(now.getTime() - DAY) } });
+        const activeSub = await trialTenant('actsub', -(GRACE + DAY), { now, sub: { 'subscription.status': 'active' } });
         const plain = await seedTenant({ label: 'plain' }); // active, no trial
 
         const first = await runTrialExpirySweep({ now });
-        expect(first.locked).toEqual([String(expired.restaurant._id)]);
+        expect(first.locked).toEqual([String(pastLock.restaurant._id)]);
 
-        const r = await reload(expired);
+        const r = await reload(pastLock);
         expect(r).toMatchObject({ status: 'suspended', suspendedReason: TRIAL_LOCK_REASON });
         expect(r.subscription.status).toBe('expired');
         expect(r.subscription.trialExpiredAt).toBeTruthy();
-        for (const t of [live, paid, activeSub]) expect((await reload(t)).status).toBe('trial');
+        for (const t of [readOnly, justBeforeLock, live, paid, activeSub]) expect((await reload(t)).status).toBe('trial');
         expect((await reload(plain)).status).toBe('active');
 
         const second = await runTrialExpirySweep({ now });
         expect(second.locked).toEqual([]);
+
+        // Once the grace is over the read-only tenant is locked by the next sweep.
+        const later = new Date(now.getTime() + GRACE);
+        const third = await runTrialExpirySweep({ now: later });
+        expect(third.locked).toEqual(expect.arrayContaining([String(readOnly.restaurant._id), String(justBeforeLock.restaurant._id)]));
+        expect(third.locked).not.toContain(String(live.restaurant._id));
     });
 
     test('concurrent sweeps lock a tenant exactly once', async () => {
         const now = new Date();
-        const t = await trialTenant('race', -1 * DAY, { now });
+        const t = await trialTenant('race', -(GRACE + DAY), { now });
         const [a, b] = await Promise.all([runTrialExpirySweep({ now }), runTrialExpirySweep({ now })]);
         const all = [...a.locked, ...b.locked].filter((id) => id === String(t.restaurant._id));
         expect(all).toHaveLength(1);
     });
+
+    test('the sweeper sends no email of its own (the reminder job owns t+0 / t+2)', async () => {
+        const now = new Date();
+        const t = await trialTenant('quiet', -(GRACE + DAY), { now });
+        await runTrialExpirySweep({ now });
+        expect(mailsTo(t.restaurant.contactEmail)).toHaveLength(0);
+    });
 });
 
-describe('locked tenant', () => {
+describe('read-only window (trial ended, before lockAt)', () => {
     let t;
     beforeAll(async () => {
-        t = await trialTenant('lock', -1 * DAY);
+        t = await trialTenant('ro', -1 * DAY);
+    });
+
+    test('GET passes for the owner, staff and guests', async () => {
+        const admin = await ctx.api.as(t.users.admin).get('/orders/live');
+        expect(admin.status).not.toBe(403);
+        const waiter = await ctx.api.as(t.users.waiter).get('/orders/live');
+        expect(waiter.status).not.toBe(403);
+        const guest = await ctx.api.guest(t).get('/menu');
+        expect(guest.status).toBe(200);
+    });
+
+    test('POST / PUT / PATCH / DELETE answer 403 SUBSCRIPTION_READ_ONLY with lockAt + trialEndDate', async () => {
+        const r = await reload(t);
+        const expectedLockAt = new Date(new Date(r.subscription.trialEndDate).getTime() + GRACE).toISOString();
+        const calls = [
+            ctx.api.as(t.users.admin).post('/staff').send({ name: 'New Waiter', email: `nw.${uniq()}@staff.test`, role: 'waiter' }),
+            ctx.api.as(t.users.admin).put(`/menu/${t.restaurant._id}`).send({ name: 'x' }),
+            ctx.api.as(t.users.admin).patch(`/staff/${t.users.waiter._id}/status`).send({ status: 'inactive' }),
+            ctx.api.as(t.users.admin).delete(`/menu/${t.restaurant._id}`),
+            ctx.api.as(t.users.waiter).post('/orders').send({ items: [] }),
+            ctx.api.guest(t).post('/orders').send({ items: [] }),
+        ];
+        for (const res of await Promise.all(calls)) {
+            expect(res.status).toBe(403);
+            expect(res.body).toMatchObject({ success: false, code: 'SUBSCRIPTION_READ_ONLY' });
+            expect(res.body.lockAt).toBe(expectedLockAt);
+            expect(res.body.trialEndDate).toBe(new Date(r.subscription.trialEndDate).toISOString());
+        }
+        // Staff creation really was refused.
+        const list = await ctx.api.as(t.users.admin).get('/staff');
+        expect(JSON.stringify(list.body)).not.toMatch(/New Waiter/);
+    });
+
+    test('every role may still log in; the auth payload flags readOnly', async () => {
+        const waiter = await login(t.users.waiter);
+        expect(waiter.status).toBe(200);
+        expect(waiter.body.tenant).toMatchObject({ trialState: 'read_only', readOnly: true, trialExpired: false, daysLeft: 0 });
+        const owner = await login(t.users.admin);
+        expect(owner.status).toBe(200);
+        expect(owner.body.tenant.readOnly).toBe(true);
+        const me = await ctx.api.as(t.users.waiter).get('/auth/me');
+        expect(me.status).toBe(200);
+        expect(me.body.user.tenant).toMatchObject({ trialState: 'read_only', readOnly: true });
+        expect(me.body.user.tenant.lockAt).toBeTruthy();
+    });
+
+    test('owner billing (GET + POST) and export stay open; /auth writes pass for staff; staff billing does not', async () => {
+        expect((await ctx.api.as(t.users.admin).get('/tenant/billing/current')).status).toBe(200);
+        const upgrade = await ctx.api.as(t.users.admin).post('/tenant/billing/upgrade').send({ planSlug: 'gold' });
+        expect(upgrade.body.code).not.toBe('SUBSCRIPTION_READ_ONLY');
+        expect((await ctx.api.as(t.users.admin).get('/tenant/export')).status).not.toBe(403);
+        const logout = await ctx.api.as(t.users.waiter).post('/auth/logout').send({});
+        expect(logout.body.code).not.toBe('SUBSCRIPTION_READ_ONLY');
+        const staffBilling = await ctx.api.as(t.users.waiter).post('/tenant/billing/upgrade').send({ planSlug: 'gold' });
+        expect(staffBilling.status).toBe(403);
+        expect(staffBilling.body.code).toBe('SUBSCRIPTION_READ_ONLY');
+    });
+});
+
+describe('locked tenant (after lockAt)', () => {
+    let t;
+    beforeAll(async () => {
+        t = await trialTenant('lock', -(GRACE + DAY));
         await runTrialExpirySweep();
     });
 
-    test('normal routes answer 403 TRIAL_EXPIRED with trialEndDate', async () => {
+    test('normal routes answer 403 SUBSCRIPTION_BLOCKED with lockAt + trialEndDate', async () => {
         const res = await ctx.api.as(t.users.admin).get('/orders/live');
         expect(res.status).toBe(403);
-        expect(res.body).toMatchObject({ success: false, code: 'TRIAL_EXPIRED' });
+        expect(res.body).toMatchObject({ success: false, code: 'SUBSCRIPTION_BLOCKED' });
         expect(res.body.trialEndDate).toBeTruthy();
+        expect(res.body.lockAt).toBeTruthy();
+        expect(JSON.stringify(res.body)).not.toMatch(/TRIAL_EXPIRED/);
     });
 
     test('customer menu / staff apps are unavailable', async () => {
         const guest = await ctx.api.guest(t).get('/menu');
         expect(guest.status).toBe(403);
-        expect(guest.body.code).toBe('TRIAL_EXPIRED');
+        expect(guest.body.code).toBe('SUBSCRIPTION_BLOCKED');
         const waiter = await ctx.api.as(t.users.waiter).get('/orders/live');
         expect(waiter.status).toBe(403);
-        expect(waiter.body.code).toBe('TRIAL_EXPIRED');
+        expect(waiter.body.code).toBe('SUBSCRIPTION_BLOCKED');
+        const waiterBilling = await ctx.api.as(t.users.waiter).get('/tenant/billing/current');
+        expect(waiterBilling.status).toBe(403);
+        expect(waiterBilling.body.code).toBe('SUBSCRIPTION_BLOCKED');
     });
 
-    test('staff login is refused with TRIAL_EXPIRED; the owner can log in', async () => {
-        const staff = await ctx.api.anon().post('/auth/login')
-            .send({ email: t.users.waiter.email, password: 'Integration#Pass123', loginType: 'staff' });
+    test('staff login is refused with SUBSCRIPTION_BLOCKED; the owner can log in', async () => {
+        const staff = await login(t.users.waiter);
         expect(staff.status).toBe(403);
-        expect(staff.body.code).toBe('TRIAL_EXPIRED');
-        const owner = await ctx.api.anon().post('/auth/login')
-            .send({ email: t.users.admin.email, password: 'Integration#Pass123', loginType: 'staff' });
+        expect(staff.body.code).toBe('SUBSCRIPTION_BLOCKED');
+        const owner = await login(t.users.admin);
         expect(owner.status).toBe(200);
-        expect(owner.body.tenant).toMatchObject({ trialExpired: true, subscriptionStatus: 'expired', daysLeft: 0 });
+        expect(owner.body.tenant).toMatchObject({
+            trialState: 'locked', trialExpired: true, readOnly: false, subscriptionStatus: 'expired', daysLeft: 0,
+        });
     });
 
     test('owner still reaches /auth/me, billing and export', async () => {
         const me = await ctx.api.as(t.users.admin).get('/auth/me');
         expect(me.status).toBe(200);
-        expect(me.body.user.tenant).toMatchObject({ trialExpired: true, daysLeft: 0 });
+        expect(me.body.user.tenant).toMatchObject({ trialState: 'locked', trialExpired: true, daysLeft: 0 });
         expect(me.body.user.tenant.trialStartDate).toBeTruthy();
         expect(me.body.user.tenant.trialEndDate).toBeTruthy();
 
@@ -221,7 +319,7 @@ describe('locked tenant', () => {
         expect(exp.status).not.toBe(403);
     });
 
-    test('paying restores full access with data intact', async () => {
+    test('paying restores full access (writable at once) with data intact', async () => {
         await Restaurant.updateOne({ _id: t.restaurant._id }, {
             $set: {
                 'subscription.pendingUpgrade': {
@@ -240,70 +338,165 @@ describe('locked tenant', () => {
         expect(r.suspendedReason).toBe('');
         expect(r.subscription.trialExpiredAt).toBeFalsy();
 
+        // The Gold snapshot above carries only { dineIn } so module gates may
+        // still answer 403 of their own; only the trial codes must be gone.
+        const TRIAL_CODES = ['SUBSCRIPTION_BLOCKED', 'SUBSCRIPTION_READ_ONLY', 'TRIAL_EXPIRED'];
         const res = await ctx.api.as(t.users.admin).get('/orders/live');
         expect(res.status).not.toBe(403);
         const waiter = await ctx.api.as(t.users.waiter).get('/orders/live');
-        expect(waiter.body.code).not.toBe('TRIAL_EXPIRED');
+        expect(TRIAL_CODES).not.toContain(waiter.body.code);
+        expect((await login(t.users.waiter)).status).toBe(200);
+        const me = await ctx.api.as(t.users.admin).get('/auth/me');
+        expect(me.body.user.tenant).toMatchObject({ trialState: 'none', trialExpired: false, readOnly: false });
+        // A real write goes through again (this one deactivates the waiter, so it runs last).
+        const write = await ctx.api.as(t.users.admin).patch(`/staff/${t.users.waiter._id}/status`).send({ status: 'inactive' });
+        expect(write.status).toBe(200);
     });
 });
 
-describe('request-time backstop', () => {
-    test('a trial past its end date is locked even before the sweeper runs', async () => {
-        const t = await trialTenant('back', -1 * DAY);
-        const res = await ctx.api.as(t.users.admin).get('/orders/live');
+describe('request-time backstop (no sweeper)', () => {
+    test('a trial inside the grace is read-only, one past lockAt is blocked, before any sweep', async () => {
+        const ro = await trialTenant('back-ro', -1 * HOUR);
+        expect((await ctx.api.as(ro.users.admin).get('/orders/live')).status).not.toBe(403);
+        const w = await ctx.api.as(ro.users.admin).post('/staff').send({ name: 'x', email: `x.${uniq()}@staff.test`, role: 'waiter' });
+        expect(w.body.code).toBe('SUBSCRIPTION_READ_ONLY');
+
+        const locked = await trialTenant('back-lock', -(GRACE + HOUR));
+        const res = await ctx.api.as(locked.users.admin).get('/orders/live');
         expect(res.status).toBe(403);
-        expect(res.body.code).toBe('TRIAL_EXPIRED');
-        expect((await ctx.api.as(t.users.admin).get('/tenant/billing/current')).status).toBe(200);
+        expect(res.body.code).toBe('SUBSCRIPTION_BLOCKED');
+        expect((await ctx.api.as(locked.users.admin).get('/tenant/billing/current')).status).toBe(200);
+        expect((await reload(locked)).status).toBe('trial'); // the sweeper has not run
     });
 });
 
 describe('reminders', () => {
-    test('7 / 3 / 1 day reminders each go out once', async () => {
-        const now = new Date();
-        const t = await trialTenant('rem', 6.5 * DAY, { now });
+    test('t-3 / t-1 / t+0 / t+2 each go out once; a second run sends nothing', async () => {
+        const now = SEND_HOUR;
+        // Ends 2 days + 1 hour from now (13:00 IST), so every run below at 11:00 IST sits inside one window.
+        const t = await trialTenant('rem', 2 * DAY + HOUR, { now });
         const to = t.restaurant.contactEmail;
-        const sentTo = () => sendEmail.mock.calls.filter(([m]) => m.to === to).map(([m]) => m.subject);
+        const at = (ms) => new Date(now.getTime() + ms);
 
-        let run = await runTrialReminders({ now });
-        expect(mine(run, t)).toEqual([{ id: String(t.restaurant._id), days: 7 }]);
-        expect(sentTo()).toHaveLength(1);
-        expect(sentTo()[0]).toMatch(/ends in 7 days/);
+        let run = await runTrialReminders({ now, dryRun: false });
+        expect(mine(run.sent, t)).toEqual([{ id: String(t.restaurant._id), type: 't-3' }]);
+        expect(mailsTo(to)).toHaveLength(1);
+        expect(mailsTo(to)[0].subject).toMatch(/ends in 3 days/);
+        expect(mailsTo(to)[0].html).toMatch(/Upgrade now/);
+        expect(mailsTo(to)[0].text).toMatch(/This is an account notice for your BestoDine trial/);
 
-        run = await runTrialReminders({ now });
-        expect(mine(run, t)).toEqual([]);
-        expect(sentTo()).toHaveLength(1);
+        run = await runTrialReminders({ now, dryRun: false });
+        expect(mine(run.sent, t)).toEqual([]);
+        expect(mailsTo(to)).toHaveLength(1);
 
-        run = await runTrialReminders({ now: new Date(now.getTime() + 4 * DAY) }); // 2.5 days left
-        expect(mine(run, t).map((s) => s.days)).toEqual([3]);
-        run = await runTrialReminders({ now: new Date(now.getTime() + 6 * DAY) }); // 0.5 days left
-        expect(mine(run, t).map((s) => s.days)).toEqual([1]);
-        expect(mine(await runTrialReminders({ now: new Date(now.getTime() + 6 * DAY) }), t)).toEqual([]);
+        run = await runTrialReminders({ now: at(2 * DAY), dryRun: false }); // 1h before the end
+        expect(mine(run.sent, t).map((s) => s.type)).toEqual(['t-1']);
+        expect(mailsTo(to)[1].subject).toMatch(/ends tomorrow/);
 
-        expect((await reload(t)).subscription.trialRemindersSent.sort()).toEqual([1, 3, 7]);
-        expect(await Notification.countDocuments({ restaurant: t.restaurant._id, title: /free trial ends/ }, { skipTenantScope: true })).toBe(3);
+        run = await runTrialReminders({ now: at(3 * DAY), dryRun: false }); // ended, read-only
+        expect(mine(run.sent, t).map((s) => s.type)).toEqual(['t+0']);
+        expect(mailsTo(to)[2].subject).toMatch(/has ended/);
+        expect(mailsTo(to)[2].text).toMatch(/locks completely on/);
+
+        run = await runTrialReminders({ now: at(5 * DAY), dryRun: false }); // last read-only day (lockAt is 1h later)
+        expect(mine(run.sent, t).map((s) => s.type)).toEqual(['t+2']);
+        expect(mailsTo(to)[3].subject).toMatch(/Last day/);
+        expect(mine((await runTrialReminders({ now: at(5 * DAY), dryRun: false })).sent, t)).toEqual([]);
+
+        const r = await reloadWithLead(t);
+        expect(r.subscription.trialReminders.map((x) => x.type).sort()).toEqual(['t+0', 't+2', 't-1', 't-3'].sort());
+        for (const row of r.subscription.trialReminders) expect(row.sentAt).toBeTruthy();
+        expect(r.subscription.trialRemindersSent || []).toEqual([]);  // legacy field untouched
+        expect(await Notification.countDocuments({ restaurant: t.restaurant._id, category: 'System', recipientRole: 'admin' })).toBe(4);
+        // System notes on the lead, without touching stage / lastContactedAt.
+        const notes = r.lead.notes.filter((n) => n.kind === 'system').map((n) => n.text);
+        expect(notes).toEqual([
+            'Auto email: trial ends in 3 days',
+            'Auto email: trial ends tomorrow',
+            expect.stringMatching(/^Auto email: trial ended, locks on /),
+            'Auto email: last day before lock',
+        ]);
+        expect(r.lead.stage).toBe('new');
+        expect(r.lead.lastContactedAt).toBeNull();
     });
 
-    test('only the nearest threshold is sent when several were missed', async () => {
-        const now = new Date();
-        const t = await trialTenant('rem2', 0.5 * DAY, { now });
-        const run = await runTrialReminders({ now });
-        expect(mine(run, t)).toEqual([{ id: String(t.restaurant._id), days: 1 }]);
-        expect(mine(await runTrialReminders({ now }), t)).toEqual([]);
+    test('only the latest missed type is sent', async () => {
+        const now = SEND_HOUR;
+        const t = await trialTenant('rem2', 12 * HOUR, { now }); // t-3 and t-1 both already triggered
+        const run = await runTrialReminders({ now, dryRun: false });
+        expect(mine(run.sent, t)).toEqual([{ id: String(t.restaurant._id), type: 't-1' }]);
+        expect(mine((await runTrialReminders({ now, dryRun: false })).sent, t)).toEqual([]);
     });
 
-    test('the expiry notice is sent once, by the sweeper hook', async () => {
-        const t = await trialTenant('rem3', -1 * DAY);
-        const doc = await reload(t);
-        expect(await sendExpiryNotice(doc)).toBe(true);
-        expect(await sendExpiryNotice(doc)).toBe(false);
-        const mails = sendEmail.mock.calls.filter(([m]) => m.to === t.restaurant.contactEmail);
-        expect(mails).toHaveLength(1);
-        expect(mails[0][0].subject).toMatch(/has ended/);
+    test('a converted (paid) tenant and a locked tenant get nothing', async () => {
+        const now = SEND_HOUR;
+        const paid = await trialTenant('rem4', 2 * DAY, { now, sub: { 'subscription.lastChargedAt': now } });
+        const active = await trialTenant('rem5', 2 * DAY, { now, sub: { 'subscription.status': 'active' } });
+        const locked = await trialTenant('rem6', -(GRACE + HOUR), { now });
+        const run = await runTrialReminders({ now, dryRun: false });
+        for (const t of [paid, active, locked]) {
+            expect(mine(run.sent, t)).toEqual([]);
+            expect(mailsTo(t.restaurant.contactEmail)).toHaveLength(0);
+        }
     });
 
-    test('paid or already-locked tenants get no countdown reminders', async () => {
-        const now = new Date();
-        const t = await trialTenant('rem4', 2 * DAY, { now, sub: { 'subscription.lastChargedAt': now } });
-        expect(mine(await runTrialReminders({ now }), t)).toEqual([]);
+    test('a failed send releases the claim and is retried on the next run', async () => {
+        const now = SEND_HOUR;
+        const t = await trialTenant('rem7', 2 * DAY, { now });
+        const to = t.restaurant.contactEmail;
+        sendEmail.mockImplementationOnce(async () => ({ sent: false, provider: 'smtp', dev: false, error: 'boom' }));
+
+        let run = await runTrialReminders({ now, dryRun: false });
+        expect(mine(run.sent, t)).toEqual([]);
+        expect(mine(run.failed, t)).toEqual([{ id: String(t.restaurant._id), type: 't-3', error: 'boom' }]);
+        expect((await reload(t)).subscription.trialReminders).toEqual([]);
+        expect(await Notification.countDocuments({ restaurant: t.restaurant._id, category: 'System' })).toBe(0);
+
+        run = await runTrialReminders({ now: new Date(now.getTime() + HOUR), dryRun: false });
+        expect(mine(run.sent, t)).toEqual([{ id: String(t.restaurant._id), type: 't-3' }]);
+        expect(mailsTo(to)).toHaveLength(2); // the failed attempt + the retry
+        const r = await reload(t);
+        expect(r.subscription.trialReminders).toHaveLength(1);
+        expect(r.subscription.trialReminders[0]).toMatchObject({ type: 't-3' });
+        expect(r.subscription.trialReminders[0].sentAt).toBeTruthy();
+    });
+
+    test('concurrent runs claim each reminder once', async () => {
+        const now = SEND_HOUR;
+        const t = await trialTenant('rem8', 2 * DAY, { now });
+        const [a, b] = await Promise.all([runTrialReminders({ now, dryRun: false }), runTrialReminders({ now, dryRun: false })]);
+        expect([...mine(a.sent, t), ...mine(b.sent, t)]).toHaveLength(1);
+        expect(mailsTo(t.restaurant.contactEmail)).toHaveLength(1);
+    });
+
+    test('outside the 09:00-18:00 send window nothing is sent', async () => {
+        const now = new Date('2026-11-17T15:30:00.000Z'); // 21:00 IST
+        const t = await trialTenant('rem9', 2 * DAY, { now });
+        const run = await runTrialReminders({ now, dryRun: false });
+        expect(mine(run.sent, t)).toEqual([]);
+        expect(mailsTo(t.restaurant.contactEmail)).toHaveLength(0);
+        // Same tenant, next morning: due.
+        const morning = new Date('2026-11-18T04:30:00.000Z'); // 10:00 IST
+        expect(mine((await runTrialReminders({ now: morning, dryRun: false })).sent, t).map((s) => s.type)).toEqual(['t-3']);
+    });
+
+    test('dry run reports who would be emailed and records nothing', async () => {
+        const now = SEND_HOUR;
+        const t = await trialTenant('rem10', 2 * DAY, { now });
+        const run = await runTrialReminders({ now, dryRun: true });
+        expect(mine(run.dryRun, t)).toEqual([{ id: String(t.restaurant._id), type: 't-3' }]);
+        expect(mine(run.sent, t)).toEqual([]);
+        expect(mailsTo(t.restaurant.contactEmail)).toHaveLength(0);
+        expect((await reload(t)).subscription.trialReminders).toEqual([]);
+    });
+
+    test('a tenant that pays after a reminder gets no further reminder', async () => {
+        const now = SEND_HOUR;
+        const t = await trialTenant('rem11', 2 * DAY + HOUR, { now });
+        expect(mine((await runTrialReminders({ now, dryRun: false })).sent, t).map((s) => s.type)).toEqual(['t-3']);
+        await Restaurant.updateOne({ _id: t.restaurant._id }, { $set: { 'subscription.lastChargedAt': now } });
+        const later = await runTrialReminders({ now: new Date(now.getTime() + 2 * DAY), dryRun: false });
+        expect(mine(later.sent, t)).toEqual([]);
+        expect(mailsTo(t.restaurant.contactEmail)).toHaveLength(1);
     });
 });

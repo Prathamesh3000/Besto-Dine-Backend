@@ -159,9 +159,12 @@ async function accountLedger(restaurantId, code, { from, to, branchClause = {}, 
         ]);
         if (o) opening = naturalBalance(account.type, o.debit, o.credit);
     }
+    const cap = Math.min(Number(limit) || 1000, 5000);
     const entries = await LedgerEntry.find({
         restaurant: restaurantId, account: code, ...dateMatch(from, to), ...branchClause,
-    }).sort({ businessDate: 1, postedAt: 1, _id: 1 }).limit(Math.min(Number(limit) || 1000, 5000)).lean();
+    }).sort({ businessDate: 1, postedAt: 1, _id: 1 }).limit(cap + 1).lean();
+    const truncated = entries.length > cap;
+    if (truncated) entries.length = cap;
     let running = opening;
     const rows = entries.map((e) => {
         running = round2(running + naturalBalance(account.type, e.debit, e.credit));
@@ -170,7 +173,20 @@ async function accountLedger(restaurantId, code, { from, to, branchClause = {}, 
             narration: e.narration, ref: e.ref, branch: e.branch, balance: running,
         };
     });
-    return { account: { code: account.code, name: account.name, type: account.type }, openingBalance: opening, closingBalance: running, entries: rows };
+    // closingBalance is the true balance at the end of the range even when
+    // `limit` cut the rows: it is opening + every row in the range.
+    let closing = running;
+    if (truncated) {
+        const [all] = await LedgerEntry.aggregate([
+            { $match: { restaurant: oid(restaurantId), account: code, ...dateMatch(from, to), ...branchClause } },
+            { $group: { _id: null, debit: { $sum: '$debit' }, credit: { $sum: '$credit' } } },
+        ]);
+        if (all) closing = round2(opening + naturalBalance(account.type, all.debit, all.credit));
+    }
+    return {
+        account: { code: account.code, name: account.name, type: account.type },
+        openingBalance: opening, closingBalance: closing, truncated, entries: rows,
+    };
 }
 
 /** Simple P&L from the ledger: income - purchases/COGS - other expenses. */

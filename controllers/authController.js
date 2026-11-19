@@ -12,7 +12,7 @@ const logger = require('../utils/logger');
 const loginAttempts = require('../utils/loginAttempts');
 const { clearAuthCookie, signAccessToken } = require('../middlewares/authMiddleware');
 const cookieAuth = require('../utils/cookieAuth');
-const { isTrialLocked, trialInfo, trialExpiredBody } = require('../utils/trialLock');
+const { trialState, trialInfo, blockedBody } = require('../utils/trialLock');
 
 // Roles whose shift status should follow their auth session. Every
 // tenant-side staff role — admin, manager, waiter, captain, chef —
@@ -106,11 +106,13 @@ function customerIdleMs() {
     return envNumber('CUSTOMER_IDLE_TIMEOUT_MINUTES', 60) * 60 * 1000;
 }
 
-const isCustomerRole = (role) => role !== 'superadmin' && !STAFF_SESSION_ROLES.has(role);
+// Portal accounts: super admins and delegated platform staff (PLATFORM_STAFF_PLAN.md).
+const PLATFORM_ROLES = new Set(['superadmin', 'platformstaff']);
+const isCustomerRole = (role) => !PLATFORM_ROLES.has(role) && !STAFF_SESSION_ROLES.has(role);
 
 function refreshTtlMs(role) {
     const hours = (envKey, dflt) => envNumber(envKey, dflt) * 60 * 60 * 1000;
-    if (role === 'superadmin') return hours('REFRESH_TTL_HOURS_SUPERADMIN', 12);
+    if (PLATFORM_ROLES.has(role)) return hours('REFRESH_TTL_HOURS_SUPERADMIN', 12);
     if (STAFF_SESSION_ROLES.has(role)) return hours('REFRESH_TTL_HOURS_STAFF', 7 * 24);
     return customerIdleMs();
 }
@@ -140,7 +142,7 @@ function refreshAbsoluteMs(role) {
         const n = Number(process.env[envKey]);
         return (Number.isFinite(n) && n > 0 ? n : dflt) * 60 * 60 * 1000;
     };
-    if (role === 'superadmin') return hours('SESSION_MAX_HOURS_SUPERADMIN', 8);
+    if (PLATFORM_ROLES.has(role)) return hours('SESSION_MAX_HOURS_SUPERADMIN', 8);
     if (STAFF_SESSION_ROLES.has(role)) return hours('SESSION_MAX_HOURS_STAFF', 12);
     // Customer: signed out 1 hour after sign-in (SESSION_MAX_HOURS_CUSTOMER
     // overrides; fractions allowed, e.g. 0.5).
@@ -353,6 +355,8 @@ const buildUserPayload = (user) => ({
     isTenantOwner: user.isTenantOwner === true,
     // SaaS fields — empty / null for legacy users, populated for tenants and platform staff
     superadminLevel: user.superadminLevel || '',
+    // Delegated portal users: which super-admin modules they may open.
+    ...(user.role === 'platformstaff' ? { platformAccess: user.platformAccess || {} } : {}),
     restaurant: user.restaurant || null,
     // Phase 6 — branch assignment for Sub Admins / branch-pinned staff.
     // Populated to { _id, name, slug } by buildAuthResponse below.
@@ -405,12 +409,15 @@ const assertTenantNotLocked = async (user) => {
     // — not "contact support". Only applies while the signup itself is
     // unresolved; an approved tenant suspended later falls through to the
     // generic TENANT_SUSPENDED below.
-    // Free trial ended unpaid: the owner (admin) may still sign in to reach
-    // billing and data export (the lock itself is enforced per request in
-    // attachTenant); every other role is told why.
-    if (isTrialLocked(restaurant)) {
+    // Free trial lifecycle (utils/trialLock, plan §6). Read-only window:
+    // every role may sign in (writes are refused per request in
+    // attachTenant). Locked: the owner (admin) may still sign in to reach
+    // billing and data export; every other role gets SUBSCRIPTION_BLOCKED.
+    const trial = trialState(restaurant);
+    if (trial.state === 'read_only') return null;
+    if (trial.state === 'locked') {
         if (user.role === 'admin') return null;
-        return { status: 403, body: trialExpiredBody(restaurant) };
+        return { status: 403, body: blockedBody(restaurant) };
     }
 
     if (restaurant.status === 'suspended' || restaurant.status === 'cancelled') {
@@ -522,8 +529,9 @@ const buildAuthResponse = async (user, { branchId: selectedBranch = null } = {})
             planSlug: r.subscription?.planSlug || '',
             subscriptionStatus: r.subscription?.status || '',
             trialEndDate: r.subscription?.trialEndDate || null,
-            // trialStartDate / trialExpired / daysLeft (utils/trialLock) for
-            // the trial banner and the lock screen.
+            // trialStartDate / trialState / lockAt / readOnly / trialExpired /
+            // daysLeft (utils/trialLock) for the trial banner, the upgrade
+            // modal and the lock screen.
             ...trialInfo(r),
             // Fully-resolved module map (plan snapshot + paid add-ons +
             // legacy fallbacks) so the UI applies exactly the backend's
@@ -654,7 +662,7 @@ exports.register = async (req, res) => {
 // so they are included in STAFF_ROLES for the role-separation guard below.
 // Routing the user to the right portal happens on the frontend based on
 // the returned `role` field.
-const STAFF_ROLES = ['waiter', 'captain', 'chef', 'manager', 'admin', 'superadmin'];
+const STAFF_ROLES = ['waiter', 'captain', 'chef', 'manager', 'admin', 'superadmin', 'platformstaff'];
 
 exports.login = async (req, res) => {
     try {
@@ -715,7 +723,7 @@ exports.login = async (req, res) => {
             //   3. ANY staff with this email — only allowed when no tenant
             //      slug was provided AND there's exactly one match (we
             //      reject ambiguous matches with a clear error).
-            user = await User.findOne({ email: cleanEmail, role: 'superadmin' }).select('+password');
+            user = await User.findOne({ email: cleanEmail, role: { $in: ['superadmin', 'platformstaff'] } }).select('+password');
 
             if (!user && activeRestaurant) {
                 user = await User.findOne({
@@ -867,7 +875,7 @@ exports.login = async (req, res) => {
         // the unified staff-login form because the form has no dedicated
         // "Super Admin" button — the post-login redirect routes them to
         // the correct portal based on their actual role.
-        const isSuperAdmin = user.role === 'superadmin';
+        const isSuperAdmin = PLATFORM_ROLES.has(user.role);
         if (
             (loginType === 'customer' && user.role !== 'customer') ||
             (loginType === 'staff' && !STAFF_ROLES.includes(user.role)) ||
@@ -902,6 +910,14 @@ exports.login = async (req, res) => {
         }
 
         const session = await issueSession(req, res, user);
+
+        // Delegated portal users: every sign-in is visible to the owner.
+        if (user.role === 'platformstaff') {
+            await require('../utils/audit').recordAudit(
+                { user, ip: req.ip, headers: req.headers },
+                { action: 'platformstaff.login', targetType: 'platform' },
+            );
+        }
 
         // Every staff role's shift mirrors the auth session: opens a
         // Shift record so the Staff Dashboard's "On Duty" light turns

@@ -169,10 +169,12 @@ function resolveTenantSync(branchArg, payload) {
         if (cached) return cached;
         return undefined; // branch is authoritative → look it up
     }
-    const hint = payloadTenantHint(payload);
-    if (hint) return hint;
+    // The authenticated request tenant outranks anything in the payload (a payload
+    // is often built from user input); the payload hint is only a fallback.
     const fromReq = tenantFromRequestContext();
     if (fromReq) return fromReq;
+    const hint = payloadTenantHint(payload);
+    if (hint) return hint;
     if (payload && payload.orderId) {
         const c = _orderTenant.get(String(payload.orderId));
         if (c) return c;

@@ -7,6 +7,8 @@ const {
     getRestaurantBySlug,
     getRestaurantBranches,
     registerRestaurant,
+    startTrial,
+    createRegisterOrder,
     submitLead,
     getSiteConfig,
     slugAvailability,
@@ -90,8 +92,74 @@ const registerRules = validate([
         body(`utm.${k}`).optional({ values: 'null' }).isString().withMessage(`utm.${k} must be text`),
         body(`utm_${k}`).optional({ values: 'null' }).isString().withMessage(`utm_${k} must be text`),
     ]),
+    // Paid-plan signup (plan §5): cycle + the Razorpay checkout result.
+    optStr('billingCycle', 20),
+    body('payment').optional({ values: 'null' })
+        .custom((v) => typeof v === 'object' && !Array.isArray(v)).withMessage('payment must be an object'),
+    optStr('payment.razorpayOrderId', 64),
+    optStr('payment.razorpayPaymentId', 64),
+    optStr('payment.razorpaySignature', 256),
 ]);
 router.post('/register-restaurant', signupLimiter, registerRules, registerRestaurant);
+
+// Razorpay order for the payment step of a PAID plan signup. Nothing is
+// created on our side, but each call creates an order at Razorpay, so it is
+// capped per IP. Looser than signupLimiter: the page re-creates the order
+// every time the owner toggles the billing cycle.
+const registerOrderLimiter = makeLimiter({ name: 'public-register-order',
+    windowMs: 60 * 60 * 1000,   // 1 hour
+    max: Math.max(1, Number(process.env.SIGNUP_ORDER_LIMIT_PER_HOUR) || 20),
+    skipFailedRequests: true,
+    message: {
+        success: false,
+        code: 'RATE_LIMITED',
+        message: 'Too many payment attempts from this network. Please try again in an hour.',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+router.post('/register-order', registerOrderLimiter, validate([
+    optStr('planId', 64),
+    optStr('billingCycle', 20),
+]), createRegisterOrder);
+
+// Free-trial signup (TRIAL_SIGNUP_AND_LEADS_PLAN.md §4). Separate from
+// /register-restaurant on purpose — see the handler comment: one short
+// form, the server picks plan + length, own limiter and dedupe messages,
+// registrationSource 'self_service_trial'. Successful calls only count:
+// a typo'd email must not lock the owner out of their final valid submit.
+const startTrialLimiter = makeLimiter({ name: 'public-start-trial',
+    windowMs: 60 * 60 * 1000,   // 1 hour
+    max: Math.max(1, Number(process.env.TRIAL_START_LIMIT_PER_HOUR) || 5),
+    skipFailedRequests: true,
+    message: {
+        success: false,
+        code: 'RATE_LIMITED',
+        message: 'Too many trial signups from this network. Please try again in an hour.',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+// Type checks only — the controller owns required-ness and the business
+// rules (field-level codes: WEAK_PASSWORD, EMAIL_IN_USE, PHONE_IN_USE,
+// TRIAL_UNAVAILABLE). Aliases of the register form are accepted.
+const startTrialRules = validate([
+    optStr('orgName'), optStr('restaurantName'),
+    optStr('adminName'), optStr('ownerName'),
+    optStr('email'), optStr('contactEmail'),
+    ...['phone', 'contactPhone'].map((f) => body(f).optional({ values: 'null' })
+        .custom((v) => typeof v === 'string' || typeof v === 'number').withMessage(`${f} must be text`)),
+    optStr('adminPassword', 128), optStr('password', 128),
+    optStr('city', 80),
+    body('source').optional({ values: 'null' }).isString().withMessage('source must be text'),
+    body('utm').optional({ values: 'null' })
+        .custom((v) => typeof v === 'object' && !Array.isArray(v)).withMessage('utm must be an object'),
+    ...['source', 'medium', 'campaign', 'term', 'content'].flatMap((k) => [
+        body(`utm.${k}`).optional({ values: 'null' }).isString().withMessage(`utm.${k} must be text`),
+        body(`utm_${k}`).optional({ values: 'null' }).isString().withMessage(`utm_${k} must be text`),
+    ]),
+]);
+router.post('/start-trial', startTrialLimiter, startTrialRules, startTrial);
 
 // Live "is this page URL free?" check for the signup form. Cheap read,
 // but capped so it can't be used to enumerate tenants at speed.

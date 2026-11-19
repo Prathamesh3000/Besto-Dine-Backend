@@ -3,7 +3,7 @@
 // tenant billing. Required-field / business messages stay in the controllers;
 // these only reject wrong types, malformed ids and absurd ranges. Unknown
 // extra keys are never rejected.
-const { validate, objectIdParam, optionalObjectId } = require('../middlewares/validate');
+const { validate, body, objectIdParam, optionalObjectId } = require('../middlewares/validate');
 const {
     optionalAmount, optionalText, optionalEnum, optionalDate, optionalStringArray,
     lines, ruleOid, ruleNum,
@@ -11,20 +11,52 @@ const {
 
 const MAX_MONEY = 10000000; // 1 crore — far above any single legitimate amount
 
+/**
+ * Strict plain-decimal amount parser shared by the wallet endpoints.
+ * Accepts a finite number or a plain decimal string ("12", "12.5", " 12.50 ").
+ * Rejects booleans, arrays, objects, hex ("0x10"), exponent ("1e3"), signs and
+ * empty strings by returning null. Does NOT range-check.
+ */
+function parseStrictAmount(v) {
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    if (typeof v === 'string' && /^\d+(\.\d+)?$/.test(v.trim())) {
+        const n = Number(v.trim());
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
+}
+
+/** Optional amount: absent/null passes; otherwise a strict decimal in [0.01, max]. */
+const strictOptionalAmount = (field, { max = MAX_MONEY, label } = {}) =>
+    body(field)
+        .optional({ values: 'null' })
+        .custom((v) => {
+            const n = parseStrictAmount(v);
+            return n !== null && n >= 0.01 && n <= max;
+        })
+        .withMessage(`${label || field} must be a number between 0.01 and ${max}`);
+
+// Optional trimmed text: must be a string whose TRIMMED length is <= max.
+const trimmedText = (field, max, label) =>
+    body(field)
+        .optional({ values: 'null' })
+        .custom((v) => typeof v === 'string' && v.trim().length <= max)
+        .withMessage(`${label} must be text of at most ${max} characters`);
+
 // ── Staff wallet ────────────────────────────────────────────────────────
 const staffWalletWithdraw = validate([
-    optionalAmount('amount', { gt: 0, max: MAX_MONEY, label: 'Amount' }),
+    strictOptionalAmount('amount', { label: 'Amount' }),
     optionalEnum('method', ['Cash', 'UPI', 'Bank'], { label: 'Method' }),
     optionalText('upiId', 100, { label: 'UPI ID' }),
     optionalText('bankName', 100, { label: 'Bank name' }),
     optionalText('accountHolder', 100, { label: 'Account holder' }),
-    optionalText('accountNumber', 40, { label: 'Account number' }),
+    optionalText('accountNumber', 30, { label: 'Account number' }),
     optionalText('ifsc', 20, { label: 'IFSC' }),
     optionalText('note', 500, { label: 'Note' }),
 ]);
 const staffWalletApprove = validate([
     objectIdParam('id'),
-    optionalText('txnRef', 100, { label: 'Transaction reference' }),
+    trimmedText('txnRef', 100, 'Transaction reference'),
 ]);
 const staffWalletReject = validate([
     objectIdParam('id'),
@@ -114,6 +146,7 @@ const billingDowngradeRequest = validate([
 const billingIdOnly = validate([objectIdParam('id')]);
 
 module.exports = {
+    parseStrictAmount,
     staffWalletWithdraw, staffWalletApprove, staffWalletReject,
     tipSettle,
     purchaseCreate, purchaseUpdate, purchaseReceive, purchasePayment, purchaseIdOnly,

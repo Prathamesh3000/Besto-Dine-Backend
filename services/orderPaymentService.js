@@ -36,8 +36,11 @@ async function recordPaidOrderLedger(req, order, tf, prevOrder = null) {
   // M6: Read loyalty config from Settings instead of hardcoding (per-tenant)
   const settings = await getSettings(req);
   const loyalty = resolveLoyaltySettings(settings);
-  const earnedPoints = (loyalty.enableLoyalty && order.total >= loyalty.minBillToEarn)
-    ? Math.floor(order.total * loyalty.pointsPerRupee)
+  // Points are earned on what the customer actually owed (after a manual
+  // discount), not the pre-discount total.
+  const netTotal = Math.max(0, (Number(order.total) || 0) - Math.max(0, Number(order.manualDiscount) || 0));
+  const earnedPoints = (loyalty.enableLoyalty && netTotal >= loyalty.minBillToEarn)
+    ? Math.floor(netTotal * loyalty.pointsPerRupee)
     : 0;
 
   // Atomic wallet points award using $inc (prevents race conditions)
@@ -45,7 +48,9 @@ async function recordPaidOrderLedger(req, order, tf, prevOrder = null) {
   const walletFilter = { user: order.user, ...tf };
   let wallet = await Wallet.findOneAndUpdate(
     walletFilter,
-    { $inc: { loyaltyPoints: earnedPoints }, $setOnInsert: { balance: 0, restaurant: tenant } },
+    earnedPoints > 0
+      ? { $inc: { loyaltyPoints: earnedPoints }, $setOnInsert: { balance: 0, restaurant: tenant } }
+      : { $setOnInsert: { balance: 0, loyaltyPoints: 0, restaurant: tenant } },
     { upsert: true, returnDocument: 'after' }
   );
 
@@ -57,26 +62,32 @@ async function recordPaidOrderLedger(req, order, tf, prevOrder = null) {
     && prevOrder.paymentStatus !== 'Paid'
     ? Math.max(0, Number(prevOrder.amountPaid) || 0)
     : 0;
-  const collected = Math.max(0, Math.round(((Number(order.total) || 0) - priorWalletPaid) * 100) / 100);
+  // The ledger books the money collected at settlement: the bill after any
+  // manual discount, less what a wallet part-payment already ledgered.
+  const collected = Math.max(0, Math.round((netTotal - priorWalletPaid) * 100) / 100);
+  const LEDGER_METHODS = ['upi', 'card', 'wallet', 'cash', 'mixed', 'other'];
+  const rawMethod = String(order.paymentMethod || 'cash').toLowerCase();
+  const ledgerMethod = LEDGER_METHODS.includes(rawMethod) ? rawMethod : (/upi/.test(rawMethod) ? 'upi' : 'other');
 
   // Record Points Transaction + Payment Transaction in parallel
   // NOTE: Balance was already deducted in walletController.payWithWallet() via atomic operation.
   // Do NOT deduct again here to avoid double-charging the customer.
   await Promise.all([
-    new Transaction({
+    // No zero-point ledger rows: a row exists only when points were earned.
+    earnedPoints > 0 ? new Transaction({
       user: order.user, order: order._id, type: 'points_earned',
       restaurant: tenant,
       branch: order.branch || null,
       amount: earnedPoints, paymentMethod: 'points', transactionId: idGen.transactionId(),
       description: `Earned from Order ${order.orderId}`,
       balanceBefore: pointsBefore, balanceAfter: wallet.loyaltyPoints
-    }).save(),
+    }).save() : null,
     new Transaction({
       user: order.user, order: order._id, type: 'order_payment',
       restaurant: tenant,
       branch: order.branch || null,
       amount: isWalletPayment ? -collected : collected,
-      paymentMethod: order.paymentMethod?.toLowerCase() || 'cash', transactionId: idGen.transactionId(),
+      paymentMethod: ledgerMethod, transactionId: idGen.transactionId(),
       description: `Payment for Order ${order.orderId}`,
       balanceBefore: balanceBefore, balanceAfter: wallet.balance
     }).save()
@@ -150,7 +161,9 @@ async function requestCounterPayment(req) {
   // Stamp the requested method so the table drawer's "Mark Paid"
   // button defaults to cash. Customer can still pick a different
   // method at the counter — admin overrides on settle.
-  order.paymentMethod = 'cash';
+  // A part-paid order keeps its method (money was already taken by wallet /
+  // online); overwriting it with 'cash' would hide that.
+  if (order.paymentStatus !== 'Partially Paid') order.paymentMethod = 'cash';
   await order.save();
 
   // Bill-consistency: the customer bill, admin drawer, and waiter settle
@@ -224,15 +237,20 @@ async function applyCouponToOrder(req) {
   const { id } = req.params;
   const { code } = req.body || {};
 
-  const order = await Order.findOne({ _id: id, ...tenantFilter(req) });
+  const tfCoupon = tenantFilter(req);
+  let order = mongoose.Types.ObjectId.isValid(id)
+    ? await Order.findOne({ _id: id, ...tfCoupon })
+    : null;
+  if (!order) order = await Order.findOne({ orderId: id, ...tfCoupon });
   if (!order) {
     throw httpError(404, { success: false, message: 'Order not found' });
   }
-  if (order.paymentStatus === 'Paid' || order.status === 'cancelled') {
+  if (order.paymentStatus === 'Paid' || order.paymentStatus === 'Partially Paid'
+    || order.paymentStatus === 'Refunded' || order.status === 'cancelled') {
     throw httpError(400, {
       success: false,
       code: 'ORDER_LOCKED',
-      message: 'Cannot modify coupon on a paid or cancelled order',
+      message: 'Cannot modify coupon on a paid, part-paid or cancelled order',
     });
   }
   // A finalised bill (Save Bill, D4) is locked until a captain reopens it.
@@ -258,10 +276,16 @@ async function applyCouponToOrder(req) {
   // Empty / null code → clear the coupon on the order.
   const trimmed = typeof code === 'string' ? code.trim() : '';
   if (!trimmed) {
+    const hadCoupon = !!order.couponCode && Number(order.couponDiscount) > 0;
+    const prevForRelease = hadCoupon ? order.toObject() : null;
     applyCouponBill(0);
     order.couponCode = '';
     order.couponDiscount = 0;
     await order.save();
+    if (prevForRelease) {
+      try { await require('./orderCancelReversal').releaseCouponUse(prevForRelease); }
+      catch (err) { logger.warn(`Coupon release failed for ${order.orderId}: ${err.message}`); }
+    }
     emitOrderEvent(
       'order:updated',
       { orderId: order.orderId, couponCode: '', couponDiscount: 0, gst: order.gst, total: order.total },
@@ -340,10 +364,51 @@ async function applyCouponToOrder(req) {
   }
   const finalDiscount = Math.min(discount, subtotal);
 
+  // Consume one use of the coupon, atomically respecting usageLimit (two
+  // staff applying the last use at once: one wins, the other gets a 400).
+  // Re-applying the code the order already holds consumes nothing; swapping
+  // to a different coupon releases the old one's use.
+  const prevCode = order.couponCode;
+  const prevForRelease = prevCode && Number(order.couponDiscount) > 0 ? order.toObject() : null;
+  const sameCoupon = !!prevCode && String(prevCode).toUpperCase() === String(coupon.code).toUpperCase();
+  if (!sameCoupon) {
+    const consumed = await Coupon.findOneAndUpdate(
+      {
+        _id: coupon._id,
+        ...tenantFilter(req),
+        isActive: true,
+        $or: [{ usageLimit: { $lte: 0 } }, { usageLimit: null }, { usageLimit: { $exists: false } }, { $expr: { $lt: ['$usageCount', '$usageLimit'] } }],
+      },
+      { $inc: { usageCount: 1 } },
+      { returnDocument: 'after' },
+    );
+    if (!consumed) {
+      throw httpError(400, { success: false, message: 'Coupon usage limit has been reached' });
+    }
+    // The previous coupon's use goes back BEFORE the new redemption row is
+    // written (release deletes the order's redemption row).
+    if (prevForRelease) {
+      try { await require('./orderCancelReversal').releaseCouponUse(prevForRelease); }
+      catch (err) { logger.warn(`Coupon release failed for ${order.orderId}: ${err.message}`); }
+    }
+    try {
+      await require('../models/couponRedemption').create({
+        coupon: coupon._id, couponCode: coupon.code, couponTitle: coupon.title,
+        user: order.user || null, order: order._id, restaurant: order.restaurant, branch: coupon.branch || null,
+        orderValue: subtotal, discountAmount: finalDiscount, discountType: coupon.discountType, discountValue: coupon.discountValue,
+      });
+    } catch (err) { logger.warn(`Coupon redemption row failed for ${order.orderId}: ${err.message}`); }
+  }
+
   applyCouponBill(finalDiscount);
   order.couponCode = coupon.code;
   order.couponDiscount = finalDiscount;
-  await order.save();
+  try {
+    await order.save();
+  } catch (err) {
+    if (!sameCoupon) await Coupon.updateOne({ _id: coupon._id, ...tenantFilter(req), usageCount: { $gt: 0 } }, { $inc: { usageCount: -1 } }).catch(() => {});
+    throw err;
+  }
 
   emitOrderEvent(
     'order:updated',
@@ -457,8 +522,16 @@ async function customerPayment(req) {
     throw httpError(400, { success: false, message: 'Order is already paid' });
   }
 
+  if (order.status === 'cancelled') {
+    throw httpError(400, { success: false, code: 'ORDER_CANCELLED', message: 'This order is cancelled.' });
+  }
+  if (order.paymentStatus === 'Refunded') {
+    throw httpError(400, { success: false, message: 'Order is already settled' });
+  }
+
   const updateData = {};
-  if (intentMethod) updateData.paymentMethod = intentMethod;
+  // A part-paid order keeps its method: money already moved (wallet / online).
+  if (intentMethod && order.paymentStatus !== 'Partially Paid') updateData.paymentMethod = intentMethod;
   const updatedOrder = Object.keys(updateData).length
     ? await Order.findOneAndUpdate({ _id: order._id, ...tf }, updateData, { returnDocument: 'after' })
     : order;
@@ -492,11 +565,9 @@ async function finalizeCustomerPaidOrder(req, updatedOrder, tf) {
   if (!updatedOrder.user) return;
 
   const settings = await getSettings(req);
-  const walletEnabled = settings?.wallet?.enableLoyalty !== false;
-  const minBill = settings?.wallet?.minBillToEarn || 100;
-  const pointsPerRupee = settings?.wallet?.pointsPerRupee || 1;
-  const earnedPoints = (walletEnabled && updatedOrder.total >= minBill)
-    ? Math.floor(updatedOrder.total * pointsPerRupee)
+  const loyalty = resolveLoyaltySettings(settings);
+  const earnedPoints = (loyalty.enableLoyalty && updatedOrder.total >= loyalty.minBillToEarn)
+    ? Math.floor(updatedOrder.total * loyalty.pointsPerRupee)
     : 0;
 
   if (earnedPoints > 0) {

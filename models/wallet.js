@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { skipScope } = require('../utils/tenantScopePlugin');
 
 const walletSchema = new mongoose.Schema({
     // Tenant link — added by Phase 1 SaaS migration. Required for all
@@ -46,6 +47,25 @@ walletSchema.pre('save', function () {
   }
 });
 
+// Guard against overdraw through update operators: schema `min` only runs on
+// save(). Any negative $inc on balance / loyaltyPoints gets an extra filter
+// condition so it only matches when the stored value can absorb it (a no-match
+// behaves like the existing call-site $gte guards: null / nModified 0).
+// Pipeline updates (the rounding follow-up below) are left alone.
+const guardNegativeInc = function () {
+  const update = typeof this.getUpdate === 'function' ? this.getUpdate() : null;
+  if (!update || Array.isArray(update) || !update.$inc) return;
+  for (const field of ['balance', 'loyaltyPoints']) {
+    const v = update.$inc[field];
+    if (typeof v === 'number' && v < 0) {
+      this.and([{ [field]: { $gte: -v - 1e-6 } }]);
+    }
+  }
+};
+walletSchema.pre('findOneAndUpdate', guardNegativeInc);
+walletSchema.pre('updateOne', guardNegativeInc);
+walletSchema.pre('updateMany', guardNegativeInc);
+
 // Round after findOneAndUpdate ($inc can cause floating point drift).
 //
 // The rounding is done IN the database with a pipeline update that rounds
@@ -73,11 +93,13 @@ walletSchema.post('findOneAndUpdate', async function (doc) {
   // update decide (it is a no-op match when nothing drifted).
   if (isAfterDoc && !drift) return;
 
-  await this.model.updateOne(
+  // AUDIT-EXEMPT: follow-up on the exact wallet _id this hook just received from the
+  // originating update; it must run whatever context the update ran in (tenant, job, system).
+  await skipScope(this.model.updateOne(
     { _id: doc._id, $expr: { $or: [offPaiseExpr('balance'), offPaiseExpr('loyaltyPoints')] } },
     [{ $set: { balance: round2Expr('balance'), loyaltyPoints: round2Expr('loyaltyPoints') } }],
-    { session: opts.session || null, skipTenantScope: true, updatePipeline: true }
-  );
+    { session: opts.session || null, updatePipeline: true }
+  ));
 
   if (isAfterDoc) {
     // Reflect the rounding in the returned doc without marking it dirty,

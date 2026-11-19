@@ -57,6 +57,8 @@ function accountKey({ user, email, restaurantId } = {}) {
     const e = normEmail(email || user?.email);
     const role = user?.role;
     if (role === 'superadmin') return `superadmin:${e}`;
+    // Delegated portal users: global (no tenant) and, unlike super admins, lockable.
+    if (role === 'platformstaff') return `platformstaff:${e}`;
     if (role === 'customer' || (!role && !restaurantId && !user?.restaurant)) return `customer:${e}`;
     const rid = restaurantId || user?.restaurant;
     return `${String(rid)}:${e}`;

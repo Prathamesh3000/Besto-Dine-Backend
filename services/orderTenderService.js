@@ -23,6 +23,9 @@ function resolveTenderedBody(oldOrder, body, { userId = null, role = null, sibli
   }
   const parsed = parseCounterTenders(body.payments);
   if (parsed.error) throw httpError(400, { success: false, ...parsed.error });
+  if (oldOrder.status === 'cancelled') {
+    throw httpError(409, { success: false, code: 'ORDER_CANCELLED', message: 'This order is cancelled and cannot be paid.' });
+  }
   if (oldOrder.paymentStatus === 'Paid' || oldOrder.paymentStatus === 'Refunded') {
     throw httpError(400, { success: false, code: 'ALREADY_PAID', message: 'This order is already settled.' });
   }
@@ -31,8 +34,10 @@ function resolveTenderedBody(oldOrder, body, { userId = null, role = null, sibli
     throw httpError(400, { success: false, code: 'INVALID_PAYMENT_STATUS', message: "With payments, paymentStatus must be 'Paid' or 'Partially Paid'." });
   }
 
+  // Same cap as applyPaymentFields: a discount never exceeds the bill.
   const effDiscount = body.manualDiscount !== undefined && Number.isFinite(Number(body.manualDiscount))
-    ? Math.max(0, Number(body.manualDiscount)) : Math.max(0, Number(oldOrder.manualDiscount) || 0);
+    ? Math.min(Math.max(0, Number(body.manualDiscount)), Math.max(0, Number(oldOrder.total) || 0))
+    : Math.max(0, Number(oldOrder.manualDiscount) || 0);
   const alreadyPaid = Math.max(0, Number(oldOrder.amountPaid) || 0);
   const due = round2(Math.max(0, (Number(oldOrder.total) || 0) - effDiscount - alreadyPaid));
   const oldTip = Math.max(0, Number(oldOrder.tipAmount) || 0);
