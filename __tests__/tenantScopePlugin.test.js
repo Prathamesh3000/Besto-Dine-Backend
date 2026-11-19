@@ -80,19 +80,22 @@ describe('scopeFilter (pure)', () => {
         expect(String(res.filter.restaurant)).toBe(String(T1));
     });
 
-    test('never overrides an explicit restaurant (even another tenant)', () => {
-        expect(scopeFilter({ restaurant: T2 }, T1)).toEqual({ action: 'explicit', filter: { restaurant: T2 } });
-        expect(scopeFilter({ restaurant: { $in: [T1, T2] } }, T1).action).toBe('explicit');
-        expect(scopeFilter({ restaurant: null }, T1).action).toBe('explicit');
+    test('an explicit restaurant equal to the tenant is left alone; anything else gets the tenant ANDed on top', () => {
+        expect(scopeFilter({ restaurant: T1 }, T1)).toEqual({ action: 'explicit', filter: { restaurant: T1 } });
+        expect(scopeFilter({ restaurant: T2 }, T1)).toEqual({ action: 'inject', filter: { $and: [{ restaurant: T2 }, { restaurant: T1 }] } });
+        expect(scopeFilter({ restaurant: { $in: [T1, T2] } }, T1).action).toBe('inject');
+        expect(scopeFilter({ restaurant: null }, T1).action).toBe('inject');
     });
 
     test('restaurant: undefined counts as missing', () => {
         expect(scopeFilter({ restaurant: undefined, a: 1 }, T1).action).toBe('inject');
     });
 
-    test('recognises restaurant inside $and / every $or branch', () => {
+    test('recognises a scalar restaurant inside $and; $or branches never count', () => {
         expect(hasTenantCondition({ $and: [{ a: 1 }, { restaurant: T1 }] })).toBe(true);
-        expect(hasTenantCondition({ $or: [{ restaurant: T1 }, { restaurant: T2 }] })).toBe(true);
+        expect(hasTenantCondition({ $and: [{ a: 1 }, { restaurant: T1 }] }, T1)).toBe(true);
+        expect(hasTenantCondition({ $and: [{ restaurant: T2 }] }, T1)).toBe(false);
+        expect(hasTenantCondition({ $or: [{ restaurant: T1 }, { restaurant: T2 }] })).toBe(false);
         expect(hasTenantCondition({ $or: [{ restaurant: T1 }, { a: 1 }] })).toBe(false);
     });
 
@@ -124,9 +127,12 @@ describe('scopePipeline (pure)', () => {
         expect(res.pipeline[1]).toEqual({ $match: { restaurant: T1 } });
     });
 
-    test('explicit restaurant in any top-level $match → untouched', () => {
-        const p = [{ $match: { restaurant: T2 } }];
+    test('leading $match already pinned to the tenant is untouched; another tenant is ANDed', () => {
+        const p = [{ $match: { restaurant: T1 } }];
         expect(scopePipeline(p, T1)).toEqual({ action: 'explicit', pipeline: p });
+        const q = scopePipeline([{ $match: { restaurant: T2 } }], T1);
+        expect(q.action).toBe('inject');
+        expect(q.pipeline[0]).toEqual({ $match: { $and: [{ restaurant: T2 }, { restaurant: T1 }] } });
     });
 
     test('$collStats-style first stage → unscopable', () => {
@@ -177,24 +183,38 @@ describe('tenantScopePlugin on Mongoose queries', () => {
         expect(logger.warn).not.toHaveBeenCalled();
     });
 
-    test('explicit OTHER tenant is kept but logged as a mismatch', async () => {
+    test('explicit OTHER tenant is confined to the context tenant and logged as a mismatch', async () => {
         await inTenant(T1, async () => {
             const [q] = await runQueryPre(Scoped.find({ restaurant: T2 }));
-            expect(q.getFilter()).toEqual({ restaurant: T2 });
+            expect(q.getFilter()).toEqual({ restaurant: T2, $and: [{ restaurant: T1 }] });
         });
         expect(logger.warn).toHaveBeenCalledWith('tenantScope.explicit-mismatch', expect.any(Object));
     });
 
-    test('skipTenantScope opt-out (options arg and setOptions) and is stripped', async () => {
+    test('skipScope() opts a query out; the legacy skipTenantScope option is stripped and NOT trusted in a tenant context', async () => {
         await inTenant(T1, async () => {
-            const [q1] = await runQueryPre(Scoped.findOne({ name: 'x' }, null, { skipTenantScope: true }));
+            const [q1] = await runQueryPre(plugin.skipScope(Scoped.findOne({ name: 'x' })));
             expect(q1.getFilter()).toEqual({ name: 'x' });
-            expect(q1.getOptions().skipTenantScope).toBeUndefined();
 
-            const [q2] = await runQueryPre(Scoped.find({ name: 'x' }).setOptions({ skipTenantScope: true }));
-            expect(q2.getFilter()).toEqual({ name: 'x' });
+            const [q2] = await runQueryPre(Scoped.findOne({ name: 'x' }, null, { skipTenantScope: true }));
+            expect(q2.getFilter()).toEqual({ name: 'x', restaurant: T1 });
+            expect(q2.getOptions().skipTenantScope).toBeUndefined();
+
+            const [q3] = await runQueryPre(Scoped.find({ name: 'x' }).setOptions({ skipTenantScope: true }));
+            expect(q3.getFilter()).toEqual({ name: 'x', restaurant: T1 });
         });
-        expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    test('NODE_ENV=production ignores TENANT_SCOPE_PLUGIN=off', async () => {
+        const prev = process.env.NODE_ENV;
+        process.env.NODE_ENV = 'production';
+        process.env.TENANT_SCOPE_PLUGIN = 'off';
+        try {
+            await inTenant(T1, async () => {
+                const [q] = await runQueryPre(Scoped.find({ status: 'prod' }));
+                expect(q.getFilter()).toEqual({ status: 'prod', restaurant: T1 });
+            });
+        } finally { process.env.NODE_ENV = prev; }
     });
 
     test('context without a tenant (superadmin / exempt path) → no-op', async () => {
@@ -256,14 +276,17 @@ describe('tenantScopePlugin on aggregate()', () => {
         });
     });
 
-    test('no-op outside context and with skipTenantScope', async () => {
+    test('no-op outside context and with skipScope(); the legacy option is stripped but not trusted', async () => {
         const [a1] = await runAggregatePre(Scoped, Scoped.aggregate([{ $match: { status: 'x' } }]));
         expect(a1.pipeline()[0]).toEqual({ $match: { status: 'x' } });
         await inTenant(T1, async () => {
             const [a2] = await runAggregatePre(Scoped,
-                Scoped.aggregate([{ $match: { status: 'x' } }]).option({ skipTenantScope: true }));
+                plugin.skipScope(Scoped.aggregate([{ $match: { status: 'x' } }])));
             expect(a2.pipeline()[0]).toEqual({ $match: { status: 'x' } });
-            expect(a2.options.skipTenantScope).toBeUndefined();
+            const [a3] = await runAggregatePre(Scoped,
+                Scoped.aggregate([{ $match: { status: 'x' } }]).option({ skipTenantScope: true }));
+            expect(a3.pipeline()[0]).toEqual({ $match: { status: 'x', restaurant: T1 } });
+            expect(a3.options.skipTenantScope).toBeUndefined();
         });
     });
 });

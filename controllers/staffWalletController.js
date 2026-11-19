@@ -7,6 +7,7 @@ const User = require('../models/user');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { notify } = require('../services/notificationService');
 const EVENTS = require('../realtime/events');
+const { parseStrictAmount } = require('../validators/money');
 
 // Roles that are allowed to own a staff wallet. Chefs / admins do not
 // receive customer tips so they don't need one — keeping the eligible
@@ -16,6 +17,10 @@ const WALLET_ROLES = new Set(['waiter', 'captain']);
 
 // Smallest withdrawal the model accepts (StaffWithdrawal.amount min).
 const MIN_WITHDRAWAL = 1;
+// StaffWithdrawal.accountNumber maxlength - validator and model must agree.
+const ACCOUNT_NUMBER_MAX = 30;
+// StaffWalletTransaction.note maxlength.
+const LEDGER_NOTE_MAX = 300;
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -109,9 +114,12 @@ exports.getMyWallet = async (req, res) => {
                 .lean(),
         ]);
 
-        const pendingWithdrawalAmount = withdrawals
-            .filter((w) => w.status === 'pending')
-            .reduce((s, w) => s + w.amount, 0);
+        // Sum ALL pending withdrawals, not just the latest 20 shown in the list.
+        const pendingAgg = await StaffWithdrawal.aggregate([
+            { $match: { user: userId, status: 'pending', ...tenantFilter(req) } },
+            { $group: { _id: null, total: { $sum: '$amount' } } },
+        ]);
+        const pendingWithdrawalAmount = round2(pendingAgg[0]?.total || 0);
 
         res.status(200).json({
             success: true,
@@ -134,106 +142,128 @@ exports.getMyWallet = async (req, res) => {
 
 // ─── Waiter-facing: POST /staff-wallet/withdraw ───────────────────────────
 exports.requestWithdrawal = async (req, res) => {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    // Early client errors are answered before any session is opened.
+    const bad = (status, message) => res.status(status).json({ success: false, message });
+    if (!WALLET_ROLES.has(req.user?.role)) {
+        return bad(403, 'Withdrawals are only allowed for waiter / captain.');
+    }
+
+    const { amount, method, upiId, bankName, accountHolder, accountNumber, ifsc, note } = req.body || {};
+    const parsed = parseStrictAmount(amount);
+    const numericAmount = parsed === null ? NaN : Math.round(parsed * 100) / 100;
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+        return bad(400, 'Amount must be a positive number.');
+    }
+    if (numericAmount < MIN_WITHDRAWAL) {
+        return bad(400, `Minimum withdrawal is ₹${MIN_WITHDRAWAL}.`);
+    }
+    if (!['Cash', 'UPI', 'Bank'].includes(method)) {
+        return bad(400, "Method must be 'Cash', 'UPI' or 'Bank'.");
+    }
+
+    // Per-method validation. UPI must look UPI-like (loose check —
+    // exhaustive validation is the bank's job at payout time, not
+    // ours). Bank requires the basic three fields the admin will
+    // need to make the actual transfer.
+    if (method === 'UPI') {
+        if (!upiId || typeof upiId !== 'string' || !/^[\w.\-]{2,}@[\w]{2,}$/.test(upiId.trim())) {
+            return bad(400, 'Please enter a valid UPI ID (eg. name@upi).');
+        }
+    }
+    if (method === 'Bank') {
+        if (!accountNumber || !ifsc || !accountHolder) {
+            return bad(400, 'Bank withdrawals need account holder, account number and IFSC.');
+        }
+        // Must agree with StaffWithdrawal.accountNumber maxlength (30) so the
+        // save can never fail after the balance has been reserved.
+        if (String(accountNumber).trim().length > ACCOUNT_NUMBER_MAX) {
+            return bad(400, `Account number is too long (max ${ACCOUNT_NUMBER_MAX} characters).`);
+        }
+    }
+
+    const userId = req.user._id;
+    const restaurantId = tenantId(req);
+
+    // Wallet row is created outside the money transaction (tolerating a
+    // concurrent first-time create) so the transaction below only contends
+    // on balance writes, which withTransaction retries.
     try {
-        if (!WALLET_ROLES.has(req.user?.role)) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(403).json({ success: false, message: 'Withdrawals are only allowed for waiter / captain.' });
+        await getOrCreateWallet({ userId, restaurantId });
+    } catch (err) {
+        if (!err || err.code !== 11000) {
+            logger.error('requestWithdrawal error:', { error: err && err.message });
+            return bad(500, 'Failed to request withdrawal.');
         }
+    }
 
-        const { amount, method, upiId, bankName, accountHolder, accountNumber, ifsc, note } = req.body || {};
-        const numericAmount = Math.round(Number(amount) * 100) / 100;
-        if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(400).json({ success: false, message: 'Amount must be a positive number.' });
-        }
-        if (numericAmount < MIN_WITHDRAWAL) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(400).json({ success: false, message: `Minimum withdrawal is ₹${MIN_WITHDRAWAL}.` });
-        }
-        if (!['Cash', 'UPI', 'Bank'].includes(method)) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(400).json({ success: false, message: "Method must be 'Cash', 'UPI' or 'Bank'." });
-        }
-
-        // Per-method validation. UPI must look UPI-like (loose check —
-        // exhaustive validation is the bank's job at payout time, not
-        // ours). Bank requires the basic three fields the admin will
-        // need to make the actual transfer.
-        if (method === 'UPI') {
-            if (!upiId || typeof upiId !== 'string' || !/^[\w.\-]{2,}@[\w]{2,}$/.test(upiId.trim())) {
-                await session.abortTransaction();
-                session.endSession();
-                return res.status(400).json({ success: false, message: 'Please enter a valid UPI ID (eg. name@upi).' });
+    const reply = (status, body) => { const e = new Error('requestWithdrawal reply'); e.reply = { status, body }; return e; };
+    let withdrawal = null;
+    let finalBalance = null;
+    const session = await mongoose.startSession();
+    try {
+        // withTransaction retries the callback on WriteConflict /
+        // TransientTransactionError, so parallel requests serialise and each
+        // sees the up-to-date balance: they succeed while funds last and the
+        // rest get a clean 400.
+        await session.withTransaction(async () => {
+            withdrawal = null;
+            const wallet = await StaffWallet.findOne({ user: userId, restaurant: restaurantId }).session(session);
+            if (!wallet) throw reply(404, { success: false, message: 'Wallet not found.' });
+            if (wallet.status !== 'active') {
+                throw reply(403, { success: false, message: 'Your wallet is currently frozen. Please contact admin.' });
             }
-        }
-        if (method === 'Bank') {
-            if (!accountNumber || !ifsc || !accountHolder) {
-                await session.abortTransaction();
-                session.endSession();
-                return res.status(400).json({ success: false, message: 'Bank withdrawals need account holder, account number and IFSC.' });
+            if (numericAmount > wallet.balance) {
+                throw reply(400, { success: false, message: `Insufficient balance. Available: ₹${wallet.balance.toFixed(2)}` });
             }
-        }
 
-        const userId = req.user._id;
-        const restaurantId = tenantId(req);
-        const wallet = await getOrCreateWallet({ userId, restaurantId, session });
+            // Reserve the amount immediately so two rapid taps can't double-
+            // spend the same balance. Reject path refunds; pay path is a no-op
+            // (the debit is already real).
+            wallet.balance = Math.round((wallet.balance - numericAmount) * 100) / 100;
+            wallet.lifetimeDebits = Math.round((wallet.lifetimeDebits + numericAmount) * 100) / 100;
+            await wallet.save({ session });
 
-        if (wallet.status !== 'active') {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(403).json({ success: false, message: 'Your wallet is currently frozen. Please contact admin.' });
-        }
-        if (numericAmount > wallet.balance) {
-            await session.abortTransaction();
-            session.endSession();
-            return res.status(400).json({ success: false, message: `Insufficient balance. Available: ₹${wallet.balance.toFixed(2)}` });
-        }
+            const w = new StaffWithdrawal({
+                restaurant: restaurantId,
+                user: userId,
+                wallet: wallet._id,
+                amount: numericAmount,
+                method,
+                upiId: method === 'UPI' ? String(upiId).trim() : undefined,
+                bankName: method === 'Bank' ? String(bankName || '').trim() : undefined,
+                accountHolder: method === 'Bank' ? String(accountHolder).trim() : undefined,
+                accountNumber: method === 'Bank' ? String(accountNumber).trim() : undefined,
+                ifsc: method === 'Bank' ? String(ifsc).trim().toUpperCase() : undefined,
+                note: note ? String(note).trim().slice(0, 300) : undefined,
+                status: 'pending',
+            });
+            await w.save({ session });
 
-        // Reserve the amount immediately so two rapid taps can't double-
-        // spend the same balance. Reject path refunds; pay path is a no-op
-        // (the debit is already real).
-        wallet.balance = Math.round((wallet.balance - numericAmount) * 100) / 100;
-        wallet.lifetimeDebits = Math.round((wallet.lifetimeDebits + numericAmount) * 100) / 100;
-        await wallet.save({ session });
+            await new StaffWalletTransaction({
+                restaurant: restaurantId,
+                wallet: wallet._id,
+                user: userId,
+                type: 'withdrawal-debit',
+                direction: 'debit',
+                amount: numericAmount,
+                balanceAfter: wallet.balance,
+                referenceKind: 'StaffWithdrawal',
+                referenceId: w._id,
+                note: `Withdrawal requested via ${method}`,
+            }).save({ session });
 
-        const withdrawal = new StaffWithdrawal({
-            restaurant: restaurantId,
-            user: userId,
-            wallet: wallet._id,
-            amount: numericAmount,
-            method,
-            upiId: method === 'UPI' ? String(upiId).trim() : undefined,
-            bankName: method === 'Bank' ? String(bankName || '').trim() : undefined,
-            accountHolder: method === 'Bank' ? String(accountHolder).trim() : undefined,
-            accountNumber: method === 'Bank' ? String(accountNumber).trim() : undefined,
-            ifsc: method === 'Bank' ? String(ifsc).trim().toUpperCase() : undefined,
-            note: note ? String(note).trim().slice(0, 300) : undefined,
-            status: 'pending',
+            withdrawal = w;
+            finalBalance = wallet.balance;
         });
-        await withdrawal.save({ session });
-
-        await new StaffWalletTransaction({
-            restaurant: restaurantId,
-            wallet: wallet._id,
-            user: userId,
-            type: 'withdrawal-debit',
-            direction: 'debit',
-            amount: numericAmount,
-            balanceAfter: wallet.balance,
-            referenceKind: 'StaffWithdrawal',
-            referenceId: withdrawal._id,
-            note: `Withdrawal requested via ${method}`,
-        }).save({ session });
-
-        await session.commitTransaction();
+    } catch (err) {
+        if (err && err.reply) return res.status(err.reply.status).json(err.reply.body);
+        logger.error('requestWithdrawal error:', { error: err && err.message });
+        return bad(500, 'Failed to request withdrawal.');
+    } finally {
         session.endSession();
+    }
 
+    try {
         // Notify admins so they can act on it. We persist the
         // Notification AND fire a socket so dashboards open right now
         // see it instantly. Sent after the commit (notify never throws),
@@ -267,12 +297,10 @@ exports.requestWithdrawal = async (req, res) => {
         res.status(201).json({
             success: true,
             withdrawal: populated,
-            wallet: { balance: wallet.balance },
+            wallet: { balance: finalBalance },
         });
     } catch (err) {
-        try { await session.abortTransaction(); } catch { /* already aborted */ }
-        session.endSession();
-        logger.error('requestWithdrawal error:', { error: err.message });
+        logger.error('requestWithdrawal post-commit error:', { error: err && err.message });
         res.status(500).json({ success: false, message: 'Failed to request withdrawal.' });
     }
 };
@@ -324,7 +352,10 @@ exports.approveWithdrawal = async (req, res) => {
         // Atomic pending → paid transition: a concurrent approve or reject
         // that already moved the row out of 'pending' makes this a no-op.
         const set = { status: 'paid', handledBy: req.user._id, handledAt: new Date() };
-        if (txnRef) set.txnRef = String(txnRef).trim().slice(0, 100);
+        // Route validator rejects a non-string or >100 TRIMMED-char ref; a
+        // blank / whitespace-only ref means "no reference".
+        const cleanRef = typeof txnRef === 'string' ? txnRef.trim() : '';
+        if (cleanRef) set.txnRef = cleanRef;
         const w = await StaffWithdrawal.findOneAndUpdate(
             { ...scoped, status: 'pending' },
             { $set: set },
@@ -384,7 +415,7 @@ exports.rejectWithdrawal = async (req, res) => {
             { ...scoped, status: 'pending' },
             { $set: {
                 status: 'rejected',
-                rejectReason: reason ? String(reason).trim().slice(0, 300) : 'No reason provided',
+                rejectReason: (typeof reason === 'string' && reason.trim()) ? reason.trim().slice(0, 300) : 'No reason provided',
                 handledBy: req.user._id,
                 handledAt: new Date(),
             } },
@@ -419,7 +450,7 @@ exports.rejectWithdrawal = async (req, res) => {
             balanceAfter: wallet.balance,
             referenceKind: 'StaffWithdrawal',
             referenceId: w._id,
-            note: `Withdrawal rejected: ${w.rejectReason}`,
+            note: `Withdrawal rejected: ${w.rejectReason}`.slice(0, LEDGER_NOTE_MAX),
         }).save({ session });
 
         await session.commitTransaction();

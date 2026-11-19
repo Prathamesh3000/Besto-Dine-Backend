@@ -8,6 +8,30 @@
 // Trial length when the tenant's snapshot plan has no trialDays of its own.
 const SELF_SIGNUP_TRIAL_DAYS = 14;
 
+/**
+ * Slug of the plan a self-service trial runs on (plan §4). TRIAL_PLAN_SLUG
+ * wins, the legacy SELF_SIGNUP_TRIAL_PLAN is honoured, default 'gold'.
+ * Read at call time so a test (or a hot config reload) can change it.
+ */
+function trialPlanSlug() {
+    const pick = (v) => (typeof v === 'string' && v.trim() ? v.trim().toLowerCase() : '');
+    return pick(process.env.TRIAL_PLAN_SLUG) || pick(process.env.SELF_SIGNUP_TRIAL_PLAN) || 'gold';
+}
+
+/**
+ * Trial length for a plan: its own `trial.durationDays` when the trial
+ * switch is on and the length is > 0, else the platform constant. Accepts a
+ * Mongoose doc or a lean object; a missing plan gives the constant.
+ */
+function trialDaysForPlan(plan) {
+    const t = plan && plan.trial;
+    if (t && t.enabled === true) {
+        const d = Number(t.durationDays);
+        if (Number.isFinite(d) && d > 0) return Math.round(d);
+    }
+    return SELF_SIGNUP_TRIAL_DAYS;
+}
+
 const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
 
 /**
@@ -80,6 +104,8 @@ async function findSignupDuplicate(RestaurantModel, { email, phone }) {
 
 module.exports = {
     SELF_SIGNUP_TRIAL_DAYS,
+    trialPlanSlug,
+    trialDaysForPlan,
     normalizeEmailForSignup,
     normalizePhoneForSignup,
     signupRequiresApproval,

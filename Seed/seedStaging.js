@@ -201,7 +201,11 @@ async function seedUsers({ restaurant, branch }) {
             doc.permissions = isAdmin ? {} : defaultPermissionsForRole(login.role);
             doc.staffId = `EMP-00${LOGINS.indexOf(login) + 1}`;
             if (login.role === 'chef') doc.kitchenResponsibility = 'both';
-            if (login.role === 'waiter') doc.handlesTakeaway = true;
+            // false = catch-all floor waiter: sees every dine-in table AND takeaway
+            // (utils/waiterScope.inWaiterScope). true made the demo waiter a pure
+            // takeaway handler who saw only captain-assigned tables, so a guest's
+            // order/request on an unassigned table reached nobody but the captain.
+            if (login.role === 'waiter') doc.handlesTakeaway = false;
         } else {
             doc.mobile = '9876543210';
         }

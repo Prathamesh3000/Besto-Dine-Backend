@@ -5,17 +5,10 @@ const Inventory = require('../models/inventory');
 const logger = require('../utils/logger');
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const { devError } = require('../utils/AppError');
+const { resolveBranchId } = require('../utils/ledgerScope');
 
 const roundQty = Inventory.roundQty;
 const isCounted = (l) => l.countedQty !== null && l.countedQty !== undefined;
-
-function resolveBranchId(req) {
-    const pinned = pinnedBranchId(req);
-    if (pinned) return pinned._id || pinned;
-    if (req.branch?._id) return req.branch._id;
-    const b = req.body?.branch;
-    return b && mongoose.isValidObjectId(b) ? b : null;
-}
 
 const summarise = (s) => {
     const lines = s.lines || [];
@@ -32,7 +25,7 @@ const summarise = (s) => {
 exports.createStocktake = async (req, res) => {
     try {
         const restaurant = tenantId(req);
-        const branchId = resolveBranchId(req);
+        const branchId = await resolveBranchId(req); // async: a body/query branch must belong to the tenant (400 INVALID_BRANCH)
         const itemFilter = { restaurant, ...(branchId ? branchScopeClause(req, branchId) : {}) };
         if (req.body?.category) itemFilter.category = String(req.body.category);
         const items = await Inventory.find(itemFilter).sort({ name: 1 }).select('name itemId unit currentStock').lean();
@@ -54,6 +47,7 @@ exports.createStocktake = async (req, res) => {
         });
         res.status(201).json({ success: true, stocktake: doc });
     } catch (error) {
+        if (error.name === 'AppError' && error.status < 500) return res.status(error.status).json({ success: false, code: error.code, message: error.message });
         if (error.name === 'ValidationError') return res.status(400).json({ success: false, message: error.message });
         res.status(500).json({ success: false, message: 'Failed to create stocktake', ...devError(error) });
     }

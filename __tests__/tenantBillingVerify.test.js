@@ -156,7 +156,8 @@ function signPayment(orderId, paymentId, secret = process.env.RAZORPAY_KEY_SECRE
 
 // Mongoose query-style helper — findOne(...).lean() returns a promise
 function leanOf(value) {
-    return { lean: () => Promise.resolve(value) };
+    const q = { select: () => q, lean: () => Promise.resolve(value) };
+    return q;
 }
 
 beforeEach(() => {

@@ -267,28 +267,29 @@ describe('purchase orders: receiving goods (GRN)', () => {
         expect((await reloadPo(po._id)).receipts).toHaveLength(0);
     });
 
-    test('over-receiving a single-line PO is accepted: stock gets the full delivered quantity', async () => {
+    // BUG-19: over-receipt is now blocked (see poReceiveLimit.test.js); a line fully received exactly is fine.
+    test('receiving exactly the ordered quantity completes a single-line PO', async () => {
         const s = await mkSupplier();
         const inv = await mkInv({ currentStock: 0 });
         const po = await mkPo(s, [[inv, 10, 10]]);
-        const res = await receive(po, [[inv, 12]]);
+        const res = await receive(po, [[inv, 10]]);
         expect(res.status).toBe(200);
         const saved = await reloadPo(po._id);
         expect(saved.status).toBe('received');
-        expect(saved.lines[0].receivedQty).toBe(12);
-        expect((await reloadInv(inv._id)).currentStock).toBe(12);
+        expect(saved.lines[0].receivedQty).toBe(10);
+        expect((await reloadInv(inv._id)).currentStock).toBe(10);
     });
 
     // Regression (fixed 2026-10): computeReceiveStatus marks 'received' only when every line is fully received.
-    test('over-receiving one line keeps the PO partially-received while another line is still outstanding', async () => {
+    test('receiving one line in full keeps the PO partially-received while another line is still outstanding', async () => {
         const s = await mkSupplier();
         const a = await mkInv();
         const b = await mkInv();
         const po = await mkPo(s, [[a, 10, 5], [b, 10, 5]]);
-        expect((await receive(po, [[a, 20]])).status).toBe(200);
+        expect((await receive(po, [[a, 10]])).status).toBe(200);
         const saved = await reloadPo(po._id);
-        expect(saved.lines.map((l) => l.receivedQty)).toEqual([20, 0]);
-        expect(saved.status).toBe('partially-received'); // was 'received' before the fix
+        expect(saved.lines.map((l) => l.receivedQty)).toEqual([10, 0]);
+        expect(saved.status).toBe('partially-received');
         const rest = await receive(po, [[b, 10]]);
         expect(rest.status).toBe(200);
         expect((await reloadInv(b._id)).currentStock).toBe(10);

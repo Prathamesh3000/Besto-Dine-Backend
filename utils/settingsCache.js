@@ -1,4 +1,5 @@
 const Settings = require('../models/settings');
+const { getContext } = require('./requestContext');
 
 /**
  * Per-(tenant, branch) settings cache.
@@ -13,7 +14,10 @@ const Settings = require('../models/settings');
  *                                 and the pinned branch from req.user.
  *   getSettings(restaurantId)   — explicit tenant id (ObjectId or string),
  *                                 tenant-level (branch=null) doc.
- *   getSettings()               — legacy single-tenant fallback.
+ *   getSettings()               — resolves the tenant from the active
+ *                                 request / runAsTenant context. With no
+ *                                 tenant it FAILS CLOSED (throws) unless
+ *                                 inside runAsSystem (platform-wide read).
  *
  * invalidateCache(req) clears every entry for the caller's tenant (see
  * below). invalidateCache() with no args clears everything.
@@ -54,7 +58,10 @@ function resolveBranchIdFromReq(req) {
 }
 
 function resolveKey(arg) {
-    if (!arg) return KEY_LEGACY;
+    if (!arg) {
+        const t = getContext()?.tenantId;
+        return t ? `${String(t)}:null` : KEY_LEGACY;
+    }
     // Express req object with attachTenant middleware applied.
     if (typeof arg === 'object' && arg.restaurant) {
         const tenant = String(arg.restaurant._id);
@@ -118,6 +125,11 @@ async function loadSettings(key) {
 
 exports.getSettings = async (arg) => {
     const key = resolveKey(arg);
+    if (key === KEY_LEGACY && !getContext()?.system) {
+        // No tenant argument and no tenant context: never serve / cache a shared,
+        // unscoped document.
+        throw new Error('settingsCache.getSettings: a tenant (req, restaurantId or tenant context) is required');
+    }
     const hit = cache.get(key);
     if (hit && hit.expires > Date.now()) return hit.value;
 

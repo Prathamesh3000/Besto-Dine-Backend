@@ -88,7 +88,8 @@ describe('refund + paid wiring (source)', () => {
     const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
     test('processOrderRefund and the direct refund controller emit refund.created; the approval controller no longer double-emits', () => {
         expect(read('utils/orderRefund.js')).toMatch(/emitRefundCreated/);
-        expect(read('controllers/razorpay/refunds.js')).toMatch(/emitRefundCreated/);
+        // refundPayment delegates to processOrderRefund (which emits refund.created) since the 2026-11 refund rework.
+        expect(read('controllers/razorpay/refunds.js')).toMatch(/processOrderRefund/);
         expect(read('controllers/refundRequestController.js')).not.toMatch(/emitWebhookEvent\(rr\.restaurant, 'refund\.created'/);
         expect(read('controllers/refundRequestController.js')).toMatch(/refundRequestId: rr\._id/);
     });

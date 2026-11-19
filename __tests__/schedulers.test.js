@@ -33,6 +33,9 @@ const mockTableFindOne = jest.fn();
 const mockShiftFind = jest.fn();
 const mockShiftUpdateOne = jest.fn();
 const mockBookingFind = jest.fn();
+const mockRestaurantFind = jest.fn();
+const T_LIVE = [{ _id: 'aaaaaaaaaaaaaaaaaaaaaaaa' }, { _id: 'cccccccccccccccccccccccc' }];
+jest.mock('../models/restaurant', () => ({ find: (...a) => mockQuery(mockRestaurantFind)(...a) }));
 const mockBookingUpdateOne = jest.fn();
 const mockMenuUpdateMany = jest.fn();
 jest.mock('../models/order', () => ({
@@ -122,6 +125,7 @@ beforeEach(() => {
     mockShiftFind.mockResolvedValue([]);
     mockShiftUpdateOne.mockResolvedValue({ modifiedCount: 1 });
     mockBookingFind.mockResolvedValue([]);
+    mockRestaurantFind.mockResolvedValue(T_LIVE);
     mockBookingUpdateOne.mockResolvedValue({ modifiedCount: 1 });
     mockMenuUpdateMany.mockResolvedValue({ modifiedCount: 0 });
     mockNotify.mockResolvedValue({ ok: true });
@@ -655,7 +659,10 @@ describe('bookingReminderScheduler', () => {
 
     test('query: confirmed, unpaid, not yet reminded, booking within the next 24 h', async () => {
         await runBookingReminderScan();
+        // only tenants that are not suspended/cancelled are scanned
+        expect(mockRestaurantFind).toHaveBeenCalledWith({ status: { $in: ['active', 'trial', 'past_due'] } });
         expect(mockBookingFind).toHaveBeenCalledWith({
+            restaurant: { $in: T_LIVE.map((t) => t._id) },
             status: 'Confirmed',
             'payment.status': { $ne: 'Paid' },
             'payment.balanceReminderSentAt': { $in: [null, undefined] },

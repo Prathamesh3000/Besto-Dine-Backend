@@ -1,8 +1,10 @@
+const mongoose = require('mongoose');
 const Expense = require('../models/expense');
+const LedgerEntry = require('../models/ledgerEntry');
 const LedgerAccount = require('../models/ledgerAccount');
 const ledger = require('../services/ledgerService');
 const { tenantFilter, tenantId, strictBranchFilter } = require('../utils/tenantScope');
-const { resolveBranchId, restaurantTz, businessDateParam } = require('../utils/ledgerScope');
+const { pinnedBranchGuard, resolveBranchId, restaurantTz, businessDateParam } = require('../utils/ledgerScope');
 const { isValidYmd, businessDateOf, eachDate } = require('../utils/businessDate');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
@@ -76,7 +78,7 @@ exports.createExpense = asyncHandler(async (req, res) => {
     const method = METHODS.includes(b.method) ? b.method : 'cash';
     const date = b.date ? new Date(b.date) : new Date();
     if (Number.isNaN(date.getTime())) throw new AppError(400, 'INVALID_DATE', 'Invalid date');
-    const branchId = resolveBranchId(req);
+    const branchId = await resolveBranchId(req);
     const expense = await Expense.create({
         restaurant: tenantId(req),
         branch: branchId,
@@ -103,11 +105,27 @@ exports.listExpenses = asyncHandler(async (req, res) => {
 exports.voidExpense = asyncHandler(async (req, res) => {
     const reason = String(req.body?.reason || '').trim();
     if (!reason) throw new AppError(400, 'REASON_REQUIRED', 'A reason is required to void an expense');
+    if (!mongoose.isValidObjectId(req.params.id)) throw new AppError(404, 'NOT_FOUND', 'Expense not found or already void');
     const expense = await Expense.findOneAndUpdate(
-        { _id: req.params.id, ...tenantFilter(req), status: 'active' },
+        { _id: req.params.id, ...tenantFilter(req), ...pinnedBranchGuard(req), status: 'active' },
         { $set: { status: 'void', voidReason: reason.slice(0, 300) } },
         { returnDocument: 'after' },
     );
     if (!expense) throw new AppError(404, 'NOT_FOUND', 'Expense not found or already void');
+    // Ledger lines are append-only: if the expense was already posted, append a mirror-image
+    // reversal (idempotent via its own key) so the ledger / P&L / cash match the expense list.
+    const posted = await LedgerEntry.find({ restaurant: tenantId(req), 'ref.type': 'expense', 'ref.id': String(expense._id), key: { $not: /^void:/ } }).lean();
+    if (posted.length) {
+        const postedAt = new Date();
+        await Promise.all(posted.map((l) => LedgerEntry.updateOne(
+            { restaurant: l.restaurant, key: `void:${l.key}` },
+            { $setOnInsert: {
+                restaurant: l.restaurant, branch: l.branch || null, businessDate: l.businessDate, account: l.account,
+                debit: l.credit, credit: l.debit, ref: l.ref, narration: `Void: ${l.narration}`.slice(0, 300),
+                key: `void:${l.key}`, postedAt,
+            } },
+            { upsert: true },
+        )));
+    }
     res.json({ success: true, expense });
 }, 'Failed to void expense');

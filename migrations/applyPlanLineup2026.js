@@ -15,12 +15,13 @@
  *      bundle used to include campaigns) and the other new keys off.
  *   2. Creates (or refreshes) Silver, Gold and Premium from the line-up.
  *      Each also gets its per-cycle `prices` (monthly / annual / 2-year,
- *      before GST); re-running rewrites them, so a price change in
- *      config/planLineup.js is applied by re-running. Stale Razorpay plan ids
- *      are left alone: utils/razorpayBilling re-creates any id whose stored
- *      amount no longer matches.
- *   3. Enterprise gets the new module keys switched on; its price and
- *      limits are left alone.
+ *      before GST) plus the `tier` rank and `trial` switch; re-running
+ *      rewrites them, so a price change in config/planLineup.js is applied
+ *      by re-running. Stale Razorpay plan ids are left alone:
+ *      utils/razorpayBilling re-creates any id whose stored amount no longer
+ *      matches.
+ *   3. Enterprise gets the new module keys switched on and its `tier` /
+ *      `trial`; its price and limits are left alone.
  *
  * Existing tenants are NOT moved to the new plans — that is a commercial
  * decision per tenant (Super Admin → Restaurants → assign plan).
@@ -78,6 +79,7 @@ async function applyPlanLineup({ SubscriptionPlan, Restaurant }, { dryRun = fals
                     name: spec.name, description: spec.description, price: spec.price,
                     prices: spec.prices,
                     billingCycle: spec.billingCycle, trialDays: spec.trialDays, sortOrder: spec.sortOrder,
+                    tier: spec.tier, trial: spec.trial,
                     isPublic: spec.isPublic, highlight: spec.highlight, isActive: true,
                     features: spec.features, limits: spec.limits,
                 } });
@@ -92,10 +94,11 @@ async function applyPlanLineup({ SubscriptionPlan, Restaurant }, { dryRun = fals
     // ── 3. Enterprise — new modules on, everything else untouched ────
     const enterprise = await SubscriptionPlan.findOne({ slug: 'enterprise' }).lean();
     if (enterprise) {
-        const set = {};
+        const entSpec = LINEUP.find(p => p.slug === 'enterprise');
+        const set = { tier: entSpec.tier, trial: entSpec.trial, trialDays: entSpec.trialDays };
         for (const k of NEW_KEYS) set[`features.${k}`] = true;
         report.enterprise = 'updated';
-        log('• enterprise: new module keys switched on');
+        log('• enterprise: new module keys switched on, tier/trial set');
         if (!dryRun) await SubscriptionPlan.updateOne({ _id: enterprise._id }, { $set: set });
     } else {
         const spec = LINEUP.find(p => p.slug === 'enterprise');
@@ -119,6 +122,9 @@ if (require.main === module) {
     (async () => {
         const uri = process.env.MONGO_URL;
         if (!uri) { console.error('MONGO_URL not set'); process.exit(1); }
+        // Same workaround as server.js: some LAN DNS servers refuse the SRV lookup
+        // a mongodb+srv:// Atlas URL needs (querySrv ECONNREFUSED). Use public DNS.
+        require('dns').setServers(['8.8.8.8', '1.1.1.1']);
         await mongoose.connect(uri, { serverSelectionTimeoutMS: 30000, family: 4 });
         console.log(`✔ Connected${dryRun ? ' (DRY RUN — no writes)' : ''}`);
         const report = await applyPlanLineup({ SubscriptionPlan, Restaurant }, { dryRun });

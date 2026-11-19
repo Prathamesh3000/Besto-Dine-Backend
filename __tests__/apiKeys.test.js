@@ -85,7 +85,7 @@ describe('apiKeyAuth middleware', () => {
         };
         restaurant = { _id: RID, status: 'active', subscription: { features: { publicApi: true } } };
         jest.spyOn(ApiKey, 'findOne').mockImplementation((q) => ({
-            select: () => ({ setOptions: () => Promise.resolve(q.prefix === keyDoc.prefix ? keyDoc : null) }),
+            select: () => Promise.resolve(q.prefix === keyDoc.prefix ? keyDoc : null),
         }));
         jest.spyOn(ApiKey, 'updateOne').mockReturnValue(Promise.resolve({}));
         jest.spyOn(Restaurant, 'findById').mockImplementation(() => Promise.resolve(restaurant));

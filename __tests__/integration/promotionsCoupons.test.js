@@ -964,11 +964,10 @@ describe('coupon redemption lifecycle via POST /orders', () => {
         expect(again.body.message).toBe('You can only use this coupon 1 time');
     });
 
-    // Not marked BUG: no spec / comment says a cancelled order should give
-    // the use back, and getPerformanceStats (promotionController.js:639-640)
-    // explicitly anticipates "a redeemed order that was later cancelled".
-    // Pinned so a change is noticed — see risks in the QA report.
-    test('cancelling a coupon order keeps the usage and the redemption (no release path)', async () => {
+    // Payments fix round 1 (2026-11): a cancel now gives the coupon use back
+    // (usageCount decremented, redemption row removed) so the coupon is
+    // usable again.
+    test('cancelling a coupon order releases the usage and the redemption', async () => {
         const c = await makeCoupon(L, { code: 'LIFECXL', usageLimit: 1, usagePerUser: 1 });
         const u = await createCustomer('life-cxl');
         const placed = await order(L, u, c.code, 613.75);
@@ -978,11 +977,10 @@ describe('coupon redemption lifecycle via POST /orders', () => {
         expect(res.status).toBe(200);
         expect((await Order.findById(placed.body.order._id).lean()).status).toBe('cancelled');
 
-        expect((await Coupon.findById(c._id).lean()).usageCount).toBe(1);
-        expect(await CouponRedemption.countDocuments({ coupon: c._id })).toBe(1);
-        // …so the customer can't re-apply it and nobody else can either.
+        expect((await Coupon.findById(c._id).lean()).usageCount).toBe(0);
+        expect(await CouponRedemption.countDocuments({ coupon: c._id })).toBe(0);
+        // …so the customer can use it again.
         const again = await call('post', '/promotions/apply-coupon', { user: u, tenant: L }).send({ code: c.code, orderValue: 625 });
-        expect(again.status).toBe(400);
-        expect(again.body.message).toBe('Coupon usage limit has been reached');
+        expect(again.status).toBe(200);
     });
 });

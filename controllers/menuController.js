@@ -21,6 +21,7 @@ const { tenantFilter, tenantId, isBranchPinned, pinnedBranchId, strictBranchFilt
 const { applyBranchPrice } = require('../utils/priceResolver');
 const { buildAvailabilityFilter, isStaffCaller } = require('../utils/menuAvailability');
 const { pickAllowed, MENU_ITEM_FIELDS } = require('../utils/bodyAllowlist');
+const { refOwned } = require('../utils/tenantRefs');
 
 /**
  * Phase 6 step 3 — validate an optional `branch` id against the
@@ -348,6 +349,10 @@ exports.createMenuItem = async (req, res) => {
         const branchCheck = await resolveBranch(req, req.body.branch);
         if (!branchCheck.ok) {
             return res.status(400).json({ success: false, message: branchCheck.message });
+        }
+
+        if (!(await refOwned(Category, req.body.category, tenantId(req)))) {
+            return res.status(400).json({ success: false, message: 'Invalid category' });
         }
 
         // ── Enforce the plan's maxMenuItems limit (0 / missing = uncapped,
@@ -760,6 +765,11 @@ exports.updateMenuItem = async (req, res) => {
                 return res.status(400).json({ success: false, message: branchCheck.message });
             }
             updateData.branch = branchCheck.branchId;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(updateData, 'category')
+            && !(await refOwned(Category, updateData.category, tenantId(req)))) {
+            return res.status(400).json({ success: false, message: 'Invalid category' });
         }
 
         // ADM-036 — translate the inactivation modal payload into the

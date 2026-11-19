@@ -107,8 +107,53 @@ function applyStatusTransition(req, oldOrder, status, updateData) {
   }
 }
 
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const PAYMENT_KEYS = ['paymentStatus', 'paymentMethod', 'amountPaid', 'cashReceived', 'manualDiscount', 'tipAmount', 'payments', 'manualConfirm', 'upiRef'];
+const PAYMENT_STATUSES = ['Pending', 'Partially Paid', 'Paid', 'Refunded'];
+const BILLING_ROLES = ['captain', 'admin', 'manager'];
+const isBlank = (v) => v === undefined || v === null || v === '';
+
 // Payment / tip / manual-discount fields + bill-paid auto-close.
+// Returns { coversSiblings } — whether the money collected also covers the
+// table's other unpaid dine-in rounds (settleSiblingDineInRounds only marks
+// those Paid when it does).
 function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role = null, tenderCtx = {}) {
+  const result = { coversSiblings: true };
+  rawBody = rawBody || {};
+  if (!PAYMENT_KEYS.some((k) => rawBody[k] !== undefined)) return result;
+
+  // Billing roles only: the route lets a chef through on updateOrderStatus.
+  if (role && !BILLING_ROLES.includes(role)) {
+    throw httpError(403, { success: false, code: 'BILLING_CAPTAIN_ONLY', message: 'Billing and payment are handled by the captain' });
+  }
+  // A void order can never be paid / discounted / tipped.
+  if (oldOrder.status === 'cancelled') {
+    throw httpError(409, { success: false, code: 'ORDER_CANCELLED', message: 'This order is cancelled and cannot be paid.' });
+  }
+  // A settled order's money fields are frozen. (A status change that merely
+  // echoes the payment fields back is allowed: they are dropped, not applied.)
+  if (oldOrder.paymentStatus === 'Paid' || oldOrder.paymentStatus === 'Refunded') {
+    if (rawBody.payments === undefined) {
+      if (rawBody.status) {
+        rawBody = { ...rawBody };
+        PAYMENT_KEYS.forEach((k) => { delete rawBody[k]; });
+        return result;
+      }
+      throw httpError(409, oldOrder.paymentStatus === 'Paid'
+        ? { success: false, code: 'ALREADY_PAID', message: 'This order is already paid.' }
+        : { success: false, code: 'ORDER_REFUNDED', message: 'This order is refunded and cannot be paid again.' });
+    }
+  }
+  if (rawBody.paymentStatus !== undefined && !PAYMENT_STATUSES.includes(rawBody.paymentStatus)) {
+    throw httpError(400, { success: false, code: 'INVALID_PAYMENT_STATUS', message: `paymentStatus must be one of ${PAYMENT_STATUSES.join(', ')}.` });
+  }
+  if (rawBody.paymentStatus === 'Refunded' && rawBody.payments === undefined) {
+    throw httpError(400, { success: false, code: 'REFUND_USE_REFUND_FLOW', message: 'Refunds are recorded through the refund flow, not by setting paymentStatus.' });
+  }
+  if (rawBody.paymentStatus === 'Pending' && oldOrder.paymentStatus && oldOrder.paymentStatus !== 'Pending') {
+    throw httpError(409, { success: false, code: 'INVALID_PAYMENT_TRANSITION', message: 'A payment cannot be reverted to Pending.' });
+  }
+
   // Split tender (task 2.3): `payments: [{ method, amount }]` is folded into
   // the legacy paymentStatus / paymentMethod / amountPaid fields first, so
   // every check below (due, tolerance, tip, cash change) runs unchanged.
@@ -116,7 +161,22 @@ function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role =
     ? resolveTenderedBody(oldOrder, rawBody, { userId, role, ...tenderCtx }) : null;
   const body = tendered ? tendered.body : rawBody;
   const { paymentStatus, paymentMethod, tipAmount, manualDiscount } = body;
-  let { amountPaid } = body;
+  const { amountPaid } = body;
+  const siblingDue = Math.max(0, Number(tenderCtx && tenderCtx.siblingDue) || 0);
+
+  // amountPaid: a real, non-negative number or nothing. Validated for EVERY
+  // status (it used to be checked only when marking Paid).
+  let givenAmount = null;
+  if (!isBlank(amountPaid)) {
+    const n = (typeof amountPaid === 'number' || typeof amountPaid === 'string') ? Number(amountPaid) : NaN;
+    if (!Number.isFinite(n) || n < 0) {
+      throw httpError(400, { success: false, code: 'INVALID_AMOUNT', message: 'Amount paid must be a non-negative number.' });
+    }
+    givenAmount = n;
+    if (!paymentStatus) {
+      throw httpError(400, { success: false, code: 'AMOUNT_NEEDS_PAYMENT_STATUS', message: "amountPaid is only accepted together with paymentStatus ('Paid' / 'Partially Paid') or payments[]." });
+    }
+  }
 
   // UPI settle (QR on the bill, paid into the restaurant's own UPI id; the
   // app cannot see it, so staff confirm it). Body extras: `manualConfirm:
@@ -144,39 +204,57 @@ function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role =
     }
     upiRef = cleaned;
   }
-  if (manualConfirm && (amountPaid === undefined || amountPaid === null || amountPaid === '')) {
-    // The customer paid the bill's amount due: record exactly that.
-    const effDisc = body.manualDiscount !== undefined && Number.isFinite(Number(body.manualDiscount))
-      ? Math.max(0, Number(body.manualDiscount)) : Math.max(0, Number(oldOrder.manualDiscount) || 0);
-    amountPaid = Math.round(Math.max(0, (Number(oldOrder.total) || 0) - effDisc - Math.max(0, Number(oldOrder.amountPaid) || 0)) * 100) / 100;
+  const oldTotal = Math.max(0, Number(oldOrder.total) || 0);
+  const oldTip = Math.max(0, Number(oldOrder.tipAmount) || 0);
+  const alreadyPaid = Math.max(0, Number(oldOrder.amountPaid) || 0);
+
+  // Manual discount applied by the admin/waiter from the table drawer.
+  // Persisted so the customer's bill-preview reflects it before they pay
+  // (emitted via order:updated below → the customer bill refetches).
+  // Capped at the bill (a discount cannot make the bill negative) and
+  // stored to the paisa.
+  if (manualDiscount !== undefined && Number.isFinite(Number(manualDiscount))) {
+    const md = round2(Math.min(Math.max(0, Number(manualDiscount)), oldTotal));
+    // A finalised bill (Save Bill, D4) keeps its discount; re-sending the
+    // current value (a settle screen echoing it back) is not a change.
+    if (md !== round2(Math.max(0, Number(oldOrder.manualDiscount) || 0))) {
+      require('../utils/billWorkspace').assertBillNotFinal(oldOrder);
+    }
+    updateData.manualDiscount = md;
   }
-  if (paymentStatus) updateData.paymentStatus = paymentStatus;
-  if (paymentMethod) updateData.paymentMethod = paymentMethod;
-  if (amountPaid !== undefined) updateData.amountPaid = amountPaid;
+  const effDiscount = updateData.manualDiscount !== undefined
+    ? updateData.manualDiscount : Math.max(0, Number(oldOrder.manualDiscount) || 0);
+  // What this order itself still owes (a tip stored on it is already in total).
+  const due = round2(Math.max(0, oldTotal - effDiscount - alreadyPaid));
+
   // Captain/admin settles the bill with an explicit tip line — accept
   // the body field so createTipForPaidOrder (called below after save)
   // produces a Tip record and the waiter's tip dashboard reflects the
   // earning. Clamp to non-negative; falsy values leave order.tipAmount
   // untouched so partial PATCH callers don't accidentally zero it out.
+  // utils/billing keeps the tip inside order.total, so a changed tip moves
+  // the total by the same amount (bill + tip invariant).
+  let extraTip = 0;
   if (tipAmount !== undefined && Number.isFinite(Number(tipAmount))) {
-    updateData.tipAmount = Math.max(0, Number(tipAmount));
+    const tip = round2(Math.max(0, Number(tipAmount)));
+    updateData.tipAmount = tip;
+    const delta = round2(tip - oldTip);
+    if (delta !== 0) updateData.total = round2(Math.max(0, oldTotal + delta));
+    extraTip = Math.max(0, delta);
   }
-  // Manual discount applied by the admin/waiter from the table drawer.
-  // Persisted so the customer's bill-preview reflects it before they pay
-  // (emitted via order:updated below → the customer bill refetches).
-  if (manualDiscount !== undefined && Number.isFinite(Number(manualDiscount))) {
-    // A finalised bill (Save Bill, D4) keeps its discount; re-sending the
-    // current value (a settle screen echoing it back) is not a change.
-    if (Math.max(0, Number(manualDiscount)) !== (Math.max(0, Number(oldOrder.manualDiscount) || 0))) {
-      require('../utils/billWorkspace').assertBillNotFinal(oldOrder);
-    }
-    updateData.manualDiscount = Math.max(0, Number(manualDiscount));
-  }
+
+  if (paymentStatus) updateData.paymentStatus = paymentStatus;
+  if (paymentMethod) updateData.paymentMethod = paymentMethod;
   if (paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid' && !oldOrder.paidAt) {
     updateData.paidAt = new Date();
   }
 
-  // Marking Paid NEVER rewrites order.total.
+  // The amount that must change hands to settle: what this order owes plus a
+  // tip raised now plus the table's other unpaid rounds (settled together).
+  const requiredOwn = round2(due + extraTip);
+  const requiredAll = round2(requiredOwn + siblingDue);
+
+  // Marking Paid NEVER re-prices the bill (other than adding a raised tip).
   //
   // It used to (`total = amountPaid`), which let any settle screen
   // silently re-price the bill — a typo'd or discounted cash amount
@@ -187,56 +265,53 @@ function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role =
   //     paid, ₹1 rounding tolerance) → 400 AMOUNT_TOO_LOW. A deliberate
   //     reduction must go through the Discount option (manualDiscount),
   //     which is recorded on the order.
-  //   • amountPaid at or above due → recorded as paid; any overpayment
-  //     or tip is carried by amountPaid / tipAmount as before.
-  if (paymentStatus === 'Paid' && amountPaid !== undefined && amountPaid !== null && amountPaid !== '') {
-    const paid = Number(amountPaid);
-    const effectiveManualDiscount = updateData.manualDiscount !== undefined
-      ? updateData.manualDiscount
-      : Math.max(0, Number(oldOrder.manualDiscount) || 0);
-    const alreadyPaid = Math.max(0, Number(oldOrder.amountPaid) || 0);
-    const due = Math.round(Math.max(0,
-      (Number(oldOrder.total) || 0) - effectiveManualDiscount - alreadyPaid) * 100) / 100;
-    if (!Number.isFinite(paid) || paid < 0) {
-      throw httpError(400, { success: false, code: 'INVALID_AMOUNT', message: 'Amount paid must be a non-negative number.' });
-    }
-    if (paid < due - 1) {
+  //   • amountPaid at or above due → recorded as paid; amountPaid stores
+  //     the cumulative money kept against this order (earlier payments +
+  //     what settles it), never the overpayment (that is change).
+  //   • no amountPaid (card / UPI) → the amount due is recorded.
+  if (paymentStatus === 'Paid' && !tendered) {
+    if (givenAmount !== null && givenAmount < due - 1) {
       throw httpError(400, {
         success: false,
         code: 'AMOUNT_TOO_LOW',
-        message: `Amount paid ₹${paid.toFixed(2)} is less than the amount due ₹${due.toFixed(2)}. `
+        message: `Amount paid ₹${givenAmount.toFixed(2)} is less than the amount due ₹${due.toFixed(2)}. `
           + 'Marking an order Paid cannot reduce the bill — use the Discount option to give a discount, then settle.',
         amountDue: due,
       });
     }
+    const paid = givenAmount !== null ? givenAmount : requiredAll;
+    result.coversSiblings = siblingDue <= 0 || paid >= requiredAll - 1;
+    // Cash handed over beyond the bill is recorded as given (the change is in
+    // payment.changeDue); any other method keeps only what the bill needs.
+    const isCash = /cash/i.test(String(paymentMethod || oldOrder.paymentMethod || ''));
+    const cap = result.coversSiblings ? requiredAll : requiredOwn;
+    const keep = isCash && result.coversSiblings ? paid : Math.min(paid, cap);
+    updateData.amountPaid = round2(alreadyPaid + keep);
+  } else if (paymentStatus === 'Partially Paid' && !tendered) {
+    // A part-payment must say how much, and it must really be partial; the
+    // split-tender path (payments[]) is the way to record the legs.
+    if (givenAmount === null || givenAmount <= 0) {
+      throw httpError(400, { success: false, code: 'AMOUNT_REQUIRED', message: 'A partial payment needs the amount collected (or use payments[]).' });
+    }
+    if (givenAmount >= due - 1) {
+      throw httpError(400, { success: false, code: 'AMOUNT_COVERS_DUE', message: "This amount covers the bill — mark it 'Paid' instead." });
+    }
+    updateData.amountPaid = round2(alreadyPaid + givenAmount);
   }
 
   // Payment state block (Phase 4): a staff settle records payment.state
   // 'paid'. For cash it also records cashReceived (explicit body field,
-  // default amountPaid) and changeDue. Existing semantics are untouched:
-  // partial payment was never allowed here (AMOUNT_TOO_LOW above, same
-  // INR 1 tolerance), so a cash amount below the payable is CASH_SHORT.
+  // default amountPaid) and changeDue. A cash amount below the payable is
+  // CASH_SHORT.
   if (paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid') {
     const method = String(paymentMethod || oldOrder.paymentMethod || '');
-    const effDiscount = updateData.manualDiscount !== undefined
-      ? updateData.manualDiscount
-      : Math.max(0, Number(oldOrder.manualDiscount) || 0);
-    const payable = Math.round(Math.max(0,
-      (Number(oldOrder.total) || 0) - effDiscount - Math.max(0, Number(oldOrder.amountPaid) || 0)) * 100) / 100;
-    // A tip already stored on the order is already inside oldOrder.total
-    // (utils/billing.js adds it), hence inside `payable`. Only a tip RAISED
-    // by this request is not yet in total (it is not recomputed here), so
-    // only that increase is added on top. Subtracting the full tip would
-    // count a stored tip twice and understate change.
-    const oldTip = Math.max(0, Number(oldOrder.tipAmount) || 0);
-    const extraTip = updateData.tipAmount !== undefined ? Math.max(0, updateData.tipAmount - oldTip) : 0;
-    const payableInclTip = Math.round((payable + extraTip) * 100) / 100;
+    // `due` already contains a tip stored on the order; only a tip RAISED by
+    // this request (extraTip) is added on top, so change is not understated.
+    const payableInclTip = requiredOwn;
     let cashReceived = null;
     let changeDue = null;
     if (/cash/i.test(method)) {
-      const raw = body.cashReceived !== undefined && body.cashReceived !== null && body.cashReceived !== ''
-        ? body.cashReceived
-        : (amountPaid !== undefined && amountPaid !== null && amountPaid !== '' ? amountPaid : null);
+      const raw = !isBlank(body.cashReceived) ? body.cashReceived : (givenAmount !== null ? givenAmount : null);
       if (raw !== null) {
         const received = Number(raw);
         if (!Number.isFinite(received) || received < 0) {
@@ -255,7 +330,7 @@ function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role =
       }
     }
     Object.assign(updateData, require('../utils/paymentState').paidSet({
-      method: manualConfirm ? 'upi-qr-manual' : method, amount: payable, reference: upiRef, cashReceived, changeDue, userId,
+      method: manualConfirm ? 'upi-qr-manual' : method, amount: due, reference: upiRef, cashReceived, changeDue, userId,
     }));
   }
 
@@ -294,6 +369,7 @@ function applyPaymentFields(oldOrder, rawBody, updateData, userId = null, role =
     // status, so stamp servedAt here (first entry only).
     if (!oldOrder.servedAt) updateData.servedAt = new Date();
   }
+  return result;
 }
 
 // Kitchen timestamps (preparing / ready / served) + chef assignment.
@@ -356,8 +432,16 @@ async function commitStatusUpdate(oldOrder, updateData, tf) {
   // The not-Paid → Paid transition is pinned too, so of two concurrent
   // mark-paid taps only one commits it (and runs the ledger / tip /
   // notification side effects); the other gets a 409.
-  const claimsPaid = updateData.paymentStatus === 'Paid' && oldOrder.paymentStatus !== 'Paid';
-  if (claimsPaid) atomicFilter.paymentStatus = { $ne: 'Paid' };
+  // Any money write (status, method, amount, tip, discount) on a not-yet-settled
+  // order is pinned to "still not Paid / Refunded and not cancelled", so of N
+  // concurrent settles exactly one commits and the rest get a 409 instead of
+  // overwriting a settled order.
+  const writesMoney = ['paymentStatus', 'paymentMethod', 'amountPaid', 'tipAmount', 'manualDiscount', 'payments']
+    .some((k) => updateData[k] !== undefined);
+  if (writesMoney) {
+    atomicFilter.paymentStatus = { $nin: ['Paid', 'Refunded'] };
+    if (!updateData.status) atomicFilter.status = { $ne: 'cancelled' };
+  }
   // Split tender rewrites payments[] / amountPaid from the order as read, so
   // a concurrent payment (wallet, another counter) makes this a 409 rather
   // than a lost line.
@@ -365,11 +449,11 @@ async function commitStatusUpdate(oldOrder, updateData, tf) {
 
   const order = await Order.findOneAndUpdate(atomicFilter, updateData, { returnDocument: 'after' });
   if (!order) {
-    if (claimsPaid && !updateData.status) {
+    if (writesMoney && !updateData.status) {
       throw httpError(409, {
         success: false,
         code: 'ALREADY_PAID',
-        message: 'This order was already marked paid. Please refresh.',
+        message: 'This order was already settled, cancelled or changed by someone else. Please refresh.',
       });
     }
     throw httpError(409, {
@@ -405,7 +489,7 @@ async function clearFloorAlertsOnClose(status, oldOrder, order, tf) {
 }
 
 // Settling one dine-in round settles the table's other unpaid rounds.
-async function settleSiblingDineInRounds(req, paymentStatus, oldOrder, order, tf) {
+async function settleSiblingDineInRounds(req, paymentStatus, oldOrder, order, tf, { coversSiblings = true } = {}) {
   // Pay-first (operations profile): every round pays for itself, so
   // paying one round (e.g. a held counter-cash order) must not mark the
   // table's other unpaid rounds Paid with amountPaid 0.
@@ -414,6 +498,9 @@ async function settleSiblingDineInRounds(req, paymentStatus, oldOrder, order, tf
   // table — the paid-up-front one neither covers nor is covered by the
   // table bill. Orders without a recorded channel follow the tenant mode.
   if (oldOrder.holdReason) return;
+  // Only when the money collected also covers the siblings' due (the single
+  // method path leaves them unpaid otherwise — never Paid with 0 collected).
+  if (!coversSiblings) return;
   const { resolveOperations, orderIsPayFirst } = require('../utils/operationsProfile');
   const ops = req.restaurant ? resolveOperations(req.restaurant) : null;
   if (orderIsPayFirst(order, ops)) return;
@@ -498,7 +585,9 @@ function runInventoryHooks(req, status, oldOrder, order) {
   // If the chef had started preparing (so deduction ran) and the order
   // then flips to cancelled, put the stock back with a `type: 'return'`
   // adjustment. Idempotent via the order.inventoryDeducted flag.
-  if (status === 'cancelled' && oldOrder.status !== 'cancelled' && order.inventoryDeducted) {
+  // A SERVED order was eaten: cancelling it writes the food off, so the
+  // stock that was consumed must not come back.
+  if (status === 'cancelled' && oldOrder.status !== 'cancelled' && oldOrder.status !== 'served' && order.inventoryDeducted) {
     try {
       const { restoreInventoryForOrder } = require('../controllers/inventoryController');
       const restaurantId = tenantId(req);
@@ -619,9 +708,12 @@ async function updateOrderStatus(req) {
 
   const updateData = {};
   applyStatusTransition(req, oldOrder, status, updateData);
-  const tenderCtx = req.body && req.body.payments !== undefined
+  // The table's other unpaid rounds are settled together with this one, so
+  // a Paid settle (single method or split) must also cover their due.
+  const settlesPaid = req.body && (req.body.payments !== undefined || req.body.paymentStatus === 'Paid');
+  const tenderCtx = settlesPaid && oldOrder.paymentStatus !== 'Paid'
     ? { siblingDue: await siblingDueFor(req, oldOrder, tf) } : undefined;
-  applyPaymentFields(oldOrder, req.body, updateData, req.user?._id || null, req.user?.role || null, tenderCtx);
+  const payResult = applyPaymentFields(oldOrder, req.body, updateData, req.user?._id || null, req.user?.role || null, tenderCtx);
   applyKitchenStamps(req, oldOrder, status, updateData);
 
   let order = await commitStatusUpdate(oldOrder, updateData, tf);
@@ -647,7 +739,7 @@ async function updateOrderStatus(req) {
 
   await clearFloorAlertsOnClose(status, oldOrder, order, tf);
   // updateData.paymentStatus: with split tenders the status is derived, not in the body.
-  await settleSiblingDineInRounds(req, updateData.paymentStatus || paymentStatus, oldOrder, order, tf);
+  await settleSiblingDineInRounds(req, updateData.paymentStatus || paymentStatus, oldOrder, order, tf, { coversSiblings: payResult.coversSiblings });
   runInventoryHooks(req, status, oldOrder, order);
   await releaseTableIfDone(oldOrder, order, tf);
   await notifyStatusTransition({ status, oldOrder, order });
@@ -659,7 +751,11 @@ async function updateOrderStatus(req) {
   // transition accrues (the paid side is covered by createTipForPaidOrder
   // below); a cancel reverses.
   if (order.status === 'served' && oldOrder.status !== 'served') require('./incentiveService').accrueSafe(order);
-  if (order.status === 'cancelled' && oldOrder.status !== 'cancelled') require('./incentiveService').reverseIfVoidSafe(order, 'order cancelled');
+  if (order.status === 'cancelled' && oldOrder.status !== 'cancelled') {
+    require('./incentiveService').reverseIfVoidSafe(order, 'order cancelled');
+    // The order consumed a coupon use / redeemed loyalty points: give them back.
+    await require('./orderCancelReversal').reverseCouponAndPoints(order);
+  }
 
   // Side Effect: Record Tip if tipAmount > 0 and status is Paid.
   // Delegated to the shared helper so every payment entry point

@@ -60,7 +60,30 @@ for (const file of fs.readdirSync(MODELS_DIR)) {
 
 // Tenant-scoped models that we still DON'T want in an export:
 //   IdempotencyRecord — technical request-dedup rows, not business data.
-const DENYLIST = new Set(['IdempotencyRecord']);
+//   Credential / session / verification collections — never exported:
+//   PasswordResetToken, Otp, RefreshSession, ApiKey (key hashes),
+//   WebhookEndpoint (signing secrets), LoginAttempt, JobLock.
+const DENYLIST = new Set([
+    'IdempotencyRecord', 'PasswordResetToken', 'Otp', 'RefreshSession',
+    'ApiKey', 'WebhookEndpoint', 'LoginAttempt', 'JobLock',
+]);
+
+// Restaurant fields set by / for the platform operator (Super Admin review,
+// manual payment confirmation, signup attribution) — not the tenant's data.
+const RESTAURANT_INTERNAL_FIELDS = [
+    'paymentNote', 'paymentStatus', 'paymentMethod', 'paymentConfirmedAt', 'paymentConfirmedBy',
+    'signupSource', 'signupStatus', 'signupNote', 'signupRejectedReason', 'signupReviewedAt',
+    'signupReviewedBy', 'signupReviewNote', 'signupReviewNoteUpdatedAt', 'signupReviewNoteUpdatedBy',
+    'requestedPlan', 'signupMeta', 'createdBy', 'featureOverrides',
+    'contactEmailNormalized', 'contactPhoneNormalized',
+];
+
+function stripInternal(restaurant) {
+    if (!restaurant) return restaurant;
+    const copy = { ...restaurant };
+    for (const f of RESTAURANT_INTERNAL_FIELDS) delete copy[f];
+    return copy;
+}
 
 // Per-collection row cap — protects memory on pathologically large tenants.
 const PER_COLLECTION_LIMIT = 50000;
@@ -103,7 +126,7 @@ async function readCollection(model, tenantId) {
     if (model.modelName === 'User') {
         query = model
             .find({ restaurant: tenantId, role: { $nin: ['customer', 'superadmin'] } })
-            .select('-password');
+            .select('-password -twoFactor.secretEnc -twoFactor.recoveryHashes');
     } else {
         query = model.find({ restaurant: tenantId });
     }
@@ -215,7 +238,7 @@ exports.exportTenantData = async (req, res) => {
 
         // The tenant's own profile leads the bundle as its own collection.
         const collections = [
-            { key: 'restaurant', docs: restaurant ? [restaurant] : [] },
+            { key: 'restaurant', docs: restaurant ? [stripInternal(restaurant)] : [] },
             ...scopedCollections,
         ];
 

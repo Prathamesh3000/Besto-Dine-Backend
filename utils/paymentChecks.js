@@ -107,7 +107,11 @@ function checkWalletRechargePayment({ payment, rzpOrder, razorpayOrderId, userId
     if (!userId || String(notes.userId || '') !== String(userId)) {
         return fail(403, 'RECHARGE_USER_MISMATCH', 'This recharge belongs to a different account.');
     }
-    if (notes.restaurantId && tenant && String(notes.restaurantId) !== String(tenant)) {
+    // Fail closed: a recharge is credited to a per-tenant wallet, so the request must carry a tenant.
+    if (!tenant) {
+        return fail(403, 'TENANT_REQUIRED', 'A restaurant context is required to verify a wallet recharge.');
+    }
+    if (notes.restaurantId && String(notes.restaurantId) !== String(tenant)) {
         return fail(403, 'TENANT_MISMATCH', 'This recharge belongs to a different restaurant.');
     }
     if (base.amount > maxAmount) {

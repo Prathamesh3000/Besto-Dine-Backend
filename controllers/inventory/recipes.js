@@ -3,7 +3,9 @@ const Inventory = require('../../models/inventory');
 const Recipe = require('../../models/recipe');
 const MenuItem = require('../../models/menuItem');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../../utils/tenantScope');
+const Branch = require('../../models/branch');
 const { devError } = require('../../utils/AppError');
+const { refOwned } = require('../../utils/tenantRefs');
 const { ALLOWED_UNITS, branchFilter, convertUnits } = require('./_shared');
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -130,7 +132,11 @@ exports.saveRecipe = async (req, res) => {
 
         // Sub Admin owns the recipe at their branch; tenant owner creates
         // branch-less (null) recipes unless body.branch is explicitly set.
-        const ownerBranch = pinnedBranchId(req) || req.body.branch || null;
+        const pinned = pinnedBranchId(req);
+        if (!pinned && req.body.branch && !(await refOwned(Branch, req.body.branch, tenantId(req)))) {
+            return res.status(400).json({ success: false, message: 'Invalid branch' });
+        }
+        const ownerBranch = pinned || req.body.branch || null;
 
         const recipe = await Recipe.findOneAndUpdate(
             { menuItem: menuItemId, restaurant: tenantId(req), branch: ownerBranch },

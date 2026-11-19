@@ -9,9 +9,12 @@ const {
 
 const {
     protect,
-    superAdminOnly,
+    superAdminPanel,
+    platformStaffGate,
     superAdminFull,
+    superAdminOrModule,
 } = require('../middlewares/authMiddleware');
+const { platformStaffActivity } = require('../middlewares/platformStaffActivity');
 
 const ctrl = require('../controllers/superadminController');
 const opsCtrl = require('../controllers/operationsController');
@@ -119,12 +122,38 @@ const planFieldChains = () => [
     optObject('features'),
     optBool('isPublic'),
     optBool('highlight'),
+    // TRIAL_SIGNUP_AND_LEADS_PLAN §2 — public card fields.
+    optObject('trial'),
+    optBool('trial.enabled'),
+    body('trial.durationDays').optional({ values: 'null' })
+        .custom((v) => v === '' || (isNumberish(v) && Number.isInteger(+v) && +v >= 0 && +v <= 3650))
+        .withMessage('Trial length must be a whole number of days between 0 and 3650'),
+    optText('badge', 40),
+    body('highlights').optional({ values: 'null' })
+        .isArray({ max: 8 }).withMessage('Highlights must be a list of at most 8 items'),
+    body('highlights.*')
+        .isString().withMessage('Each highlight must be text').bail()
+        .isLength({ max: 120 }).withMessage('A highlight cannot exceed 120 characters'),
 ];
+
+// Numeric rank (free 0, silver 10, gold 20, premium 25, enterprise 30).
+// A non-numeric value ("standard") is a 400, never a silently dropped field;
+// 0 is valid. `toInt()` hands the controller a real Number.
+const TIER_MESSAGE = 'Tier must be a whole number >= 0 (e.g. 0 free, 10 silver, 20 gold, 25 premium, 30 enterprise)';
+const tierRule = (required) => {
+    const chain = required
+        ? body('tier').exists({ values: 'null' }).withMessage('Tier is required').bail()
+        : body('tier').optional({ values: 'null' });
+    return chain
+        .custom((v) => isNumberish(v) && Number.isInteger(+v) && +v >= 0).withMessage(TIER_MESSAGE)
+        .toInt();
+};
 
 const createPlanRules = validate([
     requiredText('name', 'Plan name is required'),
     body('price').isFloat({ min: 0 }).withMessage('Price must be a non-negative number'),
     optText('slug', 200),
+    tierRule(true),
     ...planFieldChains(),
 ]);
 
@@ -135,13 +164,17 @@ const updatePlanRules = validate([
     body('price').optional()
         .custom((v) => isNumberish(v) && +v >= 0).withMessage('Price must be a non-negative number'),
     optBool('isActive'),
+    tierRule(false),
     ...planFieldChains(),
 ]);
 
 // All routes require an authenticated super admin. Mutating routes
 // additionally require the `full` sub-level — `support` superadmins are
 // limited to read-only.
-router.use(protect, superAdminOnly);
+// Delegated platform staff (role `platformstaff`) get in too, but `platformStaffGate`
+// closes everything except the routes of their assigned modules
+// (config/platformModules.js, PLATFORM_STAFF_PLAN.md) and `platformStaffActivity` logs what they do.
+router.use(protect, superAdminPanel, platformStaffGate, platformStaffActivity);
 
 // ═══════════════ ANALYTICS & AUDIT (read-only) ═══════════════════════════
 router.get('/analytics',  ctrl.getPlatformAnalytics);
@@ -191,6 +224,21 @@ router.post(
 );
 
 router.post('/restaurants/:id/suspend',    superAdminFull, validate([restaurantId]), ctrl.suspendRestaurant);
+// Free-trial extension (TRIAL_SIGNUP_AND_LEADS_PLAN §6): adds `days` to the
+// trial end (from today if it already ended) and lifts the trial lock.
+router.post(
+    '/restaurants/:id/extend-trial',
+    superAdminOrModule('trials'),
+    validate([
+        restaurantId,
+        body('days')
+            .exists({ values: 'null' }).withMessage('days is required').bail()
+            .custom((v) => isNumberish(v) && Number.isInteger(+v) && +v >= 1 && +v <= 90)
+            .withMessage('days must be a whole number between 1 and 90')
+            .toInt(),
+    ]),
+    ctrl.extendTrial
+);
 
 // Paid add-ons — single modules sold on top of the tenant's plan.
 router.get('/addon-catalog', ctrl.getAddonCatalog);
@@ -225,16 +273,53 @@ router.post('/restaurants/:id/cancel-subscription', superAdminFull, validate([re
 // allowed for any superadmin; deletion (spam cleanup) needs `full`.
 router.get('/leads',         ctrl.listLeads);
 router.get('/leads/:id',     ctrl.getLead);
-router.patch('/leads/:id',   superAdminFull, validate([leadId]), ctrl.updateLead);
+router.patch('/leads/:id',   superAdminOrModule('leads'), validate([leadId]), ctrl.updateLead);
 router.delete('/leads/:id',  superAdminFull, validate([leadId]), ctrl.deleteLead);
+
+// ═══════════════ SIGNUP LEADS (plan §8) ═════════════════════════════════
+// Self-registered tenants as a follow-up list (the tenant record IS the
+// lead). Reads for any superadmin; stage/follow-up/notes writes need `full`.
+// Distinct from the marketing-site demo requests above.
+// `/summary` and `/export.csv` are declared BEFORE `/:slug` so the slug
+// route never swallows them.
+const signupLeads = require('../controllers/superadmin/signupLeads');
+const { param: slParam, query: slQuery } = require('../middlewares/validate');
+const SIGNUP_LEAD_STAGES = signupLeads.SIGNUP_LEAD_STAGES;
+const slugParam = slParam('slug').isString().isLength({ min: 1, max: 80 })
+    .matches(/^[a-z0-9_-]+$/i).withMessage('Invalid restaurant slug');
+const optIsoOrNull = (field) => body(field).optional({ values: 'null' })
+    .custom((v) => v === '' || (typeof v === 'string' && !Number.isNaN(new Date(v).getTime())))
+    .withMessage(`${field} must be an ISO date or null`);
+const signupLeadListRules = validate([
+    slQuery('segment').optional({ values: 'falsy' }).isIn(signupLeads.SIGNUP_LEAD_SEGMENTS).withMessage('Invalid segment'),
+    slQuery('stage').optional({ values: 'falsy' }).isIn(SIGNUP_LEAD_STAGES).withMessage('Invalid stage'),
+    slQuery('followUp').optional({ values: 'falsy' }).isIn(['due']).withMessage('followUp must be "due"'),
+    slQuery('search').optional({ values: 'falsy' }).isString().isLength({ max: 120 }).withMessage('search is too long'),
+    slQuery('page').optional({ values: 'falsy' }).isInt({ min: 1 }).withMessage('page must be a positive integer'),
+    slQuery('limit').optional({ values: 'falsy' }).isInt({ min: 1, max: 100 }).withMessage('limit must be 1–100'),
+]);
+router.get('/signup-leads',             signupLeadListRules, signupLeads.listSignupLeads);
+router.get('/signup-leads/summary',     signupLeads.signupLeadsSummary);
+router.get('/signup-leads/export.csv',  signupLeadListRules, signupLeads.exportSignupLeadsCsv);
+router.patch('/signup-leads/:slug', superAdminOrModule('signupLeads'), validate([
+    slugParam,
+    body('stage').optional().isIn(SIGNUP_LEAD_STAGES).withMessage(`stage must be one of ${SIGNUP_LEAD_STAGES.join(', ')}`),
+    optIsoOrNull('nextFollowUpAt'),
+    optIsoOrNull('lastContactedAt'),
+]), signupLeads.updateSignupLead);
+router.post('/signup-leads/:slug/notes', superAdminOrModule('signupLeads'), validate([
+    slugParam,
+    body('text').custom((v) => typeof v === 'string' && v.trim().length >= 1 && v.trim().length <= 1000)
+        .withMessage('Note text must be 1–1000 characters'),
+]), signupLeads.addSignupLeadNote);
 
 // ═══════════════ MARKETING SITE CONTENT ═════════════════════════════════
 // Editable text/link content for the standalone marketing site. Read by any
 // superadmin; updates need `full`.
 router.get('/marketing',  ctrl.getMarketingSettings);
-router.put('/marketing',  superAdminFull, ctrl.updateMarketingSettings);
-router.post('/marketing/logo', superAdminFull, upload.single('image'), ctrl.uploadMarketingLogo);
-router.post('/marketing/screenshot', superAdminFull, upload.single('image'), ctrl.uploadMarketingScreenshot);
+router.put('/marketing',  superAdminOrModule('marketing'), ctrl.updateMarketingSettings);
+router.post('/marketing/logo', superAdminOrModule('marketing'), upload.single('image'), ctrl.uploadMarketingLogo);
+router.post('/marketing/screenshot', superAdminOrModule('marketing'), upload.single('image'), ctrl.uploadMarketingScreenshot);
 
 // ═══════════════ SUBSCRIPTION PAYMENTS ══════════════════════════════════
 // Platform-wide billing ledger (all tenants' successful subscription charges).
@@ -321,7 +406,7 @@ router.get('/blog',         blog.listBlogPosts);
 router.get('/blog/:id',     blog.getBlogPost);
 router.post(
     '/blog',
-    superAdminFull,
+    superAdminOrModule('blog'),
     validate([
         body('title').trim().notEmpty().withMessage('Title is required'),
         body('description').trim().notEmpty().withMessage('Meta description is required'),
@@ -329,13 +414,28 @@ router.post(
     ]),
     blog.createBlogPost
 );
-router.patch('/blog/:id',   superAdminFull, validate([blogId]), blog.updateBlogPost);
-router.delete('/blog/:id',  superAdminFull, validate([blogId]), blog.deleteBlogPost);
-router.post('/blog/cover',  superAdminFull, upload.single('image'), blog.uploadBlogCover);
+router.patch('/blog/:id',   superAdminOrModule('blog'), validate([blogId]), blog.updateBlogPost);
+router.delete('/blog/:id',  superAdminOrModule('blog'), validate([blogId]), blog.deleteBlogPost);
+router.post('/blog/cover',  superAdminOrModule('blog'), upload.single('image'), blog.uploadBlogCover);
+
+// ═══════════════ PLATFORM STAFF (delegated portal users) ════════════════
+// Full super admin only. Platform staff are denied here by platformStaffGate
+// (not in the module catalog). PLATFORM_STAFF_PLAN.md.
+const platformStaff = require('../controllers/superadmin/platformStaff');
+const staffId = objectIdParam('id', 'Invalid team member id');
+router.get('/platform-staff/modules', superAdminFull, platformStaff.listModules);   // before /:id
+router.get('/platform-staff',         superAdminFull, platformStaff.listStaff);
+router.post('/platform-staff',        superAdminFull, platformStaff.createStaff);
+router.get('/platform-staff/:id',                 superAdminFull, validate([staffId]), platformStaff.getStaff);
+router.patch('/platform-staff/:id',               superAdminFull, validate([staffId]), platformStaff.updateStaff);
+router.post('/platform-staff/:id/reset-password', superAdminFull, validate([staffId]), platformStaff.resetStaffPassword);
+router.get('/platform-staff/:id/activity',        superAdminFull, validate([staffId]), platformStaff.staffActivity);
 
 // Super admin accounts are created exclusively via the seed script at
 // Backend/Seed/seedSuperAdmin.js — there is NO API surface to create or
 // list them. Keeping the accounts out of the UI prevents a compromised
 // full-level session from escalating by minting more full-level admins.
+// The platform-staff endpoints above can only mint LIMITED `platformstaff`
+// accounts (never a super admin), so that guarantee still holds.
 
 module.exports = router;

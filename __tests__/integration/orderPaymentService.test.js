@@ -172,7 +172,8 @@ describe('staff mark-paid ledger', () => {
         const order = await makeOrder(A, { user: cust._id });
 
         expect((await markPaid(A, order)).status).toBe(200);
-        expect((await markPaid(A, order)).status).toBe(200);
+        // Payments fix round 1 (2026-11): a settled order is frozen, a repeat settle is a 409.
+        expect((await markPaid(A, order)).status).toBe(409);
 
         expect(await ledger(order, 'points_earned')).toHaveLength(1);
         expect(await ledger(order, 'order_payment')).toHaveLength(1);

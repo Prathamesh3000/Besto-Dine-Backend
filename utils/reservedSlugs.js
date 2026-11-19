@@ -28,7 +28,7 @@ const APP_ROUTE_SEGMENTS = [
     'admin', 'bill-preview', 'bill', 'branch-selection', 'chef', 'customer',
     'force-change-password', 'health', 'home', 'kiosk', 'login',
     'notifications', 'otp', 'privacy', 'r', 'register-restaurant',
-    'request-demo', 'reset-password', 'scan', 'search', 'splash', 'staff-login',
+    'request-demo', 'reset-password', 'scan', 'search', 'splash', 'staff-login', 'start-trial',
     'superadmin', 'switch-restaurant', 'terms', 'trial-expired', 'unauthorized', 'waiter',
 ];
 

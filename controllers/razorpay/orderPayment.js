@@ -160,6 +160,15 @@ exports.createRazorpayOrder = async (req, res) => {
                     message: `Payment amount ₹${amount} does not cover the amount due ₹${due}.`,
                 });
             }
+            // Never let the client open a checkout above what is due (₹1
+            // rounding tolerance): the server owns the amount.
+            if (typeof ownedOrder.total === 'number' && amount > due + 1) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'AMOUNT_MISMATCH',
+                    message: `Payment amount ₹${amount} exceeds the amount due ₹${due}.`,
+                });
+            }
         }
 
         const options = {
@@ -297,6 +306,12 @@ exports.verifyPayment = async (req, res) => {
                 rzpPaymentId: razorpay_payment_id,
             });
         } else {
+            // A blank / missing key secret is a configuration error: an HMAC
+            // made with an empty key must never pass the signature gate.
+            if (!process.env.RAZORPAY_KEY_SECRET) {
+                logger.error('verifyPayment: RAZORPAY_KEY_SECRET is not configured');
+                return res.status(503).json({ success: false, message: 'Payment verification is temporarily unavailable' });
+            }
             const body = razorpay_order_id + '|' + razorpay_payment_id;
             const expectedSignature = crypto
                 .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)

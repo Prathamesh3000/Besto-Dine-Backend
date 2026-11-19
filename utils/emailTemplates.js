@@ -668,51 +668,99 @@ exports.customerPasswordReset = ({ customerName, resetUrl, restaurantName, expir
 };
 
 /**
- * Free-trial countdown reminder (7 / 3 / 1 days left).
- * Props: { restaurantName, ownerName, daysLeft, trialEndDate, upgradeUrl }
+ * Free-trial reminder (utils/trialReminderJob, plan §7). One template for
+ * the four reminder types:
+ *   t-3  trial ends in 3 days      t-1  trial ends tomorrow
+ *   t+0  trial ended, read-only    t+2  last day before the lock
+ * Props: { type, ownerName, restaurantName, daysLeft, trialEndDate, lockAt,
+ *          upgradeUrl, menuItemCount, staffCount, supportEmail, timezone }
+ * The trial length and the grace come from utils/trialLock (never literal
+ * numbers here). No unsubscribe: this is an account notice, not marketing.
  */
-exports.trialEndingSoon = ({ restaurantName, ownerName, daysLeft, trialEndDate, upgradeUrl }) => {
-    const dayWord = daysLeft === 1 ? 'day' : 'days';
-    const endText = trialEndDate ? new Date(trialEndDate).toUTCString().slice(0, 16) : '';
-    const subject = `Your BestoDine free trial ends in ${daysLeft} ${dayWord}`;
-    const html = simpleEmailHtml(subject, `
-        <h2 style="margin:0 0 12px;font-size:20px;">Hi ${escapeHtml(ownerName || 'there')},</h2>
-        <p style="margin:0 0 16px;">The free trial for <strong>${escapeHtml(restaurantName)}</strong> ends in
-        <strong>${daysLeft} ${dayWord}</strong>${endText ? ` (${escapeHtml(endText)})` : ''}.</p>
-        <p style="margin:0 0 16px;">Choose a plan now to keep taking orders without interruption. After the trial your account is paused, but your data stays safe.</p>
-        <p style="margin:0 0 16px;"><a href="${escapeHtml(upgradeUrl)}" style="display:inline-block;background-color:#FE8301;color:#FFFFFF;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:10px;">Choose a plan</a></p>
-        <p style="margin:0;font-size:13px;color:#8D848F;">Questions? Just reply to this email.</p>`);
-    const text = [
-        `Hi ${ownerName || 'there'},`,
-        '',
-        `The free trial for "${restaurantName}" ends in ${daysLeft} ${dayWord}${endText ? ` (${endText})` : ''}.`,
-        'Choose a plan now to keep taking orders without interruption. After the trial your account is paused, but your data stays safe.',
-        '',
-        `Choose a plan: ${upgradeUrl}`,
-        '',
-        '- The BestoDine Team',
-    ].join('\n');
-    return { subject, html, text };
-};
+exports.trialReminder = ({
+    type, ownerName, restaurantName, daysLeft, trialEndDate, lockAt, upgradeUrl,
+    menuItemCount, staffCount, supportEmail, timezone,
+}) => {
+    const { TRIAL_DAYS, TRIAL_READONLY_GRACE_DAYS, lockAtOf } = require('./trialLock');
+    const fmt = (d) => {
+        if (!d) return '';
+        const opts = { day: 'numeric', month: 'long', year: 'numeric' };
+        try {
+            return new Intl.DateTimeFormat('en-IN', { ...opts, timeZone: timezone || 'Asia/Kolkata' }).format(new Date(d));
+        } catch (_) {
+            return new Intl.DateTimeFormat('en-IN', { ...opts, timeZone: 'Asia/Kolkata' }).format(new Date(d));
+        }
+    };
+    const endText = fmt(trialEndDate);
+    const lockText = fmt(lockAt || lockAtOf(trialEndDate));
+    const days = Number.isFinite(Number(daysLeft)) ? Number(daysLeft) : null;
+    const graceWord = `${TRIAL_READONLY_GRACE_DAYS} day${TRIAL_READONLY_GRACE_DAYS === 1 ? '' : 's'}`;
+    const link = upgradeUrl || `${frontendUrl().replace(/\/+$/, '')}/admin/subscription`;
+    const support = supportEmail || process.env.EMAIL_FROM || '';
+    const name = restaurantName || 'your restaurant';
 
-/** Free trial ended (account locked, data kept). Props: { restaurantName, ownerName, upgradeUrl } */
-exports.trialEnded = ({ restaurantName, ownerName, upgradeUrl }) => {
-    const subject = `Your BestoDine free trial has ended - ${restaurantName}`;
+    let subject;
+    let lead;      // first paragraph (plain text; escaped for HTML below)
+    let detail;    // second paragraph
+    switch (type) {
+        case 't-3':
+            subject = `Your BestoDine trial ends in ${days} days - ${name}`;
+            lead = `The ${TRIAL_DAYS}-day free trial for ${name} ends in ${days} days, on ${endText}.`;
+            detail = `Upgrade before then and nothing changes for your team. After the trial your account becomes read-only for ${graceWord} and then locks; your data stays safe either way.`;
+            break;
+        case 't-1':
+            subject = `Your BestoDine trial ends tomorrow - ${name}`;
+            lead = `The free trial for ${name} ends tomorrow, ${endText}.`;
+            detail = `Upgrade today to keep taking orders without interruption. From tomorrow your account is read-only for ${graceWord}, and it locks on ${lockText}.`;
+            break;
+        case 't+0':
+            subject = `Your BestoDine trial has ended - ${name} is now read-only`;
+            lead = `The free trial for ${name} ended on ${endText}. Your account is read-only: you and your staff can still see everything, but nothing can be added or changed.`;
+            detail = `It locks completely on ${lockText}. Upgrade before then and everything is writable again at once. None of your data has been deleted.`;
+            break;
+        case 't+2':
+        default:
+            subject = `Last day before ${name} is locked on BestoDine`;
+            lead = `This is the last day before the account for ${name} locks on ${lockText}.`;
+            detail = `After that, only you (the owner) can sign in, to upgrade or export your data. Upgrade now and your restaurant keeps running with everything in place.`;
+            break;
+    }
+
+    const parts = [];
+    if (Number.isFinite(Number(menuItemCount)) && Number(menuItemCount) > 0) {
+        parts.push(`${menuItemCount} menu item${Number(menuItemCount) === 1 ? '' : 's'}`);
+    }
+    if (Number.isFinite(Number(staffCount)) && Number(staffCount) > 0) {
+        parts.push(`${staffCount} staff account${Number(staffCount) === 1 ? '' : 's'}`);
+    }
+    const setupLine = parts.length ? `You have ${parts.join(' and ')} set up - all of it stays exactly as it is when you upgrade.` : '';
+    const notice = 'This is an account notice for your BestoDine trial.';
+    const supportLine = support ? `Questions? Contact us at ${support}.` : '';
+
     const html = simpleEmailHtml(subject, `
         <h2 style="margin:0 0 12px;font-size:20px;">Hi ${escapeHtml(ownerName || 'there')},</h2>
-        <p style="margin:0 0 16px;">The free trial for <strong>${escapeHtml(restaurantName)}</strong> has ended, so ordering and the staff apps are paused.
-        <strong>None of your data was deleted</strong>: pick a plan and everything comes back instantly.</p>
-        <p style="margin:0 0 16px;"><a href="${escapeHtml(upgradeUrl)}" style="display:inline-block;background-color:#FE8301;color:#FFFFFF;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:10px;">Upgrade and restore access</a></p>
-        <p style="margin:0;font-size:13px;color:#8D848F;">You can still log in as the owner to upgrade or export your data.</p>`);
+        <p style="margin:0 0 16px;">${escapeHtml(lead)}</p>
+        <p style="margin:0 0 16px;">${escapeHtml(detail)}</p>
+        ${setupLine ? `<p style="margin:0 0 16px;">${escapeHtml(setupLine)}</p>` : ''}
+        <p style="margin:0 0 24px;"><a href="${escapeHtml(link)}" style="display:inline-block;background-color:#FE8301;color:#FFFFFF;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:10px;">Upgrade now</a></p>
+        ${supportLine ? `<p style="margin:0 0 8px;font-size:13px;color:#8D848F;">${escapeHtml(supportLine)}</p>` : ''}
+        <p style="margin:0;font-size:12px;color:#B0ACB5;">${escapeHtml(notice)}</p>`);
+
     const text = [
         `Hi ${ownerName || 'there'},`,
         '',
-        `The free trial for "${restaurantName}" has ended, so ordering and the staff apps are paused. None of your data was deleted: pick a plan and everything comes back instantly.`,
+        lead,
+        detail,
+        ...(setupLine ? [setupLine] : []),
         '',
-        `Upgrade: ${upgradeUrl}`,
+        `Upgrade now: ${link}`,
+        '',
+        ...(supportLine ? [supportLine] : []),
+        notice,
         '',
         '- The BestoDine Team',
     ].join('\n');
+
     return { subject, html, text };
 };
 
@@ -741,5 +789,32 @@ exports.renewalReminder = ({ restaurantName, ownerName, planName, billingCycle, 
         '',
         '- The BestoDine Team',
     ].join('\n');
+    return { subject, html, text };
+};
+
+/**
+ * Welcome email for a delegated platform-staff user (PLATFORM_STAFF_PLAN.md):
+ * login link, temporary password and the sections they were given.
+ *
+ * Props: { name, email, tempPassword, moduleLabels: string[] }
+ */
+exports.platformStaffWelcome = ({ name, email, tempPassword, moduleLabels = [] }) => {
+    const loginUrl = `${frontendUrl()}/staff-login`;
+    const subject = 'Your BestoDine team account';
+    const list = moduleLabels.map((l) => `<li>${escapeHtml(l)}</li>`).join('');
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1A181B;background:#F5F5F7;padding:24px;">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;padding:28px;">
+    <h2 style="margin:0 0 12px;">Hi ${escapeHtml(name || 'there')},</h2>
+    <p>You have been given access to the BestoDine team portal. You can open these sections:</p>
+    <ul>${list}</ul>
+    <p><strong>Sign in:</strong> <a href="${escapeHtml(loginUrl)}">${escapeHtml(loginUrl)}</a><br>
+       <strong>Email:</strong> ${escapeHtml(email || '')}<br>
+       <strong>Temporary password:</strong> <code>${escapeHtml(tempPassword || '')}</code></p>
+    <p>You will be asked to choose a new password the first time you sign in. Your activity in the portal is logged.</p>
+  </div>
+</body></html>`;
+    const text = `Hi ${name || 'there'},\n\nYou have been given access to the BestoDine team portal: ${moduleLabels.join(', ')}.\n\nSign in: ${loginUrl}\nEmail: ${email}\nTemporary password: ${tempPassword}\n\nYou will be asked to choose a new password the first time you sign in. Your activity in the portal is logged.\n`;
     return { subject, html, text };
 };

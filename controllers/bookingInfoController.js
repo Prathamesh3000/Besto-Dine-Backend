@@ -15,6 +15,16 @@ const { tenantFilter, tenantId, pinnedBranchId, strictBranchFilter, branchScopeC
 const { tenantInsertMany } = require('../utils/tenantSafe');
 const { parseCsv } = require('../utils/csvParser');
 const { sendServerError } = require('../utils/httpErrors');
+const { refOwned } = require('../utils/tenantRefs');
+
+// A body-supplied branch (tenant owner) must be a branch of this tenant.
+// Empty / null is allowed (tenant-level); a pinned admin's body.branch is ignored.
+const bodyBranchInvalid = async (req) => {
+  if (pinnedBranchId(req)) return false;
+  const b = req.body && req.body.branch;
+  if (b === undefined || b === null || b === '') return false;
+  return !(await refOwned(Branch, b, tenantId(req)));
+};
 
 /**
  * Branch filter for advance-booking catalog reads (Event Types,
@@ -187,6 +197,7 @@ exports.getParkingRates = async (req, res) => {
 // Event Types
 exports.createEventType = async (req, res) => {
   try {
+    if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
     // Pinned admin's event types are owned by their branch; tenant
     // owner may pass body.branch or leave null for tenant-level.
     const pinned = pinnedBranchId(req);
@@ -201,6 +212,7 @@ exports.createEventType = async (req, res) => {
 
 exports.updateEventType = async (req, res) => {
   try {
+    if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
     const { id } = req.params;
     const updateData = { ...req.body };
     delete updateData.restaurant;
@@ -241,6 +253,7 @@ const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 exports.createAddon = async (req, res) => {
     try {
+        if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
         const { title, slug, description, price, icon, category, options, isFeatured, isPopular, isActive } = req.body || {};
 
         if (!title || !String(title).trim()) {
@@ -304,6 +317,7 @@ exports.createAddon = async (req, res) => {
 
 exports.updateAddon = async (req, res) => {
     try {
+        if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
         const { id } = req.params;
         const updates = { ...req.body };
         // Strip fields the caller must never overwrite.
@@ -385,6 +399,7 @@ exports.getAdminAddons = async (req, res) => {
 // Packages
 exports.createPackage = async (req, res) => {
   try {
+    if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
     // Pinned admin owns the package at their branch; tenant owner may
     // pass body.branch explicitly or leave it null for tenant-level.
     const pinned = pinnedBranchId(req);
@@ -399,6 +414,7 @@ exports.createPackage = async (req, res) => {
 
 exports.updatePackage = async (req, res) => {
   try {
+    if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
     const { id } = req.params;
     const updateData = { ...req.body };
     delete updateData.restaurant;

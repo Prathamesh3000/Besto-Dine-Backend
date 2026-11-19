@@ -225,8 +225,9 @@ describe('staff wallet: POST /staff-wallet/withdraw', () => {
         const waiter = await staff(A, 'waiter');
         const res = await withdraw(waiter, { amount: 1, method: 'Cash' });
         expect(res.status).toBe(400);
-        // The wallet created inside the aborted transaction is rolled back.
-        expect(await StaffWallet.countDocuments({ user: waiter._id })).toBe(0);
+        // The (empty) wallet is created outside the money transaction, so it persists; nothing is debited.
+        expect(await StaffWallet.countDocuments({ user: waiter._id })).toBe(1);
+        expect((await walletOf(A, waiter)).balance).toBe(0);
     });
 
     // Regression (fixed 2026-10): requestWithdrawal refuses amounts below the model's ₹1 minimum with a 400 before any write.
@@ -243,9 +244,9 @@ describe('staff wallet: POST /staff-wallet/withdraw', () => {
         await fund(A, waiter, 1000);
         const results = await Promise.all(Array.from({ length: 6 }, () => withdraw(waiter, { amount: 300, method: 'Cash' })));
         const ok = results.filter((r) => r.status === 201);
-        expect(ok.length).toBeGreaterThanOrEqual(1);
-        expect(ok.length).toBeLessThanOrEqual(3);
-        results.filter((r) => r.status !== 201).forEach((r) => expect([400, 500]).toContain(r.status));
+        // Write conflicts are retried, so exactly floor(1000 / 300) = 3 succeed and the rest are clean 400s.
+        expect(ok.length).toBe(3);
+        results.filter((r) => r.status !== 201).forEach((r) => expect(r.status).toBe(400));
 
         const w = await walletOf(A, waiter);
         expect(w.balance).toBe(1000 - 300 * ok.length);
@@ -303,7 +304,10 @@ describe('staff wallet: admin approve / reject', () => {
 
     test('approve marks paid with txnRef + handler, leaves the balance alone, and is not repeatable', async () => {
         const { waiter, id } = await pending(400, 1000);
-        const res = await approve(A.users.admin, id, { txnRef: `  UTR-${'9'.repeat(120)}  ` });
+        // The validator measures the TRIMMED length (<= 100): a padded 100-char ref is accepted and stored trimmed.
+        const tooLong = await approve(A.users.admin, id, { txnRef: `  UTR-${'9'.repeat(120)}  ` });
+        expect(tooLong.status).toBe(400);
+        const res = await approve(A.users.admin, id, { txnRef: `  UTR-${'9'.repeat(96)}  ` });
         expect(res.status).toBe(200);
         const w = await StaffWithdrawal.findById(id).lean();
         expect(w.status).toBe('paid');

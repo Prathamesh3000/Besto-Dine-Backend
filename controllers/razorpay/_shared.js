@@ -20,6 +20,7 @@ const { createTipForPaidOrder } = require('../../utils/tipHelpers');
 const { releaseTableIfSettled } = require('../../utils/tableOccupancy');
 const { verifyTypedToken, TOKEN_TYPES } = require('../../middlewares/authMiddleware');
 const { roundPaise } = require('../../utils/orderRefund');
+const { notify } = require('../../services/notificationService');
 
 // Verified guest scan-session id from X-Scan-Token (never trusted raw).
 // Used to stamp / match the payer of a guest Razorpay checkout.
@@ -203,7 +204,11 @@ async function settleSplitSiblings(order, paymentMethod) {
         const dueOf = (o) => Math.max(0, (Number(o.total) || 0) - (Number(o.manualDiscount) || 0) - (Number(o.amountPaid) || 0));
         const needed = Math.max(0, (Number(order.total) || 0) - (Number(order.manualDiscount) || 0))
             + splits.reduce((s, o) => s + dueOf(o), 0);
-        const collected = Number(order.amountPaid) || 0;
+        // markOrderPaidAtomically caps amountPaid at the primary doc's own total
+        // and records the excess in overpaidAmount: the money actually collected
+        // for the whole checkout is amountPaid + overpaidAmount.
+        const tendered = (order.payments || []).reduce((n, p) => n + (Number(p.amount) || 0), 0);
+        const collected = Math.max((Number(order.amountPaid) || 0) + (Number(order.overpaidAmount) || 0), tendered);
         if (collected < roundPaise(needed) - 1) {
             logger.warn('Split checkout: payment covers only the primary order — linked split order(s) left unpaid', {
                 orderId: order.orderId,
@@ -261,14 +266,43 @@ async function markOrderPaidAtomically(order, { paymentId, razorpayOrderId, capt
     const total = roundPaise(order.total);
     const set = { paymentStatus: 'Paid', razorpayPaymentId: paymentId };
     if (razorpayOrderId) set.razorpayOrderId = razorpayOrderId;
+    // Revenue never exceeds the bill: a capture above what was due settles
+    // the due and the SURPLUS is recorded in overpaidAmount (flagged for the
+    // restaurant to refund) instead of inflating amountPaid.
+    let gross;
     if (priorPaid > 0 && priorPaid < total) {
         set.paymentMethod = 'mixed';
-        set.amountPaid = roundPaise(priorPaid + capturedAmount);
+        gross = roundPaise(priorPaid + capturedAmount);
         set.walletAmountPaid = priorPaid;
     } else {
         set.paymentMethod = 'online';
-        set.amountPaid = roundPaise(capturedAmount);
+        gross = roundPaise(capturedAmount);
     }
+    let surplus = roundPaise(gross - total);
+    // A mixed-cart checkout pays the whole bill against the primary doc: the
+    // part of the capture that covers its unpaid linked split doc(s) is not a
+    // surplus to refund (settleSplitSiblings marks them Paid).
+    if (surplus > 1) {
+        try {
+            // Same for the unpaid sibling rounds of an aggregated dine-in table
+            // bill (settleSiblingDineInRounds): their share is inside this capture.
+            const dineInSiblings = order.table && order.type === 'dine-in' && !order.holdReason;
+            const splits = await Order.find({
+                restaurant: order.restaurant,
+                $or: [
+                    { splitParent: order._id, status: { $ne: 'cancelled' }, paymentStatus: { $nin: ['Paid', 'Refunded'] } },
+                    ...(dineInSiblings ? [{
+                        table: order.table, _id: { $ne: order._id }, type: 'dine-in',
+                        status: { $in: ['new', 'preparing', 'ready', 'served'] }, paymentStatus: { $ne: 'Paid' },
+                    }] : []),
+                ],
+            }).select('total manualDiscount amountPaid').lean();
+            const splitDue = splits.reduce((n, o) => n + Math.max(0, (Number(o.total) || 0) - (Number(o.manualDiscount) || 0) - (Number(o.amountPaid) || 0)), 0);
+            if (splitDue > 0) surplus = Math.max(0, roundPaise(surplus - splitDue));
+        } catch { /* best-effort: fall back to the plain surplus */ }
+    }
+    set.amountPaid = surplus > 0 ? total : gross;
+    if (surplus > 1) set.overpaidAmount = surplus;
     set.paidAt = order.paidAt || paidAt || new Date();
     // Payment state block (Phase 4): verified path => 'paid'.
     Object.assign(set, paymentState.paidSet({
@@ -284,6 +318,25 @@ async function markOrderPaidAtomically(order, { paymentId, razorpayOrderId, capt
         update,
         { returnDocument: 'after' }
     );
+    if (paid && surplus > 1) {
+        logger.error('Overpaid capture: surplus above the bill needs a manual refund', {
+            orderId: paid.orderId, paymentId, total, captured: capturedAmount, surplus,
+        });
+        try {
+            await notify({
+                restaurant: paid.restaurant || null,
+                branch: paid.branch || null,
+                notification: {
+                    recipientRole: 'admin',
+                    title: 'Overpayment received',
+                    description: `Order ${paid.orderId} was paid ₹${surplus} more than its bill (payment ${paymentId}). Refund the surplus.`,
+                    category: 'Payment',
+                    priority: 'high',
+                    meta: { orderId: paid.orderId, amount: surplus },
+                },
+            });
+        } catch { /* flag is best-effort */ }
+    }
     // Webhook `order.paid` (one event per order, see webhookService.emitOrderPaid).
     if (paid) { try { require('../../utils/webhookService').emitOrderPaid(paid); } catch { /* never affects settlement */ } }
     // A pay-first order held from the kitchen until its payment was

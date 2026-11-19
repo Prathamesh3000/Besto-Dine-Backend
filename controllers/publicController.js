@@ -1,39 +1,43 @@
-const crypto = require('crypto');
 const Restaurant = require('../models/restaurant');
-const SubscriptionPlan = require('../models/subscriptionPlan');
-const User = require('../models/user');
-const AuditLog = require('../models/auditLog');
+const { isTrialLocked } = require('../utils/trialLock');
 const Branch = require('../models/branch');
 const Lead = require('../models/lead');
 const MarketingSetting = require('../models/marketingSetting');
 const logger = require('../utils/logger');
 const { publicFeaturesOf } = require('../utils/publicFeatureFlags');
 const { publicOperationsOf } = require('../utils/operationsProfile');
-const { createMainBranchFor } = require('../utils/createMainBranch');
-const { isReservedSlug, checkExplicitRestaurantSlug } = require('../utils/reservedSlugs');
+const { checkExplicitRestaurantSlug } = require('../utils/reservedSlugs');
 const mongoose = require('mongoose');
 const Settings = require('../models/settings');
-const { sendEmail } = require('../utils/email');
-const { signupApplicationReceived, signupAdminAlert, restaurantSelfSignupWelcome } = require('../utils/emailTemplates');
-const { resolveRecipients: resolveAlertRecipients } = require('../utils/alerts');
 const { isStrongPassword, STRONG_PASSWORD_MESSAGE } = require('../utils/passwordPolicy');
 const { normalizeMobile } = require('../utils/mobile');
 const { slugify, slugFromName, slugIssue, suggestSlugs } = require('../utils/signupSlug');
 const { getPublicPlans } = require('../utils/publicPlans');
+const { isBillingConfigured } = require('../utils/razorpayBilling');
+const { signupRequiresApproval, trialDaysForPlan } = require('../utils/selfSignup');
+// Everything a signup does after "this is a trial / free / paid tenant"
+// (slug, dedupe, snapshot, Restaurant + owner + branch, audit, emails,
+// session) is shared by registerRestaurant and startTrial.
 const {
-    SELF_SIGNUP_TRIAL_DAYS,
-    normalizeEmailForSignup,
-    normalizePhoneForSignup,
-    signupRequiresApproval,
-    findSignupDuplicate,
-} = require('../utils/selfSignup');
+    SignupError,
+    EMAIL_REGEX,
+    SIGNUP_PAYMENT_NOTE_TYPE,
+    START_TRIAL_EMAIL_IN_USE,
+    str,
+    signupModeForPlan,
+    resolveTrialPlan,
+    findPublicPlan,
+    assertNoSignupConflict,
+    razorpayClient,
+    signupCharge,
+    verifySignupPayment,
+    assertPaymentUnused,
+    buildSignupMeta,
+    completeSignup,
+    isCycle,
+} = require('./publicSignupShared');
 
-// ─── Shared validation helpers (mirrors superadminController) ──────────
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-// Plan a self-signup trials on (see registerRestaurant). Override per
-// deployment with SELF_SIGNUP_TRIAL_PLAN.
-const SELF_SIGNUP_TRIAL_PLAN_SLUG = process.env.SELF_SIGNUP_TRIAL_PLAN || 'gold';
-const SLUG_REGEX  = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+// ─── Shared helpers ─────────────────────────────────────────────────────
 
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -89,16 +93,17 @@ exports.listRestaurants = async (req, res) => {
                 filter.$or = [{ name: rx }, { city: rx }];
             }
             const rows = await Restaurant.find(filter)
-                .select('name slug city logo')
+                .select('name slug city logo subscription status')
                 .sort({ name: 1 })
                 .limit(limit)
                 .lean();
 
             res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+            const open = rows.filter((r) => !isTrialLocked(r));
             return res.status(200).json({
                 success: true,
-                count: rows.length,
-                data: rows.map((r) => ({
+                count: open.length,
+                data: open.map((r) => ({
                     name: r.name,
                     slug: r.slug,
                     city: r.city || '',
@@ -107,12 +112,12 @@ exports.listRestaurants = async (req, res) => {
             });
         }
 
-        const restaurants = await Restaurant.find({
+        const restaurants = (await Restaurant.find({
             status: { $in: ['active', 'trial'] },
         })
-            .select('name slug city contactPhone logo branding createdAt subscription featureOverrides addons operations')
+            .select('name slug status city contactPhone logo branding createdAt subscription featureOverrides addons operations')
             .sort({ name: 1 })
-            .lean();
+            .lean()).filter((r) => !isTrialLocked(r));
 
         res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
         return res.status(200).json({
@@ -152,9 +157,9 @@ exports.getRestaurantBySlug = async (req, res) => {
         const restaurant = await Restaurant.findOne({
             slug: String(slug).toLowerCase().trim(),
             status: { $in: ['active', 'trial'] },
-        }).select('name slug city contactPhone logo branding subscription featureOverrides addons operations').lean();
+        }).select('name slug status city contactPhone logo branding subscription featureOverrides addons operations').lean();
 
-        if (!restaurant) {
+        if (!restaurant || isTrialLocked(restaurant)) {
             return res.status(404).json({ success: false, message: 'Restaurant not found' });
         }
 
@@ -208,8 +213,8 @@ exports.getRestaurantBranches = async (req, res) => {
         const tenant = await Restaurant.findOne({
             slug: String(slug).toLowerCase().trim(),
             status: { $in: ['active', 'trial'] },
-        }).select('_id name').lean();
-        if (!tenant) {
+        }).select('_id name status subscription').lean();
+        if (!tenant || isTrialLocked(tenant)) {
             return res.status(200).json({ success: true, data: [] });
         }
 
@@ -249,45 +254,38 @@ exports.getRestaurantBranches = async (req, res) => {
 };
 
 /**
- * POST /api/v1/public/register-restaurant   (Phase 5 step 2)
+ * POST /api/v1/public/register-restaurant   (Phase 5 step 2, plan §5)
  *
- * Self-service tenant signup. Unauthenticated endpoint that creates a
- * Restaurant + owner User in one atomic-ish operation. The owner
- * supplies their own password during signup. INSTANT START (default): the
- * tenant is created `status: 'trial'` with a 14-day Gold trial that starts
- * now, and the response logs the owner in (201 + tokens). With
- * SELF_SIGNUP_REQUIRE_APPROVAL=true the old flow is used: the tenant stays
- * suspended (signupStatus 'pending') until a Super Admin approves it, and
- * staff login answers 403 SIGNUP_PENDING until then (202, no tokens).
+ * Self-service tenant signup from the multi-step form (details, optional
+ * plan, payment for a paid plan). Unauthenticated; creates Restaurant +
+ * owner User + Main branch in one request through publicSignupShared.
+ * The owner supplies their own password.
  *
- * Flow:
- *   1. Validate input (restaurantName, ownerName, contactEmail, 10-digit
- *      mobile, city, strong password — utils/passwordPolicy,
- *      acceptTerms === true, optional public planId, source/utm)
- *   2. Resolve the trial plan (Gold, or SELF_SIGNUP_TRIAL_PLAN)
- *   3. Conflict check: slug uniqueness, email + phone uniqueness
- *      (aliases normalised - utils/selfSignup)
- *   4. Create Restaurant with N-day trial (default 14)
- *   5. Create owner User (role: 'admin') with user-supplied password
- *   6. Link owner → restaurant
- *   7. Write a system audit entry (actor=null, role=system)
- *   8. Fire-and-forget welcome email (instant) or "application received"
- *      email (approval mode) to the owner and a new-signup alert to Super
- *      Admins
- *   9. Instant: 201 { success, data: { ..., signupStatus: 'approved',
- *      trialStarted: true, autoLogin: true, trialStartDate, trialEndDate },
- *      ...login body (user payload + tenant, token, refreshToken) }.
- *      Approval mode: 202 { restaurant, owner, signupStatus: 'pending',
- *      pageUrl, message } — NOT a token; after approval the owner logs in
- *      at /staff-login.
+ * What the chosen plan decides (TRIAL_SIGNUP_AND_LEADS_PLAN.md §5):
+ *   - no planId ("decide later") → trial on the default trial plan
+ *     (TRIAL_PLAN_SLUG / SELF_SIGNUP_TRIAL_PLAN, default Gold), 14 days or
+ *     the plan's own trial length; registrationSource 'self_service_trial'
+ *   - trial-enabled plan → trial on THAT plan, same as /start-trial
+ *   - free plan (price 0, tier < 30) → status 'active', no trial dates,
+ *     registrationSource 'self_service'
+ *   - paid plan (sells a cycle, tier < 30) → `payment` is required
+ *     ({ razorpayOrderId, razorpayPaymentId, razorpaySignature } from the
+ *     /public/register-order checkout) and is verified server-side
+ *     (signature, order, status, INR, notes, amount ±100 paise → else 400
+ *     PAYMENT_MISMATCH; reused payment → 409 PAYMENT_ALREADY_USED). The
+ *     tenant starts 'active' with price / billingCycle / lastChargedAt /
+ *     currentPeriodEnd and a SubscriptionInvoice; registrationSource
+ *     'self_service'
+ *   - Contact-Sales plan (tier >= 30) → 400 PLAN_NOT_SELF_SERVE
  *
- * Anti-abuse: the route this handler is mounted on carries a dedicated
- * rate limiter (server.js: `signupLimiter` — 3 requests per hour per
- * IP) so the cost of spam is bounded even if a bot finds the endpoint.
+ * INSTANT START (default): the tenant is usable at once and the response
+ * logs the owner in (201 + session). With SELF_SIGNUP_REQUIRE_APPROVAL=true
+ * every path instead creates a pending signup (tenant 'suspended',
+ * signupStatus 'pending', 202, no tokens) until a Super Admin approves it.
  *
- * Audit shape (mirror of the Razorpay webhook + alerts pattern):
- *   { actor: null, actorEmail: 'self-signup', actorRole: 'system',
- *     action: 'restaurant.self_signup', targetType: 'restaurant', ... }
+ * Anti-abuse: `signupLimiter` on the route (SIGNUP_RATE_LIMIT_PER_HOUR,
+ * default 3 successful signups per hour per IP); email + phone dedupe with
+ * gmail alias folding (utils/selfSignup).
  */
 exports.registerRestaurant = async (req, res) => {
     try {
@@ -301,12 +299,13 @@ exports.registerRestaurant = async (req, res) => {
             password,
             planId,
             acceptTerms,
+            billingCycle,
+            payment,
         } = body;
 
         const fail = (status, field, message, code) => res.status(status).json({
             success: false, ...(field ? { field } : {}), ...(code ? { code } : {}), message,
         });
-        const str = (v) => (typeof v === 'string' ? v.trim() : '');
 
         // ── Validation ─────────────────────────────────────────────────
         // Length caps below are deliberately ≤ Branch schema caps so the
@@ -344,376 +343,309 @@ exports.registerRestaurant = async (req, res) => {
             return fail(400, 'acceptTerms', 'Please accept the Terms of Service and Privacy Policy to continue.', 'TERMS_REQUIRED');
         }
 
-        // ── Optional requested plan (informational — billing NOT activated) ──
-        let requestedPlan = null;
+        // ── Chosen plan → signup mode ──────────────────────────────────
+        let chosenPlan = null;
         if (planId !== undefined && planId !== null && planId !== '') {
             if (typeof planId !== 'string' || !mongoose.isValidObjectId(planId)) {
                 return fail(400, 'planId', 'Please choose a valid plan', 'INVALID_PLAN');
             }
-            // AUDIT-EXEMPT: platform-global plan catalogue.
-            requestedPlan = await SubscriptionPlan.findOne({ _id: planId, isPublic: true, isActive: true })
-                .select('name slug').lean();
-            if (!requestedPlan) return fail(400, 'planId', 'Please choose a valid plan', 'INVALID_PLAN');
+            chosenPlan = await findPublicPlan(planId);
+            if (!chosenPlan) return fail(400, 'planId', 'Please choose a valid plan', 'INVALID_PLAN');
         }
 
+        let mode = 'trial';
+        let plan = chosenPlan;
+        let cycle;
+        let verifiedPayment = null;
+        if (chosenPlan) {
+            mode = signupModeForPlan(chosenPlan);
+            if (!mode) {
+                return fail(400, 'planId',
+                    `${chosenPlan.name} is set up with our sales team. Please contact us and we will get you started.`,
+                    'PLAN_NOT_SELF_SERVE');
+            }
+            if (mode === 'paid') {
+                cycle = billingCycle === undefined || billingCycle === null || billingCycle === '' ? 'monthly' : billingCycle;
+                if (!isCycle(cycle) || signupCharge(chosenPlan, cycle) === null) {
+                    return fail(400, 'billingCycle', 'Please choose a billing cycle offered on this plan.', 'INVALID_CYCLE');
+                }
+                if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
+                    return fail(400, 'payment', `${chosenPlan.name} is a paid plan — please complete the payment to continue.`, 'PAYMENT_REQUIRED');
+                }
+            }
+        } else {
+            // "Decide later": today's behaviour — a trial on the default
+            // trial plan. Enterprise is priced 0 because it is quoted, so
+            // the legacy fallback never picks it by cheapest-first alone.
+            plan = await resolveTrialPlan({ legacyFallback: true });
+            if (!plan) {
+                logger.error('public.registerRestaurant: no active subscription plans found');
+                return res.status(503).json({
+                    success: false,
+                    message: 'Self-service signup is temporarily unavailable. Please contact support.',
+                });
+            }
+        }
+        // Dedupe happens BEFORE the payment is checked so a duplicate email
+        // never gets as far as consuming a payment id.
+        const needsApproval = signupRequiresApproval();
+        const registrationSource = mode === 'trial' ? 'self_service_trial' : 'self_service';
         const signupMeta = buildSignupMeta(body, { ownerName: cleanOwner, ip: req.ip });
 
-        // ── Resolve default plan ───────────────────────────────────────
-        // The trial plan is Gold ("14 days of Gold", PRICING_PACKAGING §3;
-        // SELF_SIGNUP_TRIAL_PLAN overrides). No 'free' slug lookup — a stray
-        // plan named free must never decide what every trial gets. Fallback:
-        // the cheapest active plan that has a list price. Enterprise is priced
-        // 0 because it is quoted, so a plain cheapest-first pick handed
-        // every trial the full Enterprise module set. If no plans exist at
-        // all, the platform isn't set up yet — 503 and let the operator know.
-        let plan = await SubscriptionPlan.findOne({ slug: SELF_SIGNUP_TRIAL_PLAN_SLUG, isActive: true });
-        if (!plan) {
-            plan = await SubscriptionPlan.findOne({ isActive: true, price: { $gt: 0 } }).sort({ price: 1 });
-        }
-        if (!plan) {
-            plan = await SubscriptionPlan.findOne({ isActive: true }).sort({ price: 1 });
-        }
-        if (!plan) {
-            logger.error('public.registerRestaurant: no active subscription plans found');
-            return res.status(503).json({
-                success: false,
-                message: 'Self-service signup is temporarily unavailable. Please contact support.',
-            });
-        }
-
-        // ── Slug generation + uniqueness ───────────────────────────────
+        // ── Explicit slug (optional) ───────────────────────────────────
         // Reserved slugs (utils/reservedSlugs.js) would collide with a
         // top-level frontend route at /<slug>: an explicit one is refused
-        // (400 SLUG_RESERVED), a generated one is auto-suffixed exactly
-        // like a uniqueness collision.
-        let slug;
+        // (400 SLUG_RESERVED); a generated one is auto-suffixed instead.
+        let explicitSlug = null;
         if (body.slug !== undefined && body.slug !== null && body.slug !== '') {
             const checked = checkExplicitRestaurantSlug(body.slug);
             if (checked.error) {
                 return fail(checked.error.status, 'slug', checked.error.message, checked.error.code);
             }
-            slug = checked.slug;
-            if (await Restaurant.exists({ slug })) {
+            explicitSlug = checked.slug;
+            if (await Restaurant.exists({ slug: explicitSlug })) {
                 return fail(409, 'slug', 'This restaurant URL is already taken. Please choose another.', 'SLUG_TAKEN');
             }
-        } else {
-            slug = slugFromName(cleanName);
-            if (!SLUG_REGEX.test(slug) || slug.length < 2) {
-                slug = `restaurant-${crypto.randomBytes(3).toString('hex')}`;
-            }
-            if (isReservedSlug(slug) || await Restaurant.exists({ slug })) {
-                slug = `${slug}-${crypto.randomBytes(2).toString('hex')}`;
-            }
         }
 
-        // ── Email uniqueness ───────────────────────────────────────────
-        // Any existing user with this email (customer, staff at another
-        // tenant, super admin) blocks self-signup — the owner must log in
-        // or pick another email. Same restaurant name + city is fine:
-        // the slug differs.
-        const existingUser = await User.exists({ email: cleanEmail });
-        if (existingUser) {
-            return fail(409, 'contactEmail',
-                'An account with this email already exists. Log in or use another email.', 'EMAIL_IN_USE');
+        // ── Email / phone uniqueness (one trial per person) ────────────
+        await assertNoSignupConflict({ email: cleanEmail, phone: cleanPhone });
+
+        // ── Paid plan: verify the payment, refuse a reused one ─────────
+        if (mode === 'paid') {
+            await assertPaymentUnused(str(payment.razorpayPaymentId));
+            verifiedPayment = await verifySignupPayment({ plan, cycle, payment });
         }
 
-        // One trial per person: a Gmail dot/+tag alias of a registered
-        // email, or a phone already on a restaurant, is refused.
-        const duplicate = await findSignupDuplicate(Restaurant, { email: cleanEmail, phone: cleanPhone });
-        if (duplicate) return fail(409, duplicate.field, duplicate.message, duplicate.code);
-
-        // ── Build subscription snapshot ────────────────────────────────────────
-        // Instant start: the 14-day clock starts NOW and the tenant is live.
-        // Approval mode (SELF_SIGNUP_REQUIRE_APPROVAL=true): the dates are
-        // provisional — approveSignup restarts the trial from the approval
-        // date and the tenant stays suspended until then.
-        const needsApproval = signupRequiresApproval();
-        const TRIAL_DAYS = SELF_SIGNUP_TRIAL_DAYS;
-        const startDate = new Date();
-        const trialEndDate = new Date(startDate.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
-
-        const snapshot = {
-            plan: plan._id,
-            planName: plan.name,
-            planSlug: plan.slug,
-            features: plan.features
-                ? (plan.features.toObject ? plan.features.toObject() : { ...plan.features })
-                : {},
-            limits: plan.limits
-                ? (plan.limits.toObject ? plan.limits.toObject() : { ...plan.limits })
-                : {},
-            startDate,
-            endDate: null,
-            trialStartDate: startDate,
-            trialEndDate,
-            status: 'trial',
-        };
-
-        // ── Create restaurant ──────────────────────────────────────
-        // signupSource='self' tags it as a self-service signup. Instant start:
-        // status 'trial' + signupStatus 'approved', usable at once (the Super
-        // Admin can still suspend it later). Approval mode: signupStatus
-        // 'pending' lands it in the Pending Approvals queue and
-        // status='suspended' keeps staff locked out until the operator clicks
-        // Approve (staff login answers 403 SIGNUP_PENDING meanwhile).
-        let restaurant;
-        try {
-            restaurant = await Restaurant.create({
-                name: cleanName,
-                slug,
-                contactEmail: cleanEmail,
-                contactPhone: cleanPhone,
-                contactEmailNormalized: normalizeEmailForSignup(cleanEmail),
-                contactPhoneNormalized: normalizePhoneForSignup(cleanPhone),
-                city: cleanCity,
-                ...(needsApproval ? {
-                    status: 'suspended',
-                    signupStatus: 'pending',
-                    suspendedAt: new Date(),
-                    suspendedReason: 'Awaiting Super Admin approval',
-                } : {
-                    status: 'trial',
-                    signupStatus: 'approved',
-                    signupReviewedAt: startDate,
-                }),
-                signupSource: 'self',
-                subscription: snapshot,
-                ...(requestedPlan ? {
-                    requestedPlan: { plan: requestedPlan._id, planName: requestedPlan.name, planSlug: requestedPlan.slug },
-                } : {}),
-                signupMeta,
-            });
-        } catch (createErr) {
-            // A concurrent duplicate signup lost the race on a unique index.
-            if (createErr?.code === 11000) {
-                const key = Object.keys(createErr.keyPattern || {})[0] || '';
-                if (key === 'contactPhoneNormalized') {
-                    return fail(409, 'contactPhone',
-                        'A restaurant is already registered with this mobile number. Log in or use another number.', 'PHONE_IN_USE');
-                }
-                if (key === 'slug') {
-                    return fail(409, 'slug', 'This restaurant URL is already taken. Please choose another.', 'SLUG_TAKEN');
-                }
-                return fail(409, 'contactEmail',
-                    'An account with this email already exists. Log in or use another email.', 'EMAIL_IN_USE');
-            }
-            throw createErr;
-        }
-
-        // ── Create owner user ──────────────────────────────────────────
-        // Roll back the restaurant if user creation fails, so we don't
-        // leave a dangling tenant with no owner.
-        let ownerUser;
-        try {
-            ownerUser = await User.create({
-                name: cleanOwner,
-                email: cleanEmail,
-                password, // hashed by the userSchema.pre('save') hook
-                mobile: cleanPhone,
-                role: 'admin',
-                restaurant: restaurant._id,
-                // CRIT-06 — THIS user is the tenant owner. Sub-admins
-                // created later via /staff leave this at its default (false).
-                isTenantOwner: true,
-                mustChangePassword: false, // they chose this password themselves
-                status: 'active',
-            });
-            restaurant.owner = ownerUser._id;
-            await restaurant.save();
-        } catch (innerErr) {
-            await Restaurant.findByIdAndDelete(restaurant._id).catch(() => {});
-            if (innerErr?.code === 11000) {
-                return fail(409, 'contactEmail',
-                    'An account with this email already exists. Log in or use another email.', 'EMAIL_IN_USE');
-            }
-            throw innerErr;
-        }
-
-        // ── Auto-provision the "Main" branch ──────────────────────────
-        // Failure here is non-fatal: the backfill script can be re-run
-        // to repair the tenant later.
-        try {
-            await createMainBranchFor(restaurant, ownerUser._id);
-        } catch (branchErr) {
-            logger.error(`public.registerRestaurant: createMainBranchFor failed for ${restaurant.slug}: ${branchErr.message}`);
-        }
-
-        // ── Audit entry (system actor — no req.user available) ────────
-        try {
-            await AuditLog.create({
-                actor: null,
-                actorEmail: 'self-signup',
-                actorRole: 'system',
-                action: 'restaurant.self_signup',
-                targetType: 'restaurant',
-                targetId: restaurant._id,
-                targetName: restaurant.name,
-                details: {
-                    plan: plan.slug,
-                    requestedPlan: requestedPlan?.slug || '',
-                    trialDays: TRIAL_DAYS,
-                    instantStart: !needsApproval,
-                    ownerEmail: cleanEmail,
-                    source: signupMeta.source,
-                },
-                ip: req.ip || req.headers['x-forwarded-for'] || '',
-                userAgent: req.headers['user-agent'] || '',
-            });
-        } catch (auditErr) {
-            logger.warn(`self-signup audit write failed: ${auditErr.message}`);
-        }
-
-        // ── Notifications (fire-and-forget) ───────────────────────────
-        // Owner: "Application received". Super Admins: new signup alert.
-        // The welcome / "you can log in" email goes out on approval.
-        notifySignupReceived({
-            restaurant,
+        return await completeSignup(req, res, {
+            name: cleanName,
+            email: cleanEmail,
+            phone: cleanPhone,
+            city: cleanCity,
             ownerName: cleanOwner,
-            requestedPlanName: requestedPlan?.name || '',
-            source: signupMeta.source || signupMeta.utmSource,
-            instant: !needsApproval,
-            trialDays: TRIAL_DAYS,
-        });
-
-        const pageUrl = `${frontendBase()}/${restaurant.slug}`;
-
-        if (!needsApproval) {
-            logger.info(`self-signup TRIAL STARTED ${restaurant.slug} (${cleanEmail})`);
-            const message = `Welcome to BestoDine! Your ${TRIAL_DAYS}-day free trial of ${plan.name} has started.`;
-            // Same body a login returns (user + tenant snapshot + token /
-            // refreshToken, or cookie-auth hints) so the SPA can sign the
-            // owner in without a second request. A session failure must not
-            // lose the signup: the owner can still log in at /staff-login.
-            let session = {};
-            try {
-                session = await require('./authController').issueSignupSession(req, res, ownerUser);
-            } catch (sessErr) {
-                logger.warn(`self-signup auto-login failed for ${restaurant.slug}: ${sessErr.message}`);
-            }
-            return res.status(201).json({
-                success: true,
-                data: {
-                    restaurant: { _id: restaurant._id, name: restaurant.name, slug: restaurant.slug },
-                    owner: { _id: ownerUser._id, name: ownerUser.name, email: ownerUser.email },
-                    signupStatus: 'approved',
-                    trialStarted: true,
-                    autoLogin: !!(session.token || session.cookieAuth),
-                    trialStartDate: startDate,
-                    trialEndDate,
-                    trialDays: TRIAL_DAYS,
-                    planName: plan.name,
-                    pageUrl,
-                    requestedPlan: requestedPlan ? { _id: requestedPlan._id, name: requestedPlan.name } : null,
-                    message,
-                },
-                message,
-                ...session,
-            });
-        }
-
-        logger.info(`self-signup PENDING ${restaurant.slug} (${cleanEmail})`);
-        const message = `Thanks for signing up! Your application is being reviewed — usually within 1 business day. We'll email ${cleanEmail} once it's approved.`;
-        return res.status(202).json({
-            success: true,
-            data: {
-                restaurant: {
-                    _id: restaurant._id,
-                    name: restaurant.name,
-                    slug: restaurant.slug,
-                },
-                owner: {
-                    _id: ownerUser._id,
-                    name: ownerUser.name,
-                    email: ownerUser.email,
-                },
-                signupStatus: 'pending',
-                pageUrl,
-                requestedPlan: requestedPlan ? { _id: requestedPlan._id, name: requestedPlan.name } : null,
-                message,
-            },
-            message,
+            password,
+            slug: explicitSlug,
+            plan,
+            mode,
+            cycle,
+            payment: verifiedPayment,
+            needsApproval,
+            // The chosen plan IS the plan on every path now; requestedPlan
+            // stays populated for the Pending Approvals queue + alert mail.
+            requestedPlan: chosenPlan ? { _id: chosenPlan._id, name: chosenPlan.name, slug: chosenPlan.slug } : null,
+            signupMeta,
+            registrationSource,
+            logTag: 'self-signup',
         });
     } catch (err) {
+        if (err instanceof SignupError) return err.send(res);
         logger.error('public.registerRestaurant error: ' + err.message);
         return res.status(500).json({ success: false, message: 'Failed to register restaurant' });
     }
 };
 
-function frontendBase() {
-    return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
-}
+/**
+ * POST /api/v1/public/start-trial   (plan §4)
+ *
+ * Why a separate route from /register-restaurant:
+ *   - different funnel: one short form (name, your name, email, mobile,
+ *     password) instead of the multi-step details → plan → payment flow;
+ *   - different trust model: the client sends NO plan, price or trial
+ *     length — the server decides all three (TRIAL_PLAN_SLUG, the plan's
+ *     trial.durationDays, SELF_SIGNUP_TRIAL_DAYS);
+ *   - different guards: its own rate limit (`public-start-trial`,
+ *     TRIAL_START_LIMIT_PER_HOUR), its own dedupe messages
+ *     ("This email already has an account. Please sign in.");
+ *   - different data: registrationSource 'self_service_trial' for
+ *     analytics, the trial lifecycle and the Signup Leads module;
+ *   - keeps /register-restaurant strict: a change to how trials start can
+ *     never loosen the payment validation on the paid path.
+ *
+ * Body: { orgName, email, phone?, adminName, adminPassword }
+ * (restaurantName / contactEmail / contactPhone / ownerName / password
+ * are accepted as aliases). Password ≥ 8 characters.
+ *
+ * Plan: TRIAL_PLAN_SLUG → legacy SELF_SIGNUP_TRIAL_PLAN → first active
+ * public plan with trial.enabled by sortOrder → 503 TRIAL_UNAVAILABLE.
+ * Trial length: plan.trial.durationDays when enabled and > 0, else 14.
+ *
+ * Response: identical in shape to the instant /register-restaurant
+ * response (201 + session). With SELF_SIGNUP_REQUIRE_APPROVAL=true the
+ * same pending signup is created (202, no session) — the approval gate is
+ * never bypassed by this route.
+ */
+exports.startTrial = async (req, res) => {
+    try {
+        const body = req.body || {};
+        const fail = (status, field, message, code) => res.status(status).json({
+            success: false, ...(field ? { field } : {}), ...(code ? { code } : {}), message,
+        });
+        const first = (...keys) => {
+            for (const k of keys) {
+                if (body[k] !== undefined && body[k] !== null && body[k] !== '') return body[k];
+            }
+            return undefined;
+        };
 
-const META_MAX = 100;
-const metaStr = (v) => (typeof v === 'string' ? v.trim().slice(0, META_MAX) : '');
+        const orgName = str(first('orgName', 'restaurantName'));
+        if (!orgName) return fail(400, 'orgName', 'Restaurant name is required');
+        if (orgName.length < 2) return fail(400, 'orgName', 'Restaurant name must be at least 2 characters');
+        if (orgName.length > 80) return fail(400, 'orgName', 'Restaurant name cannot exceed 80 characters');
+
+        const adminName = str(first('adminName', 'ownerName'));
+        if (!adminName) return fail(400, 'adminName', 'Your name is required');
+        if (adminName.length > 80) return fail(400, 'adminName', 'Your name cannot exceed 80 characters');
+
+        const email = str(first('email', 'contactEmail')).toLowerCase();
+        if (!email || !EMAIL_REGEX.test(email)) return fail(400, 'email', 'A valid email address is required');
+        if (email.length > 120) return fail(400, 'email', 'Email cannot exceed 120 characters');
+
+        const rawPhone = first('phone', 'contactPhone');
+        let phone = '';
+        if (rawPhone !== undefined && str(String(rawPhone)) !== '') {
+            phone = normalizeMobile(rawPhone);
+            if (!phone) return fail(400, 'phone', 'Please enter a valid 10-digit mobile number');
+        }
+
+        const password = first('adminPassword', 'password');
+        if (typeof password !== 'string' || !password) return fail(400, 'adminPassword', 'Password is required');
+        if (password.length < 8) return fail(400, 'adminPassword', 'Password must be at least 8 characters', 'WEAK_PASSWORD');
+        if (password.length > 128) return fail(400, 'adminPassword', 'Password cannot exceed 128 characters', 'WEAK_PASSWORD');
+
+        // ── Server-chosen plan + length ───────────────────────────────
+        const plan = await resolveTrialPlan();
+        if (!plan) {
+            logger.error('public.startTrial: no trial plan available (TRIAL_PLAN_SLUG / trial.enabled)');
+            return fail(503, null, 'Free trials are temporarily unavailable', 'TRIAL_UNAVAILABLE');
+        }
+        const trialDays = trialDaysForPlan(plan);
+
+        // ── Dedupe ───────────────────────────────────────────────────
+        const fields = { email: 'email', phone: 'phone' };
+        await assertNoSignupConflict({ email, phone, emailMessage: START_TRIAL_EMAIL_IN_USE, fields });
+
+        const needsApproval = signupRequiresApproval();
+        const signupMeta = buildSignupMeta(body, { ownerName: adminName, ip: req.ip });
+
+        return await completeSignup(req, res, {
+            name: orgName,
+            email,
+            phone,
+            city: str(body.city).slice(0, 80),
+            ownerName: adminName,
+            password,
+            plan,
+            mode: 'trial',
+            trialDays,
+            needsApproval,
+            requestedPlan: null,
+            signupMeta,
+            registrationSource: 'self_service_trial',
+            emailMessage: START_TRIAL_EMAIL_IN_USE,
+            fields,
+            logTag: 'start-trial',
+        });
+    } catch (err) {
+        if (err instanceof SignupError) return err.send(res);
+        logger.error('public.startTrial error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to start your trial' });
+    }
+};
 
 /**
- * Marketing attribution from the signup body. Accepts `source` plus
- * either a `utm` object ({ source, medium, campaign, term, content }) or
- * flat `utm_source` / `utmSource` style keys. Strings only, each ≤ 100.
+ * POST /api/v1/public/register-order   { planId, billingCycle }   (plan §5)
+ *
+ * Razorpay order for the payment step of a PAID plan signup. The plan must
+ * be active, public, self-serve (tier < 30), sell the cycle, and not be
+ * trial-enabled (a trial-enabled plan starts a trial — the owner must not
+ * be charged for it). Amount = priceWithGst(priceForPlan(plan, cycle)),
+ * INR, notes { type: 'signup_plan_payment', planSlug, billingCycle } which
+ * registerRestaurant later checks against the request.
+ *
+ * → 200 { orderId, amount, currency, keyId, plan: { _id, slug, name },
+ *         billingCycle, baseAmount, gstAmount, gstRate }  (money in paise)
+ * → 503 BILLING_NOT_CONFIGURED when Razorpay keys are missing.
  */
-function buildSignupMeta(body, { ownerName, ip }) {
-    const utm = (body.utm && typeof body.utm === 'object' && !Array.isArray(body.utm)) ? body.utm : {};
-    const pick = (key) => metaStr(utm[key]) || metaStr(body[`utm_${key}`])
-        || metaStr(body[`utm${key[0].toUpperCase()}${key.slice(1)}`]);
-    return {
-        ownerName,
-        source: metaStr(body.source),
-        utmSource: pick('source'),
-        utmMedium: pick('medium'),
-        utmCampaign: pick('campaign'),
-        utmTerm: pick('term'),
-        utmContent: pick('content'),
-        termsAcceptedAt: new Date(),
-        ip: metaStr(ip || ''),
-    };
-}
+exports.createRegisterOrder = async (req, res) => {
+    try {
+        const { planId, billingCycle } = req.body || {};
+        const fail = (status, field, message, code) => res.status(status).json({
+            success: false, ...(field ? { field } : {}), ...(code ? { code } : {}), message,
+        });
 
-/** Owner "application received" + Super Admin alert. Never throws. */
-function notifySignupReceived({ restaurant, ownerName, requestedPlanName, source, instant = false, trialDays }) {
-    setImmediate(async () => {
-        try {
-            await sendEmail({
-                to: restaurant.contactEmail,
-                ...(instant
-                    ? restaurantSelfSignupWelcome({
-                        restaurantName: restaurant.name,
-                        ownerName,
-                        email: restaurant.contactEmail,
-                        planName: restaurant.subscription?.planName || '',
-                        trialDays,
-                        slug: restaurant.slug,
-                    })
-                    : signupApplicationReceived({
-                        restaurantName: restaurant.name,
-                        ownerName,
-                        email: restaurant.contactEmail,
-                        slug: restaurant.slug,
-                    })),
-            });
-        } catch (e) {
-            logger.warn(`self-signup application email failed for ${restaurant.contactEmail}: ${e.message}`);
+        if (typeof planId !== 'string' || !mongoose.isValidObjectId(planId)) {
+            return fail(400, 'planId', 'Please choose a valid plan', 'INVALID_PLAN');
         }
-        try {
-            // SUPERADMIN_ALERT_EMAILS (comma list), else every superadmin user.
-            const recipients = await resolveAlertRecipients();
-            const mail = signupAdminAlert({
-                restaurantName: restaurant.name,
-                slug: restaurant.slug,
-                ownerName,
-                email: restaurant.contactEmail,
-                phone: restaurant.contactPhone,
-                city: restaurant.city,
-                planName: requestedPlanName,
-                source,
-            });
-            for (const to of recipients) {
-                await sendEmail({ to, ...mail });
-            }
-        } catch (e) {
-            logger.warn(`self-signup superadmin alert failed for ${restaurant.slug}: ${e.message}`);
+        const plan = await findPublicPlan(planId);
+        if (!plan) return fail(400, 'planId', 'Please choose a valid plan', 'INVALID_PLAN');
+        const mode = signupModeForPlan(plan);
+        if (mode === 'trial') {
+            return fail(400, 'planId', `${plan.name} starts with a free trial — no payment is needed to sign up.`, 'PLAN_NOT_PAYABLE');
         }
-    });
-}
+        if (mode === 'free') {
+            return fail(400, 'planId', `${plan.name} is free — no payment is needed to sign up.`, 'PLAN_NOT_PAYABLE');
+        }
+        if (mode !== 'paid') {
+            return fail(400, 'planId', `${plan.name} is set up with our sales team. Please contact us.`, 'PLAN_NOT_SELF_SERVE');
+        }
+        const cycle = billingCycle === undefined || billingCycle === null || billingCycle === '' ? 'monthly' : billingCycle;
+        if (!isCycle(cycle)) return fail(400, 'billingCycle', 'Please choose a billing cycle offered on this plan.', 'INVALID_CYCLE');
+        const charge = signupCharge(plan, cycle);
+        if (!charge) return fail(400, 'billingCycle', 'Please choose a billing cycle offered on this plan.', 'INVALID_CYCLE');
+
+        if (!isBillingConfigured()) {
+            return res.status(503).json({
+                success: false,
+                code: 'BILLING_NOT_CONFIGURED',
+                message: 'Online payment is temporarily unavailable. Please try again later or contact support.',
+            });
+        }
+
+        let order;
+        try {
+            order = await razorpayClient().orders.create({
+                amount: charge.totalPaise,
+                currency: 'INR',
+                receipt: `s_${plan.slug.slice(0, 8)}_${Date.now()}`.slice(0, 40),
+                notes: {
+                    type: SIGNUP_PAYMENT_NOTE_TYPE,
+                    planSlug: plan.slug,
+                    planName: plan.name,
+                    billingCycle: cycle,
+                    basePaise: String(charge.basePaise),
+                    gstRate: String(charge.gstRate),
+                },
+            });
+        } catch (rzpErr) {
+            const description = (rzpErr && rzpErr.error && rzpErr.error.description) || (rzpErr && rzpErr.message) || 'Unknown error';
+            logger.error(`public.createRegisterOrder: orders.create failed for ${plan.slug}/${cycle}: ${description}`);
+            return res.status(502).json({
+                success: false,
+                code: 'BILLING_SETUP_FAILED',
+                message: 'We could not set up the payment with Razorpay. Please try again.',
+            });
+        }
+
+        res.set('Cache-Control', 'no-store');
+        return res.status(200).json({
+            success: true,
+            data: {
+                orderId: order.id,
+                amount: charge.totalPaise,
+                currency: 'INR',
+                keyId: process.env.RAZORPAY_KEY_ID,
+                plan: { _id: plan._id, slug: plan.slug, name: plan.name },
+                billingCycle: cycle,
+                baseAmount: charge.basePaise,
+                gstAmount: charge.gstPaise,
+                gstRate: charge.gstRate,
+            },
+        });
+    } catch (err) {
+        logger.error('public.createRegisterOrder error: ' + err.message);
+        return res.status(500).json({ success: false, message: 'Failed to start the payment' });
+    }
+};
 
 /**
  * GET /api/v1/public/slug-availability?slug=<s>&name=<restaurantName>[&city=<c>]

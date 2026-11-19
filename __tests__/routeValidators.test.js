@@ -236,6 +236,11 @@ describe('inventory / hall / combo', () => {
     table(appFor('../routes/inventoryRoute'), [
         ['create item', 'post', '/', { name: 'Tomato', category: 'Fruits & Vegetables', unit: 'kg', currentStock: 10, minStock: '2', costPerUnit: 30.5, expiryTracking: true }, 200],
         ['create item: stock negative', 'post', '/', { name: 'Tomato', currentStock: -1 }, 400],
+        ['create item: supplier as the form sends it', 'post', '/', { name: 'Tomato', supplier: { name: 'Fresh Co', contact: 'a@b.co' } }, 200],
+        ['create item: empty supplier fields', 'post', '/', { name: 'Tomato', supplier: { name: '', contact: '' } }, 200],
+        ['create item: supplier as a bare string', 'post', '/', { name: 'Tomato', supplier: 'Fresh Co' }, 400],
+        ['create item: supplier name not text', 'post', '/', { name: 'Tomato', supplier: { name: { $ne: 1 } } }, 400],
+        ['update item: supplier object', 'put', `/${OID}`, { supplier: { name: 'Fresh Co', contact: '' } }, 200],
         ['create item: name object', 'post', '/', { name: { $ne: 1 } }, 400],
         ['update bad id', 'put', '/x', { name: 'a' }, 400],
         ['adjust valid', 'patch', `/${OID}/adjust`, { type: 'restock', quantity: 5, reason: 'delivery' }, 200],

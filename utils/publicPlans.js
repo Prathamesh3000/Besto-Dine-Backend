@@ -18,6 +18,33 @@ function toPlain(v) {
     return v.toObject ? v.toObject() : { ...v };
 }
 
+/**
+ * `{ enabled, durationDays }` for any plan document — also for rows written
+ * before the `trial` object existed (derived from the legacy trialDays) and
+ * for lean rows where the sub-document has no defaults applied.
+ */
+function trialShape(p) {
+    const t = p?.trial && typeof p.trial === 'object' ? p.trial : null;
+    const legacyDays = Number(p?.trialDays) || 0;
+    const enabled = t && typeof t.enabled === 'boolean' ? t.enabled : legacyDays > 0;
+    const durationDays = t && Number.isFinite(Number(t.durationDays))
+        ? Number(t.durationDays)
+        : (legacyDays > 0 ? legacyDays : 14);
+    return { enabled, durationDays };
+}
+
+/** Numeric rank; 0 is valid, missing (pre-migration row) reads as 0. */
+function tierOf(p) {
+    const n = Number(p?.tier);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function highlightsOf(p) {
+    return Array.isArray(p?.highlights)
+        ? p.highlights.filter((h) => typeof h === 'string' && h.trim()).map((h) => h.trim())
+        : [];
+}
+
 function publicPlanShape(p) {
     const limits = toPlain(p.limits);
     const features = toPlain(p.features);
@@ -41,6 +68,12 @@ function publicPlanShape(p) {
         currency: p.currency || 'INR',
         billingCycle: p.billingCycle,
         trialDays: p.trialDays || 0,
+        // Card fields (TRIAL_SIGNUP_AND_LEADS_PLAN §2): rank for upgrade /
+        // downgrade and the "Contact Sales" CTA, trial switch, badge, bullets.
+        tier: tierOf(p),
+        trial: trialShape(p),
+        badge: typeof p.badge === 'string' ? p.badge : '',
+        highlights: highlightsOf(p),
         features,
         limits: {
             branches: limits.maxBranches ?? null,
@@ -54,7 +87,9 @@ function publicPlanShape(p) {
 
 async function loadPublicPlans() {
     // AUDIT-EXEMPT: platform-global plan catalogue — no tenant scope.
-    const plans = await SubscriptionPlan.find({ isPublic: true, isActive: true })
+    // Plans created before isPublic / isActive existed have no such field; the
+    // schema default for both is true, so only an explicit false hides a plan.
+    const plans = await SubscriptionPlan.find({ isPublic: { $ne: false }, isActive: { $ne: false } })
         .sort({ sortOrder: 1, price: 1, name: 1 })
         .lean();
     return plans.map(publicPlanShape);
@@ -70,6 +105,9 @@ const publicPlansCache = listCache.create({
 
 module.exports = {
     PUBLIC_PLANS_TTL_MS,
+    trialShape,
+    tierOf,
+    highlightsOf,
     publicPlanShape,
     loadPublicPlans,
     publicPlansCache,

@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const logger = require('../utils/logger');
 const idGen = require('../utils/idGenerator');
+const { parseStrictAmount } = require('../validators/money');
 
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const { releaseTableIfSettled } = require('../utils/tableOccupancy');
@@ -243,6 +244,7 @@ exports.getAdminWalletStats = async (req, res) => {
                  : s.lastType === 'points_earned'   ? 'Points +'
                  : s.lastType === 'points_redeemed' ? 'Points −'
                  : s.lastType === 'refund'          ? 'Refund'
+                 : s.lastType === 'admin_adjustment' ? 'Adjustment −'
                  : '';
       const amt = Math.abs(Number(s.lastAmount) || 0);
       return verb ? `${when} · ${verb} ₹${amt.toFixed(0)}` : when;
@@ -340,9 +342,19 @@ exports.adjustWallet = async (req, res) => {
 
     let wallet = await Wallet.findOneAndUpdate(query, updateOp, { returnDocument: 'after' });
 
-    // If wallet doesn't exist, create it (for 'add' only)
+    // If wallet doesn't exist, create it (for 'add' only). Parallel first-time
+    // adds race on the (user, restaurant) unique index: the losers hit E11000
+    // and simply retry the atomic $inc against the wallet the winner created.
     if (!wallet && action !== 'deduct') {
-      wallet = await Wallet.create({ user: targetUserId, restaurant: tenantId(req), [incField]: change });
+      try {
+        wallet = await Wallet.create({ user: targetUserId, restaurant: tenantId(req), [incField]: change });
+      } catch (createErr) {
+        if (createErr && createErr.code === 11000) {
+          wallet = await Wallet.findOneAndUpdate(query, updateOp, { returnDocument: 'after' });
+        } else {
+          throw createErr;
+        }
+      }
     }
 
     if (!wallet) {
@@ -364,7 +376,7 @@ exports.adjustWallet = async (req, res) => {
         user: targetUserId,
         restaurant: tenantId(req),
         branch: pinnedBranchId(req) || null,
-        type: type === 'balance' ? (action === 'add' ? 'wallet_recharge' : 'order_payment') : (action === 'add' ? 'points_earned' : 'points_redeemed'),
+        type: type === 'balance' ? (action === 'add' ? 'wallet_recharge' : 'admin_adjustment') : (action === 'add' ? 'points_earned' : 'points_redeemed'),
         amount: change,
         paymentMethod: type === 'balance' ? 'wallet' : 'points',
         description: description || `Admin ${action} ${numAmount} ${type}`,
@@ -410,20 +422,28 @@ exports.searchWalletCustomers = async (req, res) => {
     const Order = require('../models/order');
     const rx = new RegExp(escapeRegex(q), 'i');
     // AUDIT-EXEMPT: customers are platform-global; filtered to tenant activity below
+    // Tenant first, cap second: collect this tenant's customer ids (wallet or order
+    // here) BEFORE the row cap, so a tenant customer is never crowded out by
+    // other tenants' matches.
+    const tf = tenantFilter(req);
+    const [walletUserIds, orderUserIds] = await Promise.all([
+      Wallet.distinct('user', { ...tf }),
+      Order.distinct('user', { ...tf }),
+    ]);
+    const tenantUserIds = [...new Set([...walletUserIds, ...orderUserIds].filter(Boolean).map(String))];
+    if (!tenantUserIds.length) return res.status(200).json({ success: true, customers: [] });
+    // AUDIT-EXEMPT: users are not tenant-keyed; ids are restricted to this tenant's wallet/order users
     const candidates = await User.find({
+      _id: { $in: tenantUserIds },
       role: 'customer',
       $or: [{ name: rx }, { email: rx }, { mobile: rx }],
     }).select('name email mobile').limit(200).lean();
     if (!candidates.length) return res.status(200).json({ success: true, customers: [] });
 
     const ids = candidates.map((u) => u._id);
-    const tf = tenantFilter(req);
-    const [wallets, orderUsers] = await Promise.all([
-      Wallet.find({ user: { $in: ids }, ...tf }).select('user loyaltyPoints balance status').lean(),
-      Order.distinct('user', { user: { $in: ids }, ...tf }),
-    ]);
+    const wallets = await Wallet.find({ user: { $in: ids }, ...tf }).select('user loyaltyPoints balance status').lean();
     const walletByUser = new Map(wallets.map((w) => [String(w.user), w]));
-    const orderSet = new Set(orderUsers.filter(Boolean).map(String));
+    const orderSet = new Set(orderUserIds.filter(Boolean).map(String));
 
     const customers = candidates
       .filter((u) => walletByUser.has(String(u._id)) || orderSet.has(String(u._id)))
@@ -553,8 +573,10 @@ exports.payWithWallet = async (req, res) => {
         message: 'A valid orderId is required to pay from wallet.',
       });
     }
-    const clientAmount = Number(amount);
-    if (!Number.isFinite(clientAmount) || clientAmount <= 0) {
+    // Strict plain-decimal amount: no booleans / arrays / objects / hex / exponent,
+    // and nothing that rounds below one paisa.
+    const clientAmount = parseStrictAmount(amount);
+    if (clientAmount === null || clientAmount <= 0 || Math.round(clientAmount * 100) < 1) {
       return res.status(400).json({
         success: false,
         code: 'AMOUNT_INVALID',
@@ -1222,7 +1244,8 @@ exports.redeemPoints = async (req, res) => {
     const { points } = req.body;
     const userId = req.user.id;
 
-    if (!points || points <= 0) {
+    // Whole points only (fractional redemptions round the rupee value up).
+    if (typeof points !== 'number' || !Number.isInteger(points) || points <= 0) {
       return res.status(400).json({ success: false, message: 'Invalid points amount' });
     }
 
@@ -1232,6 +1255,9 @@ exports.redeemPoints = async (req, res) => {
     const pointsToRupee = settings?.wallet?.pointsToRupee || 0.1; // default: 10 points = ₹1
 
     const rupeesEarned = Math.round(points * pointsToRupee * 100) / 100;
+    if (rupeesEarned <= 0) {
+      return res.status(400).json({ success: false, message: 'Points are worth less than one paisa' });
+    }
 
     // H2: Atomic points check + deduction to prevent double-spend (per-tenant)
     const tf = tenantFilter(req);

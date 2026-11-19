@@ -33,6 +33,8 @@ const User = require('../models/user');
 const { hasFeature } = require('../utils/featureAccess');
 const { formatBillNo } = require('../utils/billNumber');
 const logger = require('../utils/logger');
+const { runAsSystem, runAsTenant } = require('../utils/tenantSafe');
+const { skipScope } = require('../utils/tenantScopePlugin');
 
 const DEFAULT_TZ = process.env.ANALYTICS_TIMEZONE || 'Asia/Kolkata';
 const ROLES = ['captain', 'waiter'];
@@ -308,7 +310,12 @@ async function reverseIfVoid(orderOrId, reason) {
     if (!orderId) return { reversed: 0 };
     const has = await IncentiveEntry.exists({ order: orderId, state: { $in: ['pending', 'confirmed'] } });
     if (!has) return { reversed: 0 };
-    const o = await Order.findById(orderId).select('status paymentStatus').lean().setOptions({ skipTenantScope: true });
+    // Scope the fresh read by the order's own tenant when the caller handed us the document;
+    // with a bare id (tenant unknown) it is an id-keyed read exempt from scoping.
+    const rid = orderOrId && orderOrId.restaurant ? (orderOrId.restaurant._id || orderOrId.restaurant) : null;
+    const q = Order.findOne(rid ? { _id: orderId, restaurant: rid } : { _id: orderId }).select('status paymentStatus').lean();
+    // AUDIT-EXEMPT: no-tenant branch is keyed by the order _id (callers: sweepers / bare-id hooks); the tenant branch pins restaurant explicitly
+    const o = await (rid ? q : skipScope(q));
     if (!o || (o.status !== 'cancelled' && o.paymentStatus !== 'Refunded')) return { reversed: 0 };
     return reverseForOrder(orderId, reason || (o.status === 'cancelled' ? 'order cancelled' : 'order refunded'));
 }
@@ -334,35 +341,45 @@ async function reconcile({ lookbackHours = 48, restaurant = null } = {}) {
     const scope = restaurant ? { restaurant: idStr(restaurant) } : {};
     const since = new Date(Date.now() - lookbackHours * 3600 * 1000);
 
-    const open = await IncentiveEntry.distinct('order', { ...scope, state: { $in: ['pending', 'confirmed'] } }).setOptions({ skipTenantScope: true });
-    if (open.length) {
-        // AUDIT-EXEMPT: system reconcile job; `open` holds order ids read from the ledger, which is scoped to `scope` when a tenant is given
-        const voided = await Order.find({
+    // Cross-tenant ledger sweep: explicit system context (works from the scheduler,
+    // scripts, or any caller context); per-tenant work below switches to that tenant.
+    const voided = await runAsSystem('incentive-reconcile:scan', async () => {
+        // AUDIT-EXEMPT: platform-wide reconcile; ids come from the ledger, scoped to `scope` when a tenant is given
+        const open = await IncentiveEntry.distinct('order', { ...scope, state: { $in: ['pending', 'confirmed'] } });
+        if (!open.length) return [];
+        // AUDIT-EXEMPT: system reconcile job; `open` holds order ids read from the ledger
+        return Order.find({
             _id: { $in: open }, $or: [{ status: 'cancelled' }, { paymentStatus: 'Refunded' }],
-        }).select('_id orderId').lean().setOptions({ skipTenantScope: true });
-        for (const o of voided) out.reversed += (await reverseForOrder(o, 'reconcile: order void')).reversed;
+        }).select('_id orderId restaurant').lean();
+    });
+    for (const o of voided) {
+        const run = () => reverseForOrder(o, 'reconcile: order void');
+        out.reversed += (await (o.restaurant ? runAsTenant(o.restaurant, run) : runAsSystem('incentive-reconcile:reverse', run))).reversed;
     }
 
-    const tenants = await IncentiveCampaign.distinct('restaurant', scope).setOptions({ skipTenantScope: true });
+    // AUDIT-EXEMPT: platform-wide tenant list for the reconcile job
+    const tenants = await runAsSystem('incentive-reconcile:tenants', async () => await IncentiveCampaign.distinct('restaurant', scope));
     out.tenants = tenants.length;
     const nowD = new Date();
     for (const rid of tenants) {
-        // Cheap-first: feature gate, then a campaign active now or ended within the window.
-        const restaurant = await Restaurant.findById(rid).select('subscription addons featureOverrides').lean();
-        if (!restaurant || !hasFeature(restaurant, 'incentives', nowD)) continue;
-        const camps = await IncentiveCampaign.find({ restaurant: rid }).limit(200).lean().setOptions({ skipTenantScope: true });
-        const live = camps.some((c) => campaignStatus(c, nowD) === 'active'
-            || (c.endDate && new Date(c.endDate) >= since));
-        if (!live) continue;
-        const orders = await Order.find({
-            restaurant: rid, updatedAt: { $gte: since },
-            status: { $ne: 'cancelled' }, $or: [{ status: 'served' }, { paymentStatus: 'Paid' }],
-        }).select('_id orderId restaurant branch status paymentStatus servedAt paidAt waiter bill.billNo bill.financialYear items._id items.menuItem items.name items.quantity')
-            .limit(5000).lean().setOptions({ skipTenantScope: true });
-        for (let i = 0; i < orders.length; i += 10) {
-            const results = await Promise.all(orders.slice(i, i + 10).map((o) => accrueSafe(o)));
-            for (const s of results) if (s) out.accrued += s.created + s.updated;
-        }
+        await runAsTenant(rid, async () => {
+            // Cheap-first: feature gate, then a campaign active now or ended within the window.
+            const restaurant = await Restaurant.findById(rid).select('subscription addons featureOverrides').lean();
+            if (!restaurant || !hasFeature(restaurant, 'incentives', nowD)) return;
+            const camps = await IncentiveCampaign.find({ restaurant: rid }).limit(200).lean();
+            const live = camps.some((c) => campaignStatus(c, nowD) === 'active'
+                || (c.endDate && new Date(c.endDate) >= since));
+            if (!live) return;
+            const orders = await Order.find({
+                restaurant: rid, updatedAt: { $gte: since },
+                status: { $ne: 'cancelled' }, $or: [{ status: 'served' }, { paymentStatus: 'Paid' }],
+            }).select('_id orderId restaurant branch status paymentStatus servedAt paidAt waiter bill.billNo bill.financialYear items._id items.menuItem items.name items.quantity')
+                .limit(5000).lean();
+            for (let i = 0; i < orders.length; i += 10) {
+                const results = await Promise.all(orders.slice(i, i + 10).map((o) => accrueSafe(o)));
+                for (const s of results) if (s) out.accrued += s.created + s.updated;
+            }
+        });
     }
     return out;
 }

@@ -37,6 +37,7 @@ const AuditLog = require('../models/auditLog');
 const SubscriptionInvoice = require('../models/subscriptionInvoice');
 const PlanChangeRequest = require('../models/planChangeRequest');
 const logger = require('../utils/logger');
+const { skipScope } = require('../utils/tenantScopePlugin');
 const { isAddonActive } = require('../utils/featureAccess');
 const {
     isBillingConfigured,
@@ -1035,7 +1036,8 @@ exports.syncFromRazorpay = async (req, res) => {
                 if (!paymentId) continue;                  // unpaid cycle
                 if (rzpInv.status !== 'paid') continue;    // not yet captured
 
-                const existing = await SubscriptionInvoice.findOne({ razorpayPaymentId: paymentId }, null, { skipTenantScope: true }).lean(); // global idempotency on platform-unique payment id
+                // AUDIT-EXEMPT: razorpayPaymentId is platform-unique (unique index); idempotency must see an invoice stored under ANY tenant, else a tenant-scoped miss would re-apply / collide on the unique index. Only existence is used.
+                const existing = await skipScope(SubscriptionInvoice.findOne({ razorpayPaymentId: paymentId }).select('_id').lean());
                 if (existing) continue;
 
                 let payment;

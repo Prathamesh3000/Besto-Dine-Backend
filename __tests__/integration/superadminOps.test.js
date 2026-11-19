@@ -393,7 +393,7 @@ describe('billing actions', () => {
 describe('plan CRUD', () => {
     test('create → audited, visible on /public/plans immediately, public shape hides Razorpay id', async () => {
         const res = await SA().post('/superadmin/plans').send({
-            name: 'Growth Op', price: 1499, sortOrder: 5, features: { dineIn: true, crm: true }, limits: { maxTables: 25 },
+            name: 'Growth Op', price: 1499, tier: 20, sortOrder: 5, features: { dineIn: true, crm: true }, limits: { maxTables: 25 },
         });
         expect(res.status).toBe(201);
         expect(res.body.data).toMatchObject({ slug: 'growth-op', price: 1499, isPublic: true, isActive: true });
@@ -406,8 +406,11 @@ describe('plan CRUD', () => {
         expect(JSON.stringify(pub.body)).not.toContain('plan_op_secret');
         expect(JSON.stringify(pub.body)).not.toContain('apiRateLimit');
 
-        expect((await SA().post('/superadmin/plans').send({ name: 'Growth Op', price: 1 })).status).toBe(400);
-        expect((await SA().post('/superadmin/plans').send({ name: 'Neg', price: -1 })).status).toBe(400);
+        expect((await SA().post('/superadmin/plans').send({ name: 'Growth Op', price: 1, tier: 20 })).status).toBe(400);
+        expect((await SA().post('/superadmin/plans').send({ name: 'Neg', price: -1, tier: 20 })).status).toBe(400);
+        // tier is required on create (TRIAL_SIGNUP_AND_LEADS_PLAN §2); a word is a 400, not a dropped field.
+        expect((await SA().post('/superadmin/plans').send({ name: 'No Tier', price: 1 })).status).toBe(400);
+        expect((await SA().post('/superadmin/plans').send({ name: 'Word Tier', price: 1, tier: 'standard' })).status).toBe(400);
     });
 
     test('price / feature edits never retro-change existing tenants; change is audited with from→to', async () => {

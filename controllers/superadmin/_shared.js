@@ -1,5 +1,6 @@
 // Split out of controllers/superadminController.js (task 4.7). Behaviour unchanged.
 const crypto = require('crypto');
+const { trialShape, tierOf, highlightsOf } = require('../../utils/publicPlans');
 
 // ─── Validation helpers ──────────────────────────────────────────────────
 
@@ -156,6 +157,11 @@ function buildPlanPayload(p) {
         currency: p.currency,
         billingCycle: p.billingCycle,
         trialDays: p.trialDays,
+        // Public-card fields (TRIAL_SIGNUP_AND_LEADS_PLAN §2).
+        tier: tierOf(p),
+        trial: trialShape(p),
+        badge: typeof p.badge === 'string' ? p.badge : '',
+        highlights: highlightsOf(p),
         limits: p.limits,
         features: p.features,
         isActive: p.isActive,

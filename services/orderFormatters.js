@@ -54,6 +54,10 @@ function formatLiveOrder(o) {
       name: i.name,
       price: i.price,
       quantity: i.quantity,
+      // Size / toppings so a Half and a Full of one dish are
+      // distinguishable on the waiter order cards (BUG-42).
+      selectedSizes: i.selectedSizes || [],
+      selectedToppings: i.selectedToppings || [],
       instructions: i.instructions || '',
       // Ship the timestamp so the waiter card can split "Original
       // order" items from items appended later. Legacy items

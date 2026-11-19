@@ -4,6 +4,7 @@ const PurchaseOrder = require('../models/purchaseOrder');
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const { devError } = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
+const { isPlainId } = require('../utils/tenantRefs');
 
 const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -107,6 +108,7 @@ exports.nextCode = asyncHandler(async (req, res) => {
 
 // GET /api/v1/suppliers/:id
 exports.getOne = asyncHandler(async (req, res) => {
+    if (!isPlainId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid supplier id' });
     const supplier = await Supplier.findOne({ _id: req.params.id, ...tenantFilter(req), ...branchFilter(req) })
         .populate('branch', 'name').lean();
     if (!supplier) return res.status(404).json({ success: false, message: 'Supplier not found' });
@@ -166,6 +168,7 @@ exports.create = async (req, res) => {
 
 // PUT /api/v1/suppliers/:id
 exports.update = asyncHandler(async (req, res) => {
+    if (!isPlainId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid supplier id' });
     const errors = validate({ ...req.body, name: req.body.name ?? 'x' });
     if (errors.length) return res.status(400).json({ success: false, message: errors[0], errors });
 
@@ -191,6 +194,7 @@ exports.update = asyncHandler(async (req, res) => {
 
 // DELETE /api/v1/suppliers/:id — blocks if open POs reference it.
 exports.remove = asyncHandler(async (req, res) => {
+    if (!isPlainId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid supplier id' });
     const tf = tenantFilter(req);
     const supplier = await Supplier.findOne({ _id: req.params.id, ...tf });
     if (!supplier) return res.status(404).json({ success: false, message: 'Supplier not found' });

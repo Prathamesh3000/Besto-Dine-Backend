@@ -125,8 +125,10 @@ exports.runScheduledReconciliation = async () => {
     try {
         const cutoff = new Date(Date.now() - 30 * 60 * 1000);
 
-        // Scope by restaurant to respect tenant isolation and use per-tenant Razorpay keys if needed.
-        const restaurants = await Restaurant.find({ status: { $in: ['active', 'trial'] } }).select('_id slug').lean();
+        // Scope by restaurant to respect tenant isolation. past_due is a SOFT state (the tenant keeps
+        // taking orders, see utils/renewalReminderJob), so customer payments there are still recovered;
+        // suspended / cancelled tenants are skipped.
+        const restaurants = await Restaurant.find({ status: { $in: ['active', 'trial', 'past_due'] } }).select('_id slug').lean();
 
         let totalChecked = 0;
         for (const restaurant of restaurants) {

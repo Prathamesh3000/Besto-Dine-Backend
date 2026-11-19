@@ -28,6 +28,7 @@ const { hasFeature } = require('./featureAccess');
 const { sign } = require('./webhookSigner');
 const { safePost } = require('./safeHttpPost');
 const { runWithoutContext } = require('./requestContext');
+const { runAsSystem, runAsTenant } = require('./tenantSafe');
 const logger = require('./logger');
 
 const MAX_ATTEMPTS = 6;
@@ -229,17 +230,21 @@ function emitRefundCreated(order, { amount, mode, refundRequestId, refundedAmoun
 
 /** Retry job body: send every due `pending` delivery (claimed atomically). */
 async function processDueDeliveries({ limit = BATCH, now = new Date(), deps } = {}) {
-    const due = await WebhookDelivery.find({ status: 'pending', nextAttemptAt: { $lte: now } })
-        .setOptions({ skipTenantScope: true }).sort({ nextAttemptAt: 1 }).limit(limit).lean();
+    // AUDIT-EXEMPT: platform-wide retry sweep across every tenant's pending deliveries (explicit system context, any caller)
+    const due = await runAsSystem('webhook-delivery:due-scan', async () =>
+        // await INSIDE the callback: the scope hook reads the context when the query executes
+        await WebhookDelivery.find({ status: 'pending', nextAttemptAt: { $lte: now } })
+            .sort({ nextAttemptAt: 1 }).limit(limit).lean());
     let sent = 0;
     for (const row of due) {
+      await runAsTenant(row.restaurant, async () => {
         // Claim: only one instance wins; the lease protects against a crash mid-attempt.
         const claimed = await WebhookDelivery.findOneAndUpdate(
             { _id: row._id, restaurant: row.restaurant, status: 'pending', nextAttemptAt: { $lte: now } },
             { $set: { nextAttemptAt: new Date(now.getTime() + CLAIM_LEASE_MS) } },
             { returnDocument: 'after' },
         );
-        if (!claimed) continue;
+        if (!claimed) return;
         const endpoint = await WebhookEndpoint.findOne({ _id: claimed.endpoint, restaurant: claimed.restaurant }).select('+secret');
         try {
             await attemptDelivery(claimed, endpoint, { deps });
@@ -247,6 +252,7 @@ async function processDueDeliveries({ limit = BATCH, now = new Date(), deps } = 
         } catch (err) {
             logger.warn('webhook.retry.error', { error: err.message });
         }
+      });
     }
     return sent;
 }

@@ -4,6 +4,8 @@ const Recipe = require('../../models/recipe');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../../utils/tenantScope');
 const { tenantBulkWrite } = require('../../utils/tenantSafe');
 const { devError } = require('../../utils/AppError');
+const { isPlainId, refOwned } = require('../../utils/tenantRefs');
+const Branch = require('../../models/branch');
 const { ALLOWED_CATEGORIES, ALLOWED_UNITS, roundQty, escapeRegex, branchFilter, computeStatus, generateNextId, validateItemFields } = require('./_shared');
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -109,6 +111,7 @@ exports.getNextId = async (req, res) => {
 // GET /api/inventory/:id
 exports.getItemById = async (req, res) => {
     try {
+        if (!isPlainId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid inventory item id' });
         // Branch-pinned staff must not see cross-branch items via direct ID.
         const item = await Inventory.findOne({
             _id: req.params.id,
@@ -155,6 +158,10 @@ exports.createItem = async (req, res) => {
         if (typeof name !== 'string') validationErrors.unshift('Item name is required');
         if (!ALLOWED_CATEGORIES.includes(category)) validationErrors.push(`category must be one of: ${ALLOWED_CATEGORIES.join(', ')}`);
         if (!ALLOWED_UNITS.includes(unit)) validationErrors.push(`unit must be one of: ${ALLOWED_UNITS.join(', ')}`);
+        // Both are required by the model; omitting them used to surface a raw
+        // Mongoose "Cast to Number failed for value NaN" message (BUG-18).
+        if (minStock === undefined || minStock === null || minStock === '') validationErrors.push('Min stock is required');
+        if (costPerUnit === undefined || costPerUnit === null || costPerUnit === '') validationErrors.push('Cost per unit is required');
         if (validationErrors.length > 0) {
             return res.status(400).json({ success: false, message: validationErrors[0], errors: validationErrors });
         }
@@ -172,10 +179,12 @@ exports.createItem = async (req, res) => {
         const pinned = pinnedBranchId(req);
         if (pinned) {
             branchId = pinned;
-        } else if (branch && mongoose.isValidObjectId(branch)) {
-            const Branch = require('../../models/branch');
-            const branchExists = await Branch.exists({ _id: branch, ...tf, isActive: true });
-            if (branchExists) branchId = branch;
+        } else if (branch) {
+            // Explicit branch must be a branch of THIS tenant (400, never silently dropped/stored).
+            if (!(await refOwned(Branch, branch, tenantId(req), { isActive: true }))) {
+                return res.status(400).json({ success: false, message: 'Invalid branch' });
+            }
+            branchId = branch;
         }
 
         const itemId = await generateNextId(req);
@@ -222,6 +231,7 @@ exports.createItem = async (req, res) => {
 // PUT /api/inventory/:id
 exports.updateItem = async (req, res) => {
     try {
+        if (!isPlainId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid inventory item id' });
         const { name, category, unit, minStock, maxStock, costPerUnit, supplier, expiryDate, branch, expiryTracking, shelfLifeDays } = req.body;
 
         const validationErrors = validateItemFields({ name, minStock, maxStock, costPerUnit, expiryDate, shelfLifeDays });
@@ -262,10 +272,11 @@ exports.updateItem = async (req, res) => {
         if (branch !== undefined) {
             if (branch === null || branch === '') {
                 branchId = null;
-            } else if (mongoose.isValidObjectId(branch)) {
-                const Branch = require('../../models/branch');
-                const branchExists = await Branch.exists({ _id: branch, ...tf, isActive: true });
-                branchId = branchExists ? branch : item.branch;
+            } else {
+                if (!(await refOwned(Branch, branch, tenantId(req), { isActive: true }))) {
+                    return res.status(400).json({ success: false, message: 'Invalid branch' });
+                }
+                branchId = branch;
             }
         }
 
@@ -294,6 +305,7 @@ exports.updateItem = async (req, res) => {
 // DELETE /api/inventory/:id
 exports.deleteItem = async (req, res) => {
     try {
+        if (!isPlainId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid inventory item id' });
         const tf = tenantFilter(req);
         const item = await Inventory.findOneAndDelete({ _id: req.params.id, ...tf, ...branchFilter(req) });
         if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found' });

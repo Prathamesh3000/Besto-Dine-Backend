@@ -8,6 +8,15 @@ const { tenantInsertMany } = require('../utils/tenantSafe');
 const { parseCsv } = require('../utils/csvParser');
 const { _resolveBulkTargetBranch: resolveBulkTargetBranch } = require('./bookingInfoController');
 const { sendServerError } = require('../utils/httpErrors');
+const { refOwned } = require('../utils/tenantRefs');
+const Branch = require('../models/branch');
+
+const bodyBranchInvalid = async (req) => {
+    if (pinnedBranchId(req)) return false;
+    const b = req.body && req.body.branch;
+    if (b === undefined || b === null || b === '') return false;
+    return !(await refOwned(Branch, b, tenantId(req)));
+};
 
 // Branch filter for decoration-package reads. Pinned admin sees ONLY
 // their branch's decoration packages; customer at a QR-scanned branch
@@ -27,6 +36,7 @@ function decorationBranchFilter(req) {
 
 exports.createDecorationPackage = async (req, res) => {
     try {
+        if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
         // Pinned admin owns the decoration package at their branch.
         const pinned = pinnedBranchId(req);
         const ownerBranch = pinned || req.body.branch || null;
@@ -65,6 +75,7 @@ exports.getDecorationPackageById = async (req, res) => {
 
 exports.updateDecorationPackage = async (req, res) => {
     try {
+        if (await bodyBranchInvalid(req)) return res.status(400).json({ success: false, message: 'Invalid branch' });
         const updateData = { ...req.body };
         delete updateData.restaurant;
         if (pinnedBranchId(req)) delete updateData.branch;

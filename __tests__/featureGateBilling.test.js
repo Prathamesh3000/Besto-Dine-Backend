@@ -94,7 +94,7 @@ function tenant({ features, overrides, planName = 'Basic', status = 'active', su
 const staffUser = { _id: 'u1', role: 'admin' };
 const customerUser = { _id: 'c1', role: 'customer' };
 
-const leanOf = (v) => ({ lean: () => Promise.resolve(v) });
+const leanOf = (v) => { const q = { select: () => q, lean: () => Promise.resolve(v) }; return q; };
 
 beforeEach(() => {
     jest.clearAllMocks();
@@ -392,6 +392,10 @@ describe('publicPlans', () => {
             currency: 'INR',
             billingCycle: 'monthly',
             trialDays: 14,
+            tier: 0,
+            trial: { enabled: true, durationDays: 14 },
+            badge: '',
+            highlights: [],
             features: { dineIn: true, crm: true, revenueAnalytics: 'advanced' },
             limits: { branches: 3, tables: 50, staff: 20, menuItems: 400 },
             highlight: true,
@@ -431,7 +435,7 @@ describe('publicPlans', () => {
         const sort = jest.fn().mockReturnValue({ lean: () => Promise.resolve([fullPlan()]) });
         mockPlanFind.mockReturnValue({ sort });
         const out = await publicPlans.loadPublicPlans();
-        expect(mockPlanFind).toHaveBeenCalledWith({ isPublic: true, isActive: true });
+        expect(mockPlanFind).toHaveBeenCalledWith({ isPublic: { $ne: false }, isActive: { $ne: false } });
         expect(sort).toHaveBeenCalledWith({ sortOrder: 1, price: 1, name: 1 });
         expect(out).toHaveLength(1);
         expect(out[0]).not.toHaveProperty('razorpayPlanId');
@@ -970,12 +974,9 @@ describe('applyPaidPlanUpgrade — money + invoice numbering', () => {
         expect(r.subscription.price).toBe(1999); // rupees on the tenant snapshot
     });
 
-    test('missing amount/currency/created_at fall back to 0 / INR / now', async () => {
+    test('Regression (fixed 2026-11): a payment with no amount/currency (and no pending upgrade) mints NO invoice', async () => {
         await applyPaidPlanUpgrade({ restaurant: restaurantDoc(), payment: { id: 'pay_x' } });
-        const doc = mockInvoice.create.mock.calls[0][0];
-        expect(doc.amount).toBe(0);
-        expect(doc.currency).toBe('INR');
-        expect(doc.paidAt).toBeInstanceOf(Date);
+        expect(mockInvoice.create).not.toHaveBeenCalled();
     });
 
     test('per-tenant per-day counter: today count 4 → -0005', async () => {

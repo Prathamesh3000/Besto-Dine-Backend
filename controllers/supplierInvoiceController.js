@@ -2,11 +2,13 @@ const mongoose = require('mongoose');
 const SupplierInvoice = require('../models/supplierInvoice');
 const SupplierPayment = require('../models/supplierPayment');
 const Supplier = require('../models/supplier');
+const InventoryItem = require('../models/inventory');
 const PurchaseOrder = require('../models/purchaseOrder');
 const LedgerEntry = require('../models/ledgerEntry');
 const { recordTenantAudit } = require('../services/tenantAuditService');
 const { tenantFilter, tenantId, strictBranchFilter } = require('../utils/tenantScope');
-const { resolveBranchId, restaurantTz } = require('../utils/ledgerScope');
+const { refsOwned } = require('../utils/tenantRefs');
+const { resolveBranchId, restaurantTz, pinnedBranchGuard } = require('../utils/ledgerScope');
 const { businessDateOf, isValidYmd } = require('../utils/businessDate');
 const { agingBuckets, threeWayMatch, outstandingOf, round2 } = require('../utils/supplierMath');
 const AppError = require('../utils/AppError');
@@ -15,6 +17,12 @@ const asyncHandler = require('../utils/asyncHandler');
 const METHODS = ['cash', 'upi', 'bank-transfer', 'cheque', 'card', 'other'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 const validId = (v) => mongoose.isValidObjectId(v);
+
+// A usable money input: a finite number, or a non-blank numeric string. Anything else ('abc', true, [], {}) is rejected.
+const isNum = (v) => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
+const requireNum = (v, label) => {
+    if (!isNum(v)) throw new AppError(400, 'INVALID_AMOUNT', `${label} must be a number`);
+};
 
 const withOutstanding = (inv) => ({ ...inv, outstanding: outstandingOf(inv) });
 
@@ -36,6 +44,9 @@ exports.create = asyncHandler(async (req, res) => {
         if (String(po.supplier) !== String(supplier._id)) throw new AppError(400, 'PO_SUPPLIER_MISMATCH', 'That purchase order belongs to a different supplier');
     }
 
+    if (b.subtotal !== undefined && b.subtotal !== '' && b.subtotal !== null) requireNum(b.subtotal, 'Subtotal');
+    if (b.tax !== undefined && b.tax !== '' && b.tax !== null) requireNum(b.tax, 'Tax');
+    if (b.total !== undefined && b.total !== '' && b.total !== null) requireNum(b.total, 'Total');
     const subtotal = round2(b.subtotal);
     const tax = round2(b.tax || 0);
     if (!(subtotal >= 0) || b.subtotal === undefined || b.subtotal === '') throw new AppError(400, 'INVALID_AMOUNT', 'Subtotal is required');
@@ -60,10 +71,17 @@ exports.create = asyncHandler(async (req, res) => {
         });
     }
 
+    if (lines) {
+        const itemIds = lines.map((l) => l.inventoryItem).filter(Boolean);
+        if (!(await refsOwned(InventoryItem, itemIds, tenantId(req)))) {
+            throw new AppError(400, 'INVALID_LINE', 'Invoice line references an unknown inventory item');
+        }
+    }
+
     try {
         const invoice = await SupplierInvoice.create({
             restaurant: tenantId(req),
-            branch: resolveBranchId(req) || po?.branch || null,
+            branch: (await resolveBranchId(req)) || po?.branch || null,
             supplier: supplier._id,
             purchaseOrder: po ? po._id : null,
             invoiceNo, invoiceDate, dueDate,
@@ -99,7 +117,7 @@ exports.list = asyncHandler(async (req, res) => {
 exports.getOne = asyncHandler(async (req, res) => {
     const tf = tenantFilter(req);
     if (!validId(req.params.id)) throw new AppError(404, 'NOT_FOUND', 'Invoice not found');
-    const invoice = await SupplierInvoice.findOne({ _id: req.params.id, ...tf }).populate('supplier', 'name code').lean();
+    const invoice = await SupplierInvoice.findOne({ _id: req.params.id, ...tf, ...pinnedBranchGuard(req) }).populate('supplier', 'name code').lean();
     if (!invoice) throw new AppError(404, 'NOT_FOUND', 'Invoice not found');
     const payments = await SupplierPayment.find({ invoice: invoice._id, ...tf }).sort({ date: -1 }).lean();
     // `locked`: the invoice is already in the ledger, so its amounts and date can no longer be edited.
@@ -121,7 +139,7 @@ exports.update = asyncHandler(async (req, res) => {
     const b = req.body || {};
     const tf = tenantFilter(req);
     if (!validId(req.params.id)) throw new AppError(404, 'NOT_FOUND', 'Invoice not found');
-    const existing = await SupplierInvoice.findOne({ _id: req.params.id, ...tf }).lean();
+    const existing = await SupplierInvoice.findOne({ _id: req.params.id, ...tf, ...pinnedBranchGuard(req) }).lean();
     if (!existing) throw new AppError(404, 'NOT_FOUND', 'Invoice not found');
 
     const set = {};
@@ -142,6 +160,8 @@ exports.update = asyncHandler(async (req, res) => {
         invoiceDate = new Date(b.invoiceDate);
         if (Number.isNaN(invoiceDate.getTime())) throw new AppError(400, 'INVALID_DATE', 'Invalid invoice date');
     }
+    if (b.subtotal !== undefined && b.subtotal !== '') requireNum(b.subtotal, 'Subtotal');
+    if (b.tax !== undefined && b.tax !== '') requireNum(b.tax, 'Tax');
     const subtotal = b.subtotal !== undefined && b.subtotal !== '' ? round2(b.subtotal) : existing.subtotal;
     const tax = b.tax !== undefined && b.tax !== '' ? round2(b.tax) : existing.tax;
     const dateChanged = invoiceDate && !sameDay(invoiceDate, existing.invoiceDate);
@@ -171,7 +191,7 @@ exports.update = asyncHandler(async (req, res) => {
         // Conditional on amountPaid still being what we validated against, so a payment that lands
         // in the meantime cannot leave the invoice with a total below its paid amount.
         saved = await SupplierInvoice.findOneAndUpdate(
-            { _id: existing._id, ...tf, amountPaid: existing.amountPaid },
+            { _id: existing._id, ...tf, ...pinnedBranchGuard(req), amountPaid: existing.amountPaid },
             { $set: set },
             { returnDocument: 'after' },
         ).populate('supplier', 'name code');
@@ -199,6 +219,7 @@ exports.recordPayment = asyncHandler(async (req, res) => {
     const b = req.body || {};
     const tf = tenantFilter(req);
     if (!validId(req.params.id)) throw new AppError(404, 'NOT_FOUND', 'Invoice not found');
+    if (!isNum(b.amount)) throw new AppError(400, 'INVALID_AMOUNT', 'Payment amount must be a number');
     const amount = round2(b.amount);
     if (!(amount > 0)) throw new AppError(400, 'INVALID_AMOUNT', 'Payment amount must be greater than 0');
     const date = b.date ? new Date(b.date) : new Date();
@@ -207,7 +228,7 @@ exports.recordPayment = asyncHandler(async (req, res) => {
     const paid = { $round: [{ $add: ['$amountPaid', amount] }, 2] };
     const invoice = await SupplierInvoice.findOneAndUpdate(
         {
-            _id: req.params.id, ...tf,
+            _id: req.params.id, ...tf, ...pinnedBranchGuard(req),
             $expr: { $lte: [{ $add: ['$amountPaid', amount] }, { $add: ['$total', 0.005] }] },
         },
         [{ $set: { amountPaid: paid, status: { $cond: [{ $gte: [paid, { $subtract: ['$total', 0.005] }] }, 'paid', 'partial'] } } }],
@@ -215,7 +236,7 @@ exports.recordPayment = asyncHandler(async (req, res) => {
         { returnDocument: 'after', updatePipeline: true },
     );
     if (!invoice) {
-        const existing = await SupplierInvoice.findOne({ _id: req.params.id, ...tf }).lean();
+        const existing = await SupplierInvoice.findOne({ _id: req.params.id, ...tf, ...pinnedBranchGuard(req) }).lean();
         if (!existing) throw new AppError(404, 'NOT_FOUND', 'Invoice not found');
         throw new AppError(400, 'EXCEEDS_OUTSTANDING', `Payment exceeds the outstanding balance of ${outstandingOf(existing)}`, { outstanding: outstandingOf(existing) });
     }

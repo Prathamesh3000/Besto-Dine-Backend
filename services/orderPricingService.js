@@ -398,6 +398,8 @@ async function resolvePointsRedemption(req, { validUserId, settings, authoritati
     authoritativePointsRedeemed = Math.min(requestedPoints, available);
     const { pointsToRupee } = resolveLoyaltySettings(settings);
     const rate = Number(pointsToRupee) || 0;
+    // Points worth nothing (pointsToRupee 0): skip redemption rather than burn points.
+    if (!(rate > 0)) return { authoritativePointsRedeemed: 0, authoritativePointsValue: 0 };
     authoritativePointsValue = Math.round(authoritativePointsRedeemed * rate * 100) / 100;
     // Don't let points push the post-coupon bill below zero, nor pay
     // more than the tenant's Settings.wallet.maxRedeemPercent (default

@@ -215,9 +215,11 @@ require('./utils/ledgerPostJob').startLedgerPostJob(scheduler); // opt-in: LEDGE
 // (decision 5, 2026-10); this job applies it once the grace period ends.
 require('./utils/haltedSubscriptionSuspender').startHaltedSubscriptionSuspender();
 
-// ─── Free trials — lock expired unpaid trials, send 7/3/1-day reminders ─────
-// Hourly sweeper (TRIAL_SWEEP_DISABLED=true to opt out) and a daily reminder
-// job (TRIAL_REMINDERS_DISABLED=true). Both cluster-locked via the scheduler.
+// ─── Free trials — lock trials past their read-only grace, send reminders ───
+// Hourly sweeper (TRIAL_SWEEP_DISABLED=true to opt out) and an hourly reminder
+// job (t-3 / t-1 / t+0 / t+2; TRIAL_REMINDERS_ENABLED, default on in production
+// only; TRIAL_REMINDERS_DRY_RUN=true to rehearse). Both cluster-locked via the
+// scheduler.
 require('./utils/trialExpirySweeper').startTrialExpirySweeper();
 require('./utils/trialReminderJob').startTrialReminderJob();
 

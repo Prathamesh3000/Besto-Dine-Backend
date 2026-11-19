@@ -24,13 +24,18 @@ async function loadSources({ restaurantId, start, end, branchClause = {} }) {
     const paidOrders = await Order.find({
         restaurant: restaurantId,
         ...branchClause,
-        $or: [{ paidAt: range }, { 'payments.at': range }],
-    }).select('orderId branch total gst amountPaid paymentMethod walletAmountPaid paidAt payments razorpayPaymentId').limit(MAX_DOCS).lean();
+        // Same fallback chain as GST / cash closing: paidAt || payments[].at || createdAt.
+        $or: [
+            { paidAt: range },
+            { 'payments.at': range },
+            { paidAt: null, amountPaid: { $gt: 0 }, createdAt: range },
+        ],
+    }).select('orderId branch total gst amountPaid paymentMethod walletAmountPaid paidAt createdAt payments razorpayPaymentId').limit(MAX_DOCS).lean();
 
     const tenders = [];
     for (const order of paidOrders) {
         getTenders(order).forEach((line, index) => {
-            if (inRange(line.at || order.paidAt, start, end)) tenders.push({ order, line, index });
+            if (inRange(line.at || order.paidAt || order.createdAt, start, end)) tenders.push({ order, line, index });
         });
     }
 
@@ -85,7 +90,13 @@ async function loadSources({ restaurantId, start, end, branchClause = {} }) {
 /** Cash movements of a loaded day: { cashSales, cashRefunds, cashPaidOuts }. */
 function summarizeCash(src) {
     const cashSales = src.tenders.filter((t) => t.line.method === 'cash').reduce((s, t) => s + t.line.amount, 0);
-    const cashRefunds = src.refunds.filter((r) => dominantMethod(r.order) === 'cash').reduce((s, r) => s + Number(r.refund.amount), 0);
+    // A refund records where the money went (refund.destination): only a
+    // cash hand-back leaves the drawer; wallet / gateway refunds do not.
+    // Legacy entries without a destination fall back to the order's method.
+    const isCashRefund = (r) => (r.refund.destination
+        ? r.refund.destination === 'cash'
+        : dominantMethod(r.order) === 'cash');
+    const cashRefunds = src.refunds.filter(isCashRefund).reduce((s, r) => s + Number(r.refund.amount), 0);
     const cashPaidOuts =
         src.expenses.filter((e) => e.method === 'cash').reduce((s, e) => s + Number(e.amount), 0)
         + src.supplierPayments.filter((p) => p.method === 'cash').reduce((s, p) => s + Number(p.amount), 0)

@@ -339,12 +339,15 @@ describe('request-context tenant (AsyncLocalStorage)', () => {
         expect(io.sent[0].rooms[0]).toBe(`t:${T1}:admin`);
     });
 
-    test('a payload hint wins over the request tenant', () => {
+    test('the request tenant wins over a payload hint (payload is only a fallback)', () => {
         const io = fakeIO();
         socket.socketRequestContext({ restaurant: { _id: T1 } }, fakeRes(), () => {
             socket.emitToAdmin(io, null, 'e', { restaurant: T2 });
         });
-        expect(io.sent[0].rooms[0]).toBe(`t:${T2}:admin`);
+        expect(io.sent[0].rooms[0]).toBe(`t:${T1}:admin`);
+        const io2 = fakeIO();
+        socket.emitToAdmin(io2, null, 'e', { restaurant: T2 });
+        expect(io2.sent[0].rooms[0]).toBe(`t:${T2}:admin`);
     });
 
     test('a timer that outlives the request by > 30s no longer trusts the request tenant', async () => {

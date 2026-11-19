@@ -167,6 +167,8 @@ describe('inventory item CRUD + validation', () => {
         ['101-char name', { name: 'x'.repeat(101) }, 'Item name must be under 100 characters'],
         ['past expiry', { expiryDate: '2020-01-01' }, 'Expiry date cannot be in the past'],
         ['negative shelf life', { shelfLifeDays: -3 }, 'Shelf life (days) must be a non-negative number'],
+        ['omitted minStock (BUG-18: no raw Mongoose cast message)', { minStock: undefined }, 'Min stock is required'],
+        ['omitted costPerUnit (BUG-18)', { costPerUnit: undefined }, 'Cost per unit is required'],
     ])('create rejects %s → 400', async (_label, override, message) => {
         const before = await Inventory.countDocuments({ restaurant: A.restaurant._id });
         const res = await admin().post('/inventory').send({ ...base(), ...override });

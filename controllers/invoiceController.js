@@ -187,9 +187,14 @@ exports.getInvoice = asyncHandler(async (req, res) => {
     // cross-tenant data requires knowing another tenant's invoice id.
     // When a tenant slug is present (e.g. customer app sends
     // X-Restaurant-Slug), we DO scope the lookup so a wrong slug
-    // hides the bill. When no slug is present, we fall through so
-    // legacy single-tenant guest flows keep working.
-    const tenantScope = req.restaurant ? { restaurant: req.restaurant._id } : {};
+    // hides the bill. With no tenant at all the request is refused (400).
+    // Fail closed: a lookup is never run unscoped. A public bill link must carry
+    // the restaurant (slug header / subdomain); staff are scoped by their own tenant.
+    const scopeId = req.restaurant?._id || tenantId(req);
+    if (!scopeId) {
+        return res.status(400).json({ success: false, message: 'Restaurant context is required' });
+    }
+    const tenantScope = { restaurant: scopeId };
     const rawId = req.params.id;
 
     // Callers (BillDetail / BillReceipt) pass whichever id their
