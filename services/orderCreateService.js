@@ -23,6 +23,7 @@ const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope
 const { resolveMergeLeader, freeTableOrUnmergeGroup } = require('../utils/tableMerge');
 const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
 const { claimSeat } = require('../utils/tableSeats');
+const { startTableTimer } = require('../utils/tableTimer');
 const { httpError, reply } = require('./orderErrors');
 const {
   isValidObjectId,
@@ -37,6 +38,7 @@ const { buildCreateOrderNotificationTasks } = require('./orderNotifications');
 const { nextTokenNumber, isTokenMode, resolveRequestOps } = require('../utils/orderToken');
 const { nextTicketNo, stampFirstRound } = require('../utils/kotRounds');
 const { issueGuestAccess } = require('../utils/guestAccess');
+const { findMovedDestination } = require('../utils/tableMove');
 
 // Channels we accept on createOrder. Kept narrow so a tampered client
 // can't claim arbitrary strings; anything outside this set is rejected
@@ -370,7 +372,7 @@ function normaliseContactFields(req) {
 //
 // Returns the scan session id (CRIT-12 — stamped on the order for
 // socket-room gating) or null.
-function verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode = false }) {
+function verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode = false, scanTableAlias = null }) {
   let scanSessionId = null;
   const isCustomerCaller = !req.user || req.user.role === 'customer';
   // Token-number mode: there is no table to prove — the customer came in
@@ -413,7 +415,10 @@ function verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode = f
         message: expired ? 'Your table session has expired. Please re-scan the QR code.' : 'Invalid table session. Please re-scan the QR code.',
       });
     }
-    if (String(decoded.tableId) !== String(validTableId)) {
+    // scanTableAlias: the table this token was issued for, when the party was
+    // moved to validTableId since (resolveMovedScanTable proved it).
+    if (String(decoded.tableId) !== String(validTableId)
+        && !(scanTableAlias && String(decoded.tableId) === String(scanTableAlias))) {
       throw httpError(403, { success: false, code: 'SCAN_TOKEN_MISMATCH', message: 'Scan token does not match this table. Re-scan the QR code.' });
     }
     const currentTenant = tenantId(req);
@@ -423,6 +428,35 @@ function verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode = f
     scanSessionId = decoded.sessionId || null;
   }
   return scanSessionId;
+}
+
+// ── Phase: moved-party redirect (POST /tables/move) ─────────────────
+// A phone that missed the table:moved push still holds a scan token for
+// the OLD table. If staff moved that scan session's party, the
+// destination table lists { sessionId, fromTable: <token's table> } in
+// movedSessions - then the order belongs on the NEW table. Nothing is
+// loosened: the lookup needs this exact session on this exact tenant, and
+// the body may name only the token's table or the table it moved to.
+// Returns { fromTableId, toTableId } or null.
+async function resolveMovedScanTable(req, { type, isKioskOrder, validTableId }) {
+  try {
+    if (type !== 'dine-in' || isKioskOrder || !validTableId) return null;
+    if (req.user && req.user.role !== 'customer') return null;
+    const scanToken = req.headers['x-scan-token'];
+    if (!scanToken) return null;
+    const decoded = verifyTypedToken(scanToken, TOKEN_TYPES.SCAN);
+    if (!decoded.tableId || !decoded.sessionId) return null;
+    const currentTenant = tenantId(req);
+    if (currentTenant && decoded.restaurantId && String(decoded.restaurantId) !== String(currentTenant)) return null;
+    const toTableId = await findMovedDestination({
+      tableId: decoded.tableId, sessionId: decoded.sessionId, tenantFilter: tenantFilter(req),
+    });
+    if (!toTableId) return null;
+    if (String(validTableId) !== String(decoded.tableId) && String(validTableId) !== toTableId) return null;
+    return { fromTableId: String(decoded.tableId), toTableId };
+  } catch {
+    return null; // verifyDineInScan reports a bad token as before
+  }
 }
 
 // ── Phase: merge-group redirect ─────────────────────────────────────
@@ -1180,6 +1214,9 @@ async function occupyTableForNewOrder(req, savedOrder, type, resolvedTableId) {
       { _id: resolvedTableId, ...tenantFilter(req) },
       tableUpdate
     );
+    // Table timer: the first CONFIRMED order of the sitting starts it
+    // (a held / empty order does not - see utils/tableTimer).
+    await startTableTimer(savedOrder);
     emitStaffTable(
       'table:updated',
       { tableId: resolvedTableId, status: shouldKeepMerged ? 'merged' : 'occupied' },
@@ -1316,11 +1353,17 @@ async function createOrder(req) {
   // runs once the authoritative bill is known, below).
   resolveManualDiscount(req);
   const attribution = resolveAttribution(req, { tokenMode });
-  const { validUserId, validTableId } = attribution;
+  const { validUserId } = attribution;
+  let { validTableId } = attribution;
   const { cleanCustomerName, cleanPhone } = normaliseContactFields(req);
 
   const isKioskOrder = resolvedSource === 'kiosk';
-  const scanSessionId = verifyDineInScan(req, { type, isKioskOrder, validTableId, tokenMode });
+  // A party staff moved to another table keeps ordering on its old scan token.
+  const movedScan = await resolveMovedScanTable(req, { type, isKioskOrder, validTableId });
+  if (movedScan) validTableId = movedScan.toTableId;
+  const scanSessionId = verifyDineInScan(req, {
+    type, isKioskOrder, validTableId, tokenMode, scanTableAlias: movedScan ? movedScan.fromTableId : null,
+  });
   const resolvedTableId = await resolveLeaderTable(req, type, validTableId);
   // A table-less dine-in order in token mode: collected by token number.
   const wantsToken = tokenMode && type === 'dine-in' && !isKioskOrder && !resolvedTableId;

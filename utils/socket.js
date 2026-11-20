@@ -542,6 +542,17 @@ exports.init = (server, allowedOrigins) => {
                             restaurantId: decoded.restaurantId ? String(decoded.restaurantId) : null,
                             sessionId: decoded.sessionId || null,
                         };
+                        // A party staff moved to another table (POST /tables/move)
+                        // that reconnects with its old token sits in the NEW table's room.
+                        if (decoded.sessionId && decoded.restaurantId) {
+                            try {
+                                const movedTo = await require('./tableMove').findMovedDestination({
+                                    tableId: decoded.tableId, sessionId: decoded.sessionId,
+                                    tenantFilter: { restaurant: decoded.restaurantId },
+                                });
+                                if (movedTo) socket.data.scan.tableId = movedTo;
+                            } catch { /* best effort - the old room still works for the old table */ }
+                        }
                     }
                 } catch { /* invalid/expired scan token → ignore */ }
             }
@@ -643,6 +654,9 @@ exports.staffRoom = (ioInstance, role, branchId, restaurantId = null) => {
     }
     return ioInstance.to(emitRoomsFor(rid, role, toId(branchId)));
 };
+
+/** Any list of staff roles at a branch (used by the table timer events). */
+exports.emitToRoles = emitToRoles;
 
 /** admin + waiter + kitchen at a branch (null = tenant-level). */
 exports.emitToStaff = (ioInstance, branchId, event, payload) =>

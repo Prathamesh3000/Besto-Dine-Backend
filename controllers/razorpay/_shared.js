@@ -155,6 +155,26 @@ async function settleSiblingDineInRounds(order, paymentMethod) {
             paymentStatus: { $ne: 'Paid' },
             ...tf,
         });
+        // Only when the money collected on `order` covers the siblings too
+        // (₹1 rounding tolerance). A payment for this round alone must not
+        // give the table's other rounds away. markOrderPaidAtomically keeps
+        // the whole capture in amountPaid (+ overpaidAmount), so that sum is
+        // what was collected.
+        const payable = siblings.filter((sib) => !orderIsPayFirst(sib, ops));
+        const dueOf = (o) => Math.max(0, (Number(o.total) || 0) - (Number(o.manualDiscount) || 0) - (Number(o.amountPaid) || 0));
+        const siblingsDue = payable.reduce((n, o) => n + dueOf(o), 0);
+        const needed = Math.max(0, (Number(order.total) || 0) - (Number(order.manualDiscount) || 0)) + siblingsDue;
+        const tendered = (order.payments || []).reduce((n, p) => n + (Number(p.amount) || 0), 0);
+        const collected = Math.max((Number(order.amountPaid) || 0) + (Number(order.overpaidAmount) || 0), tendered);
+        if (payable.length && collected < roundPaise(needed) - 1) {
+            logger.warn('Dine-in table bill: payment covers only this round — sibling rounds left unpaid', {
+                orderId: order.orderId,
+                collected,
+                needed: roundPaise(needed),
+                siblingOrderIds: payable.map((s) => s.orderId),
+            });
+            return;
+        }
         let settled = 0;
         for (const sib of siblings) {
             if (orderIsPayFirst(sib, ops)) continue;   // pays for itself

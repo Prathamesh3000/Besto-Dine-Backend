@@ -56,23 +56,44 @@ function ctxOf(src) {
     };
 }
 
+// The row for (src, payload), or null when there is no tenant to attach it to.
+function buildAuditRow(src, payload) {
+    const { user, restaurantId, branchId, ip } = ctxOf(src);
+    const { action = 'other', entityType = '', entityId = '', summary = '', before, after } = payload || {};
+    if (!restaurantId) return null;
+    return {
+        restaurant: restaurantId,
+        branch: branchId || null,
+        actor: { id: user._id || user.id || null, name: user.name || user.fullName || user.email || '', role: user.role || '' },
+        action: TenantAudit.ACTIONS.includes(action) ? action : 'other',
+        entityType: String(entityType || '').slice(0, 60),
+        entityId: entityId ? String(entityId).slice(0, 100) : '',
+        summary: String(summary || '').slice(0, 500),
+        before: prepareSnapshot(before),
+        after: prepareSnapshot(after),
+        ip: String(ip || '').slice(0, 100),
+    };
+}
+
+/**
+ * The ONE audit writer that is allowed to throw: it writes inside the
+ * caller's mongoose transaction (`session`) so the audited action and its
+ * audit row commit - or roll back - together. Use it only where the audit is
+ * part of the action's integrity (table move); everything else uses the
+ * never-throwing recordTenantAudit.
+ */
+async function recordTenantAuditInSession(src, payload, session) {
+    const row = buildAuditRow(src, payload);
+    if (!row) throw new Error('Tenant audit: no restaurant to attach the row to');
+    const [doc] = await TenantAudit.create([row], session ? { session } : {});
+    return doc;
+}
+
 async function writeAudit(src, payload) {
     try {
-        const { user, restaurantId, branchId, ip } = ctxOf(src);
-        const { action = 'other', entityType = '', entityId = '', summary = '', before, after } = payload || {};
-        if (!restaurantId) return null;
-        const doc = await TenantAudit.create({
-            restaurant: restaurantId,
-            branch: branchId || null,
-            actor: { id: user._id || user.id || null, name: user.name || user.fullName || user.email || '', role: user.role || '' },
-            action: TenantAudit.ACTIONS.includes(action) ? action : 'other',
-            entityType: String(entityType || '').slice(0, 60),
-            entityId: entityId ? String(entityId).slice(0, 100) : '',
-            summary: String(summary || '').slice(0, 500),
-            before: prepareSnapshot(before),
-            after: prepareSnapshot(after),
-            ip: String(ip || '').slice(0, 100),
-        });
+        const row = buildAuditRow(src, payload);
+        if (!row) return null;
+        const doc = await TenantAudit.create(row);
         return doc;
     } catch (err) {
         try { logger.error('Tenant audit write failed: ' + err.message, { action: payload?.action }); } catch { /* never throw */ }
@@ -89,4 +110,4 @@ function recordTenantAudit(src, payload) {
     }
 }
 
-module.exports = { REDACT_RE, recordTenantAudit, prepareSnapshot, sanitize, MAX_BYTES };
+module.exports = { REDACT_RE, recordTenantAudit, recordTenantAuditInSession, prepareSnapshot, sanitize, MAX_BYTES };

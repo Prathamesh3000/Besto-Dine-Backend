@@ -26,6 +26,14 @@ const EVENTS = Object.freeze({
 
     // Tables / sessions
     TABLE_UPDATED: 'table:updated',
+    // A seated party (all its open orders) was moved to another table
+    // (POST /tables/move). Sent to staff rooms, and to the moved diners'
+    // phones with a fresh scan token for the new table.
+    TABLE_MOVED: 'table:moved',
+    // Table timer (utils/tableTimer.js): sent ONLY to the admin, manager and
+    // captain rooms of the table's branch. docs/TABLE_TIMER.md.
+    TABLE_TIMER_STARTED: 'table:timer-started',
+    TABLE_TIMER_STOPPED: 'table:timer-stopped',
     // QA #14 — sent to the `table:<id>` room when the admin deletes or
     // disables a table, so seated diners stop ordering immediately.
     TABLE_UNAVAILABLE: 'table:unavailable',

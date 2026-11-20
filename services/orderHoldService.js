@@ -171,6 +171,9 @@ async function releaseHeldOrder(orderOrId, { ops: knownOps } = {}) {
 
     const ops = knownOps || await loadOps(released.restaurant, { branchId: released.branch || null });
     await runReleaseSideEffects(released, ops);
+    // Table timer: a released pay-first order is the table's first CONFIRMED
+    // order - the timer starts at the release time.
+    await require('../utils/tableTimer').startTableTimer(released, { at: released.releasedAt });
     let out = released;
     if (completesWithoutKitchen(ops)) out = await completeWithoutKitchen(released, { ops });
 

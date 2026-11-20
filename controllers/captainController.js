@@ -21,6 +21,7 @@ const { notify } = require('../services/notificationService');
 const EVENTS = require('../realtime/events');
 const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('../utils/tenantScope');
 const logger = require('../utils/logger');
+const { timerView } = require('../utils/tableTimer');
 const { resolveOperationsForRequest } = require('../utils/operationsProfile');
 const { billingStatesForTables } = require('../utils/paymentState');
 const { seatsTakenOf } = require('../utils/tableSeats');
@@ -99,7 +100,7 @@ exports.getFloorOverview = async (req, res) => {
         // integrity but must never show on the floor (same rule as
         // tableController.getTables).
         let tables = await Table.find({ ...tf, ...bf, isDeleted: { $ne: true } })
-            .select('name capacity status area assignedWaiter mergedWith seats')
+            .select('name capacity status area assignedWaiter mergedWith seats +sessionStartedAt')
             .populate('assignedWaiter', 'name staffId')
             .sort({ name: 1 })
             .lean();
@@ -152,6 +153,8 @@ exports.getFloorOverview = async (req, res) => {
         };
 
         const billing = await billingStatesForTables(tables.map(t => t._id), tf);
+        // Table timer: captain / admin / manager only (see utils/tableTimer).
+        const timer = await timerView(req, tables);
         const tablesOut = tables.map(t => {
             const seatGroup = seatsOfGroup(t);
             const tableOrders = ordersByTable.get(String(t._id)) || [];
@@ -178,6 +181,7 @@ exports.getFloorOverview = async (req, res) => {
                 delayed: tableOrders.some(isOrderDelayed),
                 // Derived (Phase 4): billing_pending | payment_pending | payment_failed | print_failed | null
                 billingState: billing.get(String(t._id)) || null,
+                ...(timer ? { sessionStartedAt: timer.decorate({}, t).sessionStartedAt } : {}),
             };
         });
 
@@ -237,6 +241,7 @@ exports.getFloorOverview = async (req, res) => {
             workload,
             summary,
             thresholds: { prepDelayMin: PREP_DELAY_MIN, readyWaitMin: READY_WAIT_MIN },
+            ...(timer ? timer.extras : {}),
         });
     } catch (error) {
         logger.error('captain.floor-overview failed:', error);

@@ -13,6 +13,7 @@ const {
     regenerateQrToken,
     mergeTables,
     unmergeTables,
+    moveTable,
     assignWaiter,
     getAssignmentHistory,
     freeTable,
@@ -128,6 +129,10 @@ router.post('/merge', protect, staffOnly, checkPermission('tables'), validate([
 router.post('/unmerge', protect, staffOnly, checkPermission('tables'), validate([
     requiredObjectId('body', 'tableId', 'A valid tableId is required'),
 ]), unmergeTables);
+// Move a seated party (all its open orders) to a free table - captain / admin
+// / manager. Literal path, registered before every '/:id' route. Ids are
+// validated in the controller so errors carry code VALIDATION.
+router.post('/move', protect, captainOrAdmin, moveTable);
 // Captain (head waiter) reassigns tables to waiters as part of floor
 // control — captainOrAdmin, not adminOnly. The controller is tenant- and
 // branch-scoped, so a branch-pinned captain can only touch their own tables.

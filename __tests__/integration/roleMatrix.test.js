@@ -452,6 +452,7 @@ const EXPECTED = [
     ['POST', '/tables/import', ADMIN],
     ['POST', '/tables/merge', staffPerm('tables')],
     ['POST', '/tables/unmerge', staffPerm('tables')],
+    ['POST', '/tables/move', CAP_ADMIN],
     ['PUT', '/tables/:id/assign', CAP_ADMIN],
     ['GET', '/tables/:id/assignments', CAP_ADMIN],
     ['POST', '/tables', ADMIN],

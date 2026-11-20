@@ -4,7 +4,7 @@
  * Thin, never-throwing adapters between feature code and
  * tenantAuditService, so call sites stay a single line.
  */
-const { recordTenantAudit, REDACT_RE } = require('./tenantAuditService');
+const { recordTenantAudit, recordTenantAuditInSession, REDACT_RE } = require('./tenantAuditService');
 
 const num = (v) => Math.max(0, Number(v) || 0);
 
@@ -108,4 +108,24 @@ function auditMenuPrice(req, before, after) {
     } catch { /* never throw */ }
 }
 
-module.exports = { auditOrderUpdate, auditRefund, auditStaff, auditSettingsChange, auditMenuPrice };
+// A seated party was moved to another table. UNLIKE the adapters above this
+// one is transactional and may reject: it is written inside the move's own
+// mongoose transaction, so a failed audit write rolls the move back.
+// `info`: { from: {id,name}, to: {id,name}, orderIds, itemCount, total, at }.
+function auditTableMove(ctx, info, session) {
+    const from = info.from || {};
+    const to = info.to || {};
+    return recordTenantAuditInSession(ctx, {
+        action: 'table.move',
+        entityType: 'table',
+        entityId: String(from.id || ''),
+        summary: `Moved table ${from.name} -> ${to.name} (${(info.orderIds || []).length} order(s), ${info.itemCount} item(s), total ${info.total})`,
+        before: { tableId: String(from.id || ''), tableName: from.name },
+        after: {
+            tableId: String(to.id || ''), tableName: to.name,
+            orderIds: info.orderIds || [], itemCount: info.itemCount, total: info.total, at: info.at,
+        },
+    }, session);
+}
+
+module.exports = { auditOrderUpdate, auditRefund, auditStaff, auditSettingsChange, auditMenuPrice, auditTableMove };

@@ -80,7 +80,7 @@ function resolveKey(arg) {
 // consumers (notification gates in orderController, requestController, etc.)
 // were reading the raw branch doc and silently bypassing toggles the
 // tenant-owner had saved at the tenant level.
-const INHERITED_SECTIONS = ['taxes', 'reservation', 'wallet', 'notifications', 'operatingHours', 'delivery'];
+const INHERITED_SECTIONS = ['taxes', 'reservation', 'wallet', 'notifications', 'operatingHours', 'delivery', 'tableTimer'];
 
 async function loadSettings(key) {
     if (key === KEY_LEGACY) {

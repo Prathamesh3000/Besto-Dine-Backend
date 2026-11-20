@@ -16,6 +16,7 @@
 const Table = require('../models/table');
 const logger = require('../utils/logger');
 const { verifyTypedToken, TOKEN_TYPES } = require('./authMiddleware');
+const { findMovedDestination } = require('../utils/tableMove');
 
 const CACHE_TTL_MS = 3000;
 const CACHE_MAX = 5000;
@@ -54,6 +55,18 @@ async function tableSessionGuard(req, res, next) {
         // the epoch is revoked, so a diner who re-scans right after the reset
         // is never locked out by their own fresh token.
         if (epoch && (Number(decoded.iat) + 1) * 1000 <= epoch) {
+            // The old table was freed AFTER staff moved this party elsewhere
+            // (POST /tables/move): the party is not signed out by that. Judge
+            // the token by the table it moved to instead.
+            if (decoded.sessionId && decoded.restaurantId) {
+                const destId = await findMovedDestination({
+                    tableId: decoded.tableId, sessionId: decoded.sessionId, tenantFilter: { restaurant: decoded.restaurantId },
+                });
+                if (destId) {
+                    const destEpoch = await epochOf(destId);
+                    if (!(destEpoch && (Number(decoded.iat) + 1) * 1000 <= destEpoch)) return next();
+                }
+            }
             return res.status(401).json({
                 success: false,
                 code: 'TABLE_SESSION_ENDED',

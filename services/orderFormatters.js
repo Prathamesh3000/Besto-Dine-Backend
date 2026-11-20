@@ -15,6 +15,7 @@ const {
 
 // GET /orders/live — one row of the staff live board.
 const { publicPayment } = require('../utils/paymentState');
+const { movedFromOf } = require('../utils/tableMove');
 
 function formatLiveOrder(o) {
   // isUrgent: ready order that has been waiting more than 10 minutes
@@ -38,6 +39,8 @@ function formatLiveOrder(o) {
     // Token-number mode (tables.useTables:false): the token a table-less
     // dine-in order is collected by ("T-042"); null for every other order.
     tokenNumber: o.tokenNumber || null,
+    // POST /tables/move: where this order sat before staff moved it, or null.
+    movedFrom: movedFromOf(o),
     status: o.status,
     time: new Date(o.createdAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
     user: o.customerName,
@@ -151,6 +154,7 @@ function formatOrderDetail(order) {
     table: order.table ? order.table.name : 'Takeaway',
     // Token-number mode: "Your token: T-042" on the confirmation / tracking page.
     tokenNumber: order.tokenNumber || null,
+    movedFrom: movedFromOf(order),
     status: order.status,
     user: order.customerName,
     phone: order.phone,
@@ -332,6 +336,7 @@ function formatKitchenOrder(o, now, mergedLabelFor) {
     id: o.orderId,
     tableId: tableLabel || 'TA',
     table: o.table ? { name: tableLabel, area: areaObj } : null,
+    movedFrom: movedFromOf(o),
     // Token-number mode: the KDS card shows the token instead of a table.
     tokenNumber: o.tokenNumber || null,
     status: o.status,
@@ -422,6 +427,7 @@ function formatCompletedKitchenOrder(o) {
     customerName: o.customerName,
     tableName: o.table?.name || null,
     areaName: o.table?.area?.name || null,
+    movedFrom: movedFromOf(o),
     tokenNumber: o.tokenNumber || null,
     itemCount: (o.items || []).reduce((s, it) => s + (Number(it.quantity) || 1), 0),
     items: (o.items || []).map((it) => ({ name: it.name, quantity: it.quantity })),

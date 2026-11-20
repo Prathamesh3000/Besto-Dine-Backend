@@ -132,6 +132,26 @@ const tableSchema = new mongoose.Schema({
         default: [],
         select: false,
     },
+    // Diner parties that were moved HERE from another table (POST /tables/move):
+    // [{ sessionId, fromTable, at }]. A phone still holding a scan token for
+    // the old table is matched by sessionId + fromTable and treated as being
+    // at this table (utils/tableMove.findMovedDestination). Cleared whenever
+    // the table is freed. select:false - session ids never reach a client.
+    movedSessions: {
+        type: [new mongoose.Schema({
+            sessionId: { type: String, required: true },
+            fromTable: { type: mongoose.Schema.Types.ObjectId, ref: 'Table', required: true },
+            at: { type: Date, default: Date.now },
+        }, { _id: false })],
+        default: undefined,
+        select: false,
+    },
+    // Table timer (utils/tableTimer.js): server timestamp of the FIRST CONFIRMED
+    // order of this sitting + its TableSession row. Staff-only (admin / manager /
+    // captain): select:false and stripped from toJSON so a customer response can
+    // never carry them; staff listings select them explicitly.
+    sessionStartedAt: { type: Date, default: null, select: false },
+    tableSession: { type: mongoose.Schema.Types.ObjectId, ref: 'TableSession', default: null, select: false },
     mergedWith: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Table'
@@ -156,6 +176,8 @@ const tableSchema = new mongoose.Schema({
                 ret.seatsTaken = ret.seats.length;
                 delete ret.seats;
             }
+            delete ret.sessionStartedAt;
+            delete ret.tableSession;
             return ret;
         },
     },

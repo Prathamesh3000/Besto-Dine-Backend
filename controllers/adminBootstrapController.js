@@ -7,6 +7,7 @@ const User = require('../models/user');
 const { tenantFilter, strictBranchFilter, pinnedBranchId, branchScopeClause } = require('../utils/tenantScope');
 const { resolveSettingsForRequest } = require('./settingsController');
 const logger = require('../utils/logger');
+const { timerView, normalizeTableTimer, canSeeTimer } = require('../utils/tableTimer');
 
 // Mirrors areaController.areaBranchFilter — kept inline so the bootstrap
 // endpoint doesn't pull a controller-level dependency. If that branch
@@ -60,6 +61,7 @@ exports.getAdminBootstrap = async (req, res) => {
     const want = (s) => requested.includes(s);
 
     const tasks = {};
+    let timerExtras = null;
 
     if (want('tables')) {
         const filter = { ...tenantFilter(req), ...strictBranchFilter(req) };
@@ -71,7 +73,7 @@ exports.getAdminBootstrap = async (req, res) => {
             // expired QR code", because the scan route only accepts
             // `tb-<12 hex>`. Staff print this token on a physical label
             // at the table, so it is not secret from them.
-            .select('+qrToken +seats')
+            .select('+qrToken +seats +sessionStartedAt')
             .populate('area', 'name isActive')
             .populate('branch', 'name slug')
             .populate('currentDiner.user', 'name mobile email')
@@ -79,6 +81,13 @@ exports.getAdminBootstrap = async (req, res) => {
             .lean()
             // Seat identities never leave the server — only the count.
             .then((rows) => rows.map(exposeSeats));
+        // Table timer fields are added below, for admin / manager / captain only.
+        tasks.tables = tasks.tables.then(async (rows) => {
+            const view = await timerView(req, rows);
+            if (!view) return rows.map(({ sessionStartedAt: _s, tableSession: _t, ...rest }) => rest);
+            timerExtras = view.extras;
+            return rows.map((r) => view.decorate(r, r));
+        });
     }
 
     if (want('areas')) {
@@ -137,7 +146,13 @@ exports.getAdminBootstrap = async (req, res) => {
         // this and reading the raw Settings doc would silently strip
         // additionalCharges from sub-branch admins and break parity
         // with the customer bill preview.
-        tasks.settings = resolveSettingsForRequest(req);
+        tasks.settings = Promise.resolve(resolveSettingsForRequest(req)).then((s) => {
+            if (!s || typeof s !== 'object') return s;
+            // Timer thresholds only for admin / manager / captain.
+            if (canSeeTimer(req.user)) return { ...s, tableTimer: normalizeTableTimer(s.tableTimer) };
+            const { tableTimer: _omit, ...rest } = s;
+            return rest;
+        });
     }
 
     const keys = Object.keys(tasks);
@@ -171,6 +186,8 @@ exports.getAdminBootstrap = async (req, res) => {
     res.status(200).json({
         success: errors.length === 0,
         data,
+        // Table timer (admin / manager / captain): serverTime + thresholds, top level only.
+        ...(timerExtras || {}),
         ...(errors.length ? { _errors: errors } : {}),
     });
 };

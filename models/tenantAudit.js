@@ -14,6 +14,7 @@ const ACTIONS = [
     'bill.edit', 'bill.finalize',
     'staff.create', 'staff.deactivate', 'staff.role_change', 'staff.permission_change',
     'settings.change', 'menu.price_change',
+    'table.move',
     'other',
 ];
 

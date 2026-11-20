@@ -21,6 +21,7 @@
 const Table = require('../models/table');
 const Request = require('../models/request');
 const logger = require('./logger');
+const { closeTableTimers } = require('./tableTimer');
 
 // Return an array of all table IDs in the group: self + mergedWith.
 // Accepts a populated table doc OR a plain object.
@@ -85,6 +86,8 @@ async function getMergeGroupNames(tableId, tenantFilterObj = {}) {
 // opts.keepSeats: true never releases seats (e.g. detaching a stale paid
 // bill while a newly seated party — possibly without an order yet —
 // holds a seat). clearSeats wins if both are passed.
+// opts.timerReason: why the table timer stops ('paid' | 'freed' | 'forced' |
+// 'cleared', default 'freed') - see utils/tableTimer.closeTableTimers.
 async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}, opts = {}) {
     const table = await Table.findOne({ _id: tableId, ...tenantFilterObj })
         .select('mergedWith status branch restaurant')
@@ -133,8 +136,16 @@ async function freeTableOrUnmergeGroup(tableId, tenantFilterObj = {}, opts = {})
                 currentDiner: { user: null, name: '', phone: '', isRegistered: false, claimedAt: null },
                 ...(clearSeats ? { seats: [] } : {}),
             },
+            // Parties moved here (POST /tables/move) are done once the table is freed.
+            $unset: { movedSessions: 1 },
         }
     );
+
+    // Table timer: the sitting is over - close its TableSession (once for the
+    // whole group) and tell admin / manager / captain.
+    await closeTableTimers(groupIds, tenantFilterObj, {
+        reason: opts.timerReason || 'freed', branch: table.branch || null, restaurant: table.restaurant,
+    });
 
     // Soft-close any service requests (Water / Call Waiter / Bill /
     // Other) still tied to these tables. Without this, the admin

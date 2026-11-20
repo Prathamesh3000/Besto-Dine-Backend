@@ -45,6 +45,7 @@ const { revokeTipsForOrder } = require('../utils/tipHelpers');
 const { resolveMergeLeader, freeTableOrUnmergeGroup, mergeGroupIdsOf } = require('../utils/tableMerge');
 const { endTableSessions } = require('../utils/tableSessions');
 const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
+const { timerView, closeTableTimers } = require('../utils/tableTimer');
 
 // QA #14 — tell diners bound to these tables (they auto-join the
 // `table:<id>` room from their scan token) that the table can no longer
@@ -247,7 +248,7 @@ const getTables = async (req, res) => {
             // the admin QR modal cannot build a working code without it.
             // +seats → serialised as `seatsTaken` (count only) by the
             // schema's toJSON transform; identities never leave.
-            .select('+qrToken +seats')
+            .select('+qrToken +seats +sessionStartedAt')
             .populate('area', 'name isActive')
             .populate('branch', 'name slug')
             .populate('currentDiner.user', 'name mobile email')
@@ -255,9 +256,14 @@ const getTables = async (req, res) => {
 
         // Derived billing chip (Phase 4); table.status itself is untouched.
         const billing = await billingStatesForTables(tables.map((t) => t._id), tenantFilter(req));
-        const out = tables.map((t) => ({ ...t.toJSON(), billingState: billing.get(String(t._id)) || null }));
+        // Table timer: admin / manager / captain only (null for every other role).
+        const timer = await timerView(req, tables.map((t) => ({ _id: t._id, mergedWith: t.mergedWith, sessionStartedAt: t.sessionStartedAt })));
+        const out = tables.map((t) => {
+            const row = { ...t.toJSON(), billingState: billing.get(String(t._id)) || null };
+            return timer ? timer.decorate(row, t) : row;
+        });
 
-        res.status(200).json({ success: true, tables: out });
+        res.status(200).json({ success: true, tables: out, ...(timer ? timer.extras : {}) });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Error fetching tables', ...devError(error) });
     }
@@ -700,6 +706,12 @@ const updateTable = async (req, res) => {
         if (updates.status === 'free' || updates.status === 'disabled' || updates.isActive === false) {
             await releaseSeats([table._id, ...(table.mergedWith || [])], tenantFilter(req));
         }
+        // Taken out of service / reset to free by hand: the sitting is over.
+        if (updates.status === 'free' || updates.status === 'disabled' || updates.isActive === false) {
+            await closeTableTimers([table._id, ...(table.mergedWith || [])], tenantFilter(req), {
+                reason: 'freed', branch: table.branch || null, restaurant: table.restaurant,
+            });
+        }
         if (updates.status === 'disabled' || updates.isActive === false) {
             emitTableUnavailable([table._id, ...(table.mergedWith || [])], 'disabled');
         }
@@ -1041,6 +1053,7 @@ const unmergeTables = async (req, res) => {
             // scan / order.
             { $set: { status: 'free', mergedWith: [], seats: [] } }
         );
+        await closeTableTimers(allMergedIds, tenantFilter(req), { reason: 'cleared', branch: table.branch || null, restaurant: table.restaurant });
 
         // Per-tenant settings (was the legacy no-arg single-tenant lookup).
         const settings = await getSettings(req);
@@ -1423,7 +1436,9 @@ const freeTable = async (req, res) => {
         }
 
         // Staff reset → every seat on the table / group is released.
-        const { freedIds } = await freeTableOrUnmergeGroup(table._id, tf, { clearSeats: true });
+        const { freedIds } = await freeTableOrUnmergeGroup(table._id, tf, {
+            clearSeats: true, timerReason: force && realOrders.length > 0 ? 'forced' : 'freed',
+        });
 
         try {
             for (const freedId of freedIds) {
@@ -1493,10 +1508,10 @@ const freeAllTables = async (req, res) => {
             || o.paymentStatus === 'Partially Paid'
             || Number(o.amountPaid || 0) > 0;
         const realOrders = openOrders.filter(isReal);
+        const realTables = new Set(realOrders.map((o) => String(o.table)));
 
         if (realOrders.length > 0 && !force) {
             const totalAmount = realOrders.reduce((s, o) => s + (Number(o.total) || 0), 0);
-            const realTables = new Set(realOrders.map((o) => String(o.table)));
             return res.status(409).json({
                 success: false,
                 code: 'ORDER_NOT_EMPTY',
@@ -1535,7 +1550,8 @@ const freeAllTables = async (req, res) => {
         const freedAll = [];
         for (const t of inScope) {
             if (done.has(String(t._id))) continue;
-            const { freedIds } = await freeTableOrUnmergeGroup(t._id, tf, { clearSeats: true });
+            const wroteOff = force && mergeGroupIdsOf(t).some((gid) => realTables.has(String(gid)));
+            const { freedIds } = await freeTableOrUnmergeGroup(t._id, tf, { clearSeats: true, timerReason: wroteOff ? 'forced' : 'freed' });
             for (const fid of freedIds) { done.add(String(fid)); freedAll.push(String(fid)); }
             try {
                 for (const fid of freedIds) {
@@ -1955,7 +1971,40 @@ const getTableAvailability = async (req, res) => {
     }
 };
 
+// POST /tables/move  { fromTableId, toTableId, preview? }
+// Moves the seated party (every open order of the source table) to a free
+// table. The server finds the orders itself - order ids are never accepted
+// from the client. Rules, errors and events: docs/MOVE_TABLE.md.
+const moveTable = async (req, res) => {
+    try {
+        if (tablesDisabled(req)) return tablesDisabledReply(res);
+        const { fromTableId, toTableId } = req.body || {};
+        const valid = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v) && String(new mongoose.Types.ObjectId(v)) === v.toLowerCase();
+        if (!valid(fromTableId) || !valid(toTableId)) {
+            return res.status(400).json({ success: false, code: 'VALIDATION', message: 'fromTableId and toTableId must be valid table ids.' });
+        }
+        const preview = req.body.preview === true;
+        if (req.body.preview !== undefined && req.body.preview !== null && typeof req.body.preview !== 'boolean') {
+            return res.status(400).json({ success: false, code: 'VALIDATION', message: 'preview must be true or false.' });
+        }
+        const { moveTable: runMove } = require('../services/tableMoveService');
+        const result = await runMove({
+            tf: tenantFilter(req),
+            actor: req.user,
+            isOtherBranch: (t) => isOtherBranchTable(req, t),
+            fromTableId, toTableId, preview, ip: req.ip,
+        });
+        return res.status(200).json({ success: true, ...result });
+    } catch (error) {
+        if (error && error.name === 'MoveError') {
+            return res.status(error.status).json({ success: false, code: error.code, message: error.message, ...error.extra });
+        }
+        return res.status(500).json({ success: false, message: 'Error moving table', ...devError(error) });
+    }
+};
+
 module.exports = {
+    moveTable,
     getTableAvailability,
     createTable,
     getTables,

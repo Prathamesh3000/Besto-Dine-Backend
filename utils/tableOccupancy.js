@@ -293,6 +293,13 @@ async function releaseTableIfSettled(orderOrTableId, tenantFilterObj = {}, opts 
             },
             { $set: { activeOrder: newest } },
         );
+        // The table stays occupied: if nothing countable is left (the first
+        // order was cancelled and only empty / held orders remain) the timer
+        // is cleared; while another order counts it keeps running.
+        await require('./tableTimer').reconcileTableTimer(groupIds, tf, {
+            branch: opts.branch !== undefined ? opts.branch : (order?.branch || table.branch || null),
+            restaurant: table.restaurant || restaurant,
+        });
         return { freedIds: [], repointedTo: newest };
     }
 
@@ -309,7 +316,7 @@ async function releaseTableIfSettled(orderOrTableId, tenantFilterObj = {}, opts 
 
     // Lazy require — tableMerge is a sibling helper; keeps load order flat.
     const { freeTableOrUnmergeGroup } = require('./tableMerge');
-    const { freedIds } = await freeTableOrUnmergeGroup(tableId, tf);
+    const { freedIds } = await freeTableOrUnmergeGroup(tableId, tf, { timerReason: opts.timerReason || 'paid' });
 
     if (opts.emit !== false && freedIds.length) {
         try {

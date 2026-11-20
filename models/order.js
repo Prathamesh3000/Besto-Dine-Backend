@@ -445,6 +445,22 @@ const orderSchema = new mongoose.Schema({
   // banner inside the admin TablesDashboard drawer.
   counterPaymentRequestedAt: { type: Date },
 
+  // Table-move history (POST /tables/move), oldest first. Moving a party
+  // only changes `table` and appends here - status, items and payment never
+  // change. The last entry's from-side is shown as "Moved from T5".
+  tableMoves: {
+    type: [new mongoose.Schema({
+      fromTable:     { type: mongoose.Schema.Types.ObjectId, ref: 'Table' },
+      fromTableName: { type: String, default: '' },
+      toTable:       { type: mongoose.Schema.Types.ObjectId, ref: 'Table' },
+      toTableName:   { type: String, default: '' },
+      at:            { type: Date, default: Date.now },
+      by:            { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      byName:        { type: String, default: '' },
+    }, { _id: false })],
+    default: undefined,
+  },
+
   // Tracks whether deductInventoryForOrder has already run against
   // this order. Gates the deduction (idempotency — don't double-deduct
   // if status somehow re-enters 'preparing') and drives the restore

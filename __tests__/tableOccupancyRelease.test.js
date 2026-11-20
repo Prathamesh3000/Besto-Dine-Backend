@@ -83,7 +83,7 @@ describe('releaseTableIfSettled', () => {
             createdAt: { $gte: new Date(NOW.getTime() - PARTY_WINDOW_MS) },
             ...UNSETTLED_ORDER_MATCH,
         });
-        expect(mockFree).toHaveBeenCalledWith('t1', { restaurant: R });
+        expect(mockFree).toHaveBeenCalledWith('t1', { restaurant: R }, { timerReason: 'paid' });
         expect(mockEmitToStaff).toHaveBeenCalledWith({ io: true }, BR, 'table:updated', { tableId: 't1', status: 'free', restaurant: R });
         expect(mockTableUpdateMany).not.toHaveBeenCalled();
     });
@@ -123,7 +123,7 @@ describe('releaseTableIfSettled', () => {
         mockTableFindOne.mockResolvedValue({ _id: id, mergedWith: [], branch: null, restaurant: R });
         await releaseTableIfSettled(id, { restaurant: R });
         expect(mockTableFindOne.mock.calls[0][0]).toEqual({ _id: id, restaurant: R });
-        expect(mockFree).toHaveBeenCalledWith(id, { restaurant: R });
+        expect(mockFree).toHaveBeenCalledWith(id, { restaurant: R }, { timerReason: 'paid' });
         // No branch → emit routed by the tenant hint.
         expect(mockEmitToStaff).toHaveBeenCalledWith({ io: true }, null, 'table:updated', { tableId: id, status: 'free', restaurant: R });
     });
@@ -132,7 +132,7 @@ describe('releaseTableIfSettled', () => {
         await releaseTableIfSettled({ _id: 'o1', table: 't1', restaurant: R, branch: BR }, {});
         expect(mockTableFindOne.mock.calls[0][0]).toEqual({ _id: 't1', restaurant: R });
         expect(mockOrderFind.mock.calls[0][0].restaurant).toBe(R);
-        expect(mockFree).toHaveBeenCalledWith('t1', { restaurant: R });
+        expect(mockFree).toHaveBeenCalledWith('t1', { restaurant: R }, { timerReason: 'paid' });
     });
 
     test('opts.branch / opts.restaurant override the emit routing; emit:false skips the emit', async () => {

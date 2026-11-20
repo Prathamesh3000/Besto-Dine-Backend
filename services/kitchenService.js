@@ -12,6 +12,7 @@ const { getMergeGroupNames } = require('../utils/tableMerge');
 const { httpError, reply } = require('./orderErrors');
 const { staffBranchFilter } = require('./orderAccess');
 const { formatKitchenOrder, sortKitchenOrders, formatCompletedKitchenOrder } = require('./orderFormatters');
+const { movedFromOf } = require('../utils/tableMove');
 
 // "This order involved the kitchen": at least one kitchen/bar line, or a
 // legacy order whose items predate the prepStation field.
@@ -238,7 +239,7 @@ async function getCompletedKitchenOrders(req) {
 
   const [orders, total] = await Promise.all([
     Order.find(query)
-      .select('orderId type status total items table tokenNumber customerName createdAt updatedAt servedAt preparationStartedAt preparationCompletedAt')
+      .select('orderId type status total items table tokenNumber customerName createdAt updatedAt servedAt preparationStartedAt preparationCompletedAt tableMoves')
       .populate({ path: 'table', select: 'name area', populate: { path: 'area', select: 'name' } })
       .sort({ servedAt: -1, updatedAt: -1 })
       .limit(limit)
@@ -301,6 +302,7 @@ async function reprintKOT(req) {
       orderId: order.orderId,
       _id: String(order._id),
       table: kotTableLabel,
+      movedFrom: movedFromOf(order),
       type: order.type,
       items: order.items.map(i => ({
         name: i.name,
@@ -349,6 +351,7 @@ async function reprintKOT(req) {
       _id: order._id,
       orderId: order.orderId,
       table: kotTableLabel,
+      movedFrom: movedFromOf(order),
       items: order.items,
       type: order.type,
       customerName: order.customerName,

@@ -29,7 +29,7 @@ function handleSettingsValidation(req, res, next) {
 }
 const settingsValidate = (chains) => [...chains, handleSettingsValidation];
 
-const OBJECT_SECTIONS = ['general', 'taxes', 'notifications', 'reservation', 'delivery', 'wallet', 'landingPage', 'printers', 'payments'];
+const OBJECT_SECTIONS = ['general', 'taxes', 'notifications', 'reservation', 'delivery', 'wallet', 'landingPage', 'printers', 'payments', 'tableTimer'];
 const ARRAY_SECTIONS = ['operatingHours', 'branches'];
 const VALID_SECTIONS = [...OBJECT_SECTIONS, ...ARRAY_SECTIONS];
 
@@ -149,6 +149,14 @@ const SECTION_FIELD_RULES = {
         field(`${p}upiPayeeName`, c).optional({ values: 'null' })
             .custom((v) => typeof v === 'string').withMessage('Payee name must be text').bail()
             .custom((v) => normalizePayeeName(v) !== null).withMessage('Payee name can be at most 60 characters'),
+    ],
+    // Table timer thresholds (models/settings.js `tableTimer`): whole minutes
+    // 1..1440; red > amber is checked in settingsController (needs the stored half).
+    tableTimer: (p, c) => [
+        field(`${p}amberMinutes`, c).optional({ values: 'null' })
+            .isInt({ min: 1, max: 1440, allow_leading_zeroes: false }).withMessage('Amber minutes must be a whole number between 1 and 1440'),
+        field(`${p}redMinutes`, c).optional({ values: 'null' })
+            .isInt({ min: 1, max: 1440, allow_leading_zeroes: false }).withMessage('Red minutes must be a whole number between 1 and 1440'),
     ],
     // Thermal printers (models/settings.js `printers`). The `agent`
     // block is server-owned and ignored here (controller strips it).

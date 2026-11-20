@@ -11,6 +11,7 @@ const { tenantFilter, tenantId } = require('../../utils/tenantScope');
 const { createTipForPaidOrder } = require('../../utils/tipHelpers');
 const { checkOrderPaymentBinding, orderAmountDue, isValidCheckoutSignature } = require('../../utils/paymentChecks');
 const { claimPayment, releaseClaim } = require('../../utils/paymentClaim');
+const { siblingDueFor } = require('../../services/orderTenderService');
 const { describeRazorpayError } = require('../../utils/razorpayErrors');
 const {
     verifiedScanSessionId,
@@ -113,7 +114,7 @@ exports.createRazorpayOrder = async (req, res) => {
         let ownedOrder = null;
         if (cafeOrderId && cafeOrderId !== 'none') {
             const tf = tenantFilter(req);
-            const fields = '_id orderId total amountPaid paymentStatus status razorpayOrderId table branch';
+            const fields = '_id orderId total amountPaid paymentStatus status razorpayOrderId table branch type holdReason source user manualDiscount';
             if (mongoose.Types.ObjectId.isValid(cafeOrderId)) {
                 ownedOrder = await Order.findOne({ _id: cafeOrderId, ...tf }).select(fields).lean();
             }
@@ -153,6 +154,20 @@ exports.createRazorpayOrder = async (req, res) => {
             // Compare with what is still DUE (total − a prior wallet part),
             // the same rule verify-payment applies to the capture.
             const { due } = orderAmountDue(ownedOrder);
+            // Dine-in aggregated table bill: the customer's bill sums every
+            // unpaid round on the table and ONE capture settles them all
+            // (settleSiblingDineInRounds). So the amount may be either this
+            // order's own due, or its due plus what the table's other unpaid
+            // rounds still owe — nothing in between and nothing above.
+            let siblingDue = 0;
+            if (ownedOrder.type === 'dine-in' && ownedOrder.table) {
+                try {
+                    siblingDue = await siblingDueFor(req, ownedOrder, tf);
+                } catch (err) {
+                    logger.warn('createRazorpayOrder: sibling due lookup failed — treating as 0', { error: err.message });
+                }
+            }
+            const tableDue = siblingDue > 0 ? Math.round((due + siblingDue) * 100) / 100 : due;
             if (typeof ownedOrder.total === 'number' && amount < due - 1) {
                 return res.status(400).json({
                     success: false,
@@ -162,11 +177,22 @@ exports.createRazorpayOrder = async (req, res) => {
             }
             // Never let the client open a checkout above what is due (₹1
             // rounding tolerance): the server owns the amount.
-            if (typeof ownedOrder.total === 'number' && amount > due + 1) {
+            if (typeof ownedOrder.total === 'number' && amount > tableDue + 1) {
                 return res.status(400).json({
                     success: false,
                     code: 'AMOUNT_MISMATCH',
-                    message: `Payment amount ₹${amount} exceeds the amount due ₹${due}.`,
+                    message: `Payment amount ₹${amount} exceeds the amount due ₹${tableDue}.`,
+                });
+            }
+            // Between this round's due and the whole table's due is neither a
+            // single-round payment nor a full-table one: it would settle every
+            // sibling round for less than they owe.
+            if (typeof ownedOrder.total === 'number' && siblingDue > 0
+                && amount > due + 1 && amount < tableDue - 1) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'AMOUNT_MISMATCH',
+                    message: `Payment amount ₹${amount} must be this order's ₹${due} or the whole table's ₹${tableDue}.`,
                 });
             }
         }

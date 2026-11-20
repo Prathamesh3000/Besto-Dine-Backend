@@ -12,6 +12,7 @@ const logger = require('../utils/logger');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
 const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope');
 const { httpError, reply } = require('./orderErrors');
+const { movedFromOf, findMovedDestination } = require('../utils/tableMove');
 const { staffBranchFilter, applySessionScope } = require('./orderAccess');
 const {
   formatLiveOrder,
@@ -545,11 +546,29 @@ async function getRefunds(req) {
 // list them in placement order ("Order #1", "Order #2", ...). Used by
 // the admin Tables drawer, the customer bill preview, and the chef
 // dashboard for the table-aggregation views.
+// A guest whose party staff moved to another table (POST /tables/move) may still
+// ask about its OLD table: answer for the table the party is at now. Anyone else,
+// and any other table, is returned unchanged.
+async function followMovedTable(req, tableId) {
+  try {
+    if (req.user && req.user.role !== 'customer') return tableId;
+    const token = req.headers['x-scan-token'];
+    if (!token) return tableId;
+    const d = verifyTypedToken(token, TOKEN_TYPES.SCAN);
+    if (!d.sessionId || String(d.tableId) !== String(tableId)) return tableId;
+    const moved = await findMovedDestination({ tableId, sessionId: d.sessionId, tenantFilter: tenantFilter(req) });
+    return moved || tableId;
+  } catch {
+    return tableId;
+  }
+}
+
 async function getActiveOrdersListByTable(req) {
-  const { tableId } = req.params;
+  let { tableId } = req.params;
   if (!mongoose.Types.ObjectId.isValid(tableId)) {
     throw httpError(400, { success: false, message: 'Invalid table ID' });
   }
+  tableId = await followMovedTable(req, tableId);
   const isGuestOrCustomer = !req.user || req.user.role === 'customer';
   const SESSION_WINDOW_MS = 12 * 60 * 60 * 1000;
 
@@ -581,16 +600,17 @@ async function getActiveOrdersListByTable(req) {
     return reply(200, { success: true, orders: orders.map((o) => forCustomer(req, o, o)) });
   }
   const billingState = (await billingStatesForTables([tableId], tenantFilter(req))).get(String(tableId)) || null;
-  return reply(200, { success: true, billingState, orders: orders.map((o) => ({ ...o, payment: publicPayment(o) })) });
+  return reply(200, { success: true, billingState, orders: orders.map((o) => ({ ...o, payment: publicPayment(o), movedFrom: movedFromOf(o) })) });
 }
 
 // Get active order for a specific table (includes served but unpaid orders)
 async function getActiveOrderByTable(req) {
-  const { tableId } = req.params;
+  let { tableId } = req.params;
 
   if (!mongoose.Types.ObjectId.isValid(tableId)) {
     throw httpError(400, { success: false, message: 'Invalid table ID' });
   }
+  tableId = await followMovedTable(req, tableId);
 
   const activeStatuses = ['new', 'preparing', 'ready', 'served'];
 
@@ -648,7 +668,7 @@ async function getActiveOrderByTable(req) {
 
   if (isGuestOrCustomer) return reply(200, { success: true, order: forCustomer(req, order, order) });
   const billingState = (await billingStatesForTables([tableId], tenantFilter(req))).get(String(tableId)) || null;
-  return reply(200, { success: true, billingState, order: { ...order, payment: publicPayment(order) } });
+  return reply(200, { success: true, billingState, order: { ...order, payment: publicPayment(order), movedFrom: movedFromOf(order) } });
 }
 
 // Get single order by ID (for customer tracking)

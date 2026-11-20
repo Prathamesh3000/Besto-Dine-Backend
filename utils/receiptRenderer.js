@@ -22,6 +22,7 @@
  */
 const { lineItemsSubtotal } = require('../services/orderBillMath');
 const { formatBillNo } = require('./billNumber');
+const { movedFromOf } = require('./tableMove');
 
 const COLS = Object.freeze({ '58': 32, '80': 48 });
 
@@ -170,6 +171,9 @@ function renderKot({ cafeName, order, items, station, tableLabel, reason, waiter
     pushRow(lines, order?.orderId || '', orderTypeLabel(order), w, { b: true });
     const who = tableLabel ? `Table ${tableLabel}` : (order?.customerName ? text(order.customerName) : '');
     pushRow(lines, who, formatTime(reason === 'append' ? Date.now() : (order?.createdAt || Date.now()), timezone), w);
+    // POST /tables/move: tell the kitchen the party sat elsewhere before.
+    const movedFrom = movedFromOf(order);
+    if (movedFrom && movedFrom.tableName) pushWrapped(lines, `Moved from ${text(movedFrom.tableName)}`, w, 'l', { b: true });
     lines.push(HR);
 
     let count = 0;
@@ -254,6 +258,8 @@ function renderBill({ settings, order, tableLabel, paperWidth, openDrawer, upi =
     if (order?.bill?.billNo != null) pushRow(lines, `Bill No: ${formatBillNo(order.bill)}`, '', w, { b: true });
     const typeLabel = orderTypeLabel(order);
     pushRow(lines, tableLabel ? `Table ${tableLabel}` : typeLabel, tableLabel ? typeLabel : '', w);
+    const billMovedFrom = movedFromOf(order);
+    if (tableLabel && billMovedFrom && billMovedFrom.tableName) pushRow(lines, `Moved from ${text(billMovedFrom.tableName)}`, '', w);
     if (order?.customerName) pushRow(lines, `Customer: ${text(order.customerName)}`, '', w);
     lines.push(HR);
 

@@ -12,6 +12,7 @@ const { getMainBranchId, isSubBranchCaller } = require('../utils/mainBranch');
 const EVENTS = require('../realtime/events');
 const logger = require('../utils/logger');
 const { normalizeVpa, normalizePayeeName, maskVpa } = require('../utils/upiQr');
+const { normalizeTableTimer, validateTableTimer, canSeeTimer } = require('../utils/tableTimer');
 
 // Broadcast `settings:updated` to every staff dashboard at the caller's
 // branch so headers (admin / waiter / chef) can refetch and swap the
@@ -39,7 +40,7 @@ function broadcastSettingsUpdated(req, section = 'general') {
 //
 // `general` and `branches` stay per-branch so each location keeps its
 // own address, contact, and cafe name.
-const INHERITED_SECTIONS = ['taxes', 'reservation', 'wallet', 'notifications', 'operatingHours', 'delivery'];
+const INHERITED_SECTIONS = ['taxes', 'reservation', 'wallet', 'notifications', 'operatingHours', 'delivery', 'tableTimer'];
 
 const EMAIL_REGEX   = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PINCODE_REGEX = /^[0-9]{6}$/;
@@ -706,6 +707,8 @@ function sanitizePublicSettings(settings) {
   delete copy.printers;
   // The restaurant's UPI payee is never customer-facing.
   delete copy.payments;
+  // Table timer thresholds are floor-staff config.
+  delete copy.tableTimer;
   // Back-office config: Tally ledger mapping, staff notification switches.
   delete copy.taxExport;
   delete copy.notifications;
@@ -732,6 +735,18 @@ function normalizePrinters(body, existingDoc) {
   }
 }
 
+// Table timer: merge the submitted half/halves over the stored (or default)
+// thresholds and validate the pair. Returns { value } or { error }.
+function resolveTableTimerInput(input, existing) {
+  const cur = normalizeTableTimer(existing && typeof existing.toObject === 'function' ? existing.toObject() : existing);
+  const next = { ...cur };
+  for (const k of ['amberMinutes', 'redMinutes']) {
+    if (input && input[k] !== undefined && input[k] !== null && input[k] !== '') next[k] = Number(input[k]);
+  }
+  const error = validateTableTimer(next);
+  return error ? { error } : { value: next };
+}
+
 function sanitizeMongoKeys(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
   const clean = {};
@@ -747,6 +762,12 @@ exports.getSettings = async (req, res) => {
     const resolved = await exports.resolveSettingsForRequest(req);
     const isStaffOrAdmin = req.user && ['admin', 'manager', 'captain', 'waiter', 'chef', 'superadmin'].includes(req.user.role);
     const payload = isStaffOrAdmin ? resolved : sanitizePublicSettings(resolved);
+    // Table timer thresholds: defaults (60 / 90) when never saved.
+    // Only admin / manager / captain see it; waiter, chef and superadmin get no timer key.
+    if (isStaffOrAdmin && payload && typeof payload === 'object') {
+      if (canSeeTimer(req.user)) payload.tableTimer = normalizeTableTimer(payload.tableTimer);
+      else delete payload.tableTimer;
+    }
     res.json(payload);
   } catch (error) {
     logger.error('getSettings error:', { error: error.message });
@@ -916,6 +937,12 @@ exports.updateSettings = async (req, res) => {
       }
     }
 
+    if (updateBody.tableTimer !== undefined) {
+      const tt = resolveTableTimerInput(updateBody.tableTimer, settings?.tableTimer);
+      if (tt.error) return res.status(400).json({ success: false, message: tt.error, errors: { tableTimer: tt.error } });
+      updateBody.tableTimer = tt.value;
+    }
+
     if (settings) {
       settings = await Settings.findOneAndUpdate(scope, updateBody, {
         returnDocument: 'after',
@@ -953,7 +980,7 @@ exports.updateSettings = async (req, res) => {
 exports.updateSettingsSection = async (req, res) => {
   try {
     const { section } = req.params;
-    const validSections = ['general', 'operatingHours', 'taxes', 'notifications', 'reservation', 'wallet', 'branches', 'delivery', 'landingPage', 'printers', 'payments'];
+    const validSections = ['general', 'operatingHours', 'taxes', 'notifications', 'reservation', 'wallet', 'branches', 'delivery', 'landingPage', 'printers', 'payments', 'tableTimer'];
 
     if (!validSections.includes(section)) {
       return res.status(400).json({ message: `Invalid section: ${section}. Valid sections: ${validSections.join(', ')}` });
@@ -1004,6 +1031,11 @@ exports.updateSettingsSection = async (req, res) => {
       settings = await Settings.create(await buildDefaults(req));
     }
 
+    if (section === 'tableTimer') {
+      const tt = resolveTableTimerInput(req.body, settings.tableTimer);
+      if (tt.error) return res.status(400).json({ success: false, message: tt.error, errors: { tableTimer: tt.error } });
+      req.body = tt.value;
+    }
     if (section === 'printers') normalizePrinters(req.body, settings);
     if (section === 'payments') {
       const pay = normalizePaymentsBody(req.body);

@@ -19,6 +19,7 @@ const { tenantFilter, tenantId, pinnedBranchId } = require('../utils/tenantScope
 const { resolveMergeLeader } = require('../utils/tableMerge');
 const { callerPartyKeys, tableUnavailableError } = require('../utils/tableOccupancy');
 const { claimSeat } = require('../utils/tableSeats');
+const { startTableTimer } = require('../utils/tableTimer');
 const { httpError, reply } = require('./orderErrors');
 const {
   isValidObjectId,
@@ -310,6 +311,7 @@ async function repeatOrderItem(req) {
           { _id: counterDoc.table, ...tenantFilter(req) },
           { status: 'occupied', activeOrder: counterDoc._id },
         );
+        await startTableTimer(counterDoc);
         emitStaffTable('table:updated', { tableId: counterDoc.table, status: 'occupied' }, counterDoc.branch);
       } catch (err) { logger.warn('Repeat-item counter table update failed:', err.message); }
     }
@@ -330,23 +332,18 @@ async function repeatOrderItem(req) {
 
   const itemForKitchen = kitchenPart[0]; // single item — guaranteed by partition
 
-  // If source order is ACTIVE (and not already paid — a prepaid order
-  // still in the kitchen must not grow), add to it
-  if (['new', 'preparing', 'ready'].includes(sourceOrder.status) && !isSettled(sourceOrder)) {
+  // If source order is still being cooked (new / preparing) and not already
+  // paid — a prepaid order still in the kitchen must not grow — add to it.
+  // A READY order is already cooked: appending would flip it back to
+  // Preparing and the chef would re-cook the ready item, so it falls
+  // through to a new order below (same as a served round).
+  if (['new', 'preparing'].includes(sourceOrder.status) && !isSettled(sourceOrder)) {
     // Stamp addedAt so the customer + chef views can split this
     // repeated item from the original batch on the timeline.
     const stampedItem = { ...itemForKitchen, addedAt: new Date() };
     // Same bill recompute as appendOrderItems — the repeated item
     // attracts GST / service charge / additional charges.
     const repeatDelta = await appendRepeatItemsToOrder(req, sourceOrder, [stampedItem], lineItemsSubtotal([stampedItem]));
-    // Status revert on append — see createOrder's matching block
-    // for the full rationale. ready → preparing because the new
-    // repeated item still needs cooking; the order is no longer
-    // "fully ready" until the kitchen finishes the new line.
-    if (sourceOrder.status === 'ready') {
-      sourceOrder.status = 'preparing';
-      sourceOrder.preparationCompletedAt = undefined;
-    }
     await sourceOrder.save();
 
     // Re-emit kitchen events so the chef KDS picks the order
@@ -412,6 +409,7 @@ async function repeatOrderItem(req) {
       { _id: savedOrder.table, ...tenantFilter(req) },
       { status: 'occupied', activeOrder: savedOrder._id }
     );
+    await startTableTimer(savedOrder);
     emitStaffTable('table:updated', { tableId: savedOrder.table, status: 'occupied' }, savedOrder.branch);
   }
 
@@ -568,6 +566,7 @@ async function persistRepeatCounterSide(req, { sourceOrder, repeatCounter, resol
           { _id: counterSideOrder.table, ...tf },
           { status: 'occupied', activeOrder: counterSideOrder._id },
         );
+        await startTableTimer(counterSideOrder);
         emitStaffTable('table:updated', { tableId: counterSideOrder.table, status: 'occupied' }, counterSideOrder.branch);
       } catch (err) { logger.warn('Repeat-all: counter table update failed:', err.message); }
     }
@@ -599,7 +598,11 @@ async function findRepeatAppendTarget(req, { sourceOrder, resolvedTargetTable, t
   // actually is. A source that is already PAID (prepaid online / kiosk
   // while still in the kitchen) is never reopened — the repeat becomes
   // a new unpaid order instead.
-  const sourceIsActive = ['new', 'preparing', 'ready'].includes(sourceOrder.status) && !isSettled(sourceOrder);
+  // Only a round the chef has not finished (new / preparing) takes the
+  // repeat. A READY round is already cooked, so appending would flip it
+  // back to Preparing and the chef would re-cook the ready item (x2) -
+  // it gets its own order like a served round does.
+  const sourceIsActive = ['new', 'preparing'].includes(sourceOrder.status) && !isSettled(sourceOrder);
   const sameTableAsSource = !sourceOrder.table
     || !resolvedTargetTable
     || String(sourceOrder.table) === String(resolvedTargetTable);
@@ -624,10 +627,9 @@ async function findRepeatAppendTarget(req, { sourceOrder, resolvedTargetTable, t
   //     kitchen-side repeated items to it instead of creating a
   //     duplicate. Another party's open bill is never touched.
   if (sourceOrder.type === 'dine-in' && resolvedTargetTable) {
-    // Only fold the repeat into a still-ACTIVE round (new/preparing/
-    // ready) — that round is mid-flight, so adding to it is correct and
-    // the kitchen hasn't finished it yet. A SERVED round is already
-    // cooked and delivered; appending to it would revive the served
+    // Only fold the repeat into a round still being cooked (new/preparing)
+    // — adding to it is correct, the kitchen hasn't finished it yet. A
+    // READY or SERVED round is already cooked; appending to it would revive the served
     // items into the chef KDS (chef sees "×2" and re-cooks the one
     // that's already on the table). So when the previous round is
     // served, we DON'T append here — we fall through to create a fresh
@@ -636,7 +638,7 @@ async function findRepeatAppendTarget(req, { sourceOrder, resolvedTargetTable, t
     // lost on the bill; the chef just sees only the new ×1 to cook.
     const existingOnTable = await Order.findOne({
       table: resolvedTargetTable,
-      status: { $in: ['new', 'preparing', 'ready'] },
+      status: { $in: ['new', 'preparing'] },
       paymentStatus: { $nin: [...SETTLED_PAYMENT_STATUSES] },
       ...repeatPartyFilter(sourceOrder),
       ...tf,
@@ -697,7 +699,9 @@ async function appendRepeatToActiveOrder(req, { target, sourceOrder, repeatKitch
 }
 
 // Kitchen side: create a fresh order for the repeated items.
-async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf, tokenFor }) {
+// `label` lets another caller (staff "add items" onto a READY order) reuse this
+// to open the new order with its own wording / reply shape.
+async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal, counterSideOrder, counterBare, resolvedTargetTable, resolvedTargetBranch, tf, tokenFor, label = null }) {
   // Source closed and no active order on the target table → create a fresh kitchen-side order.
   const newOrderId = sourceOrder.type === 'takeaway' ? idGen.takeawayOrderId() : idGen.orderId();
   // A repeat that opens a fresh order is that order's KOT round 1.
@@ -719,7 +723,7 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
     items: repeatKitchen,
     total: kitchenTotal, // replaced by the taxed bill below
     scanSessionId: sourceOrder.scanSessionId || null,
-    note: `Repeated from ${sourceOrder.orderId}`,
+    note: label?.note ?? `Repeated from ${sourceOrder.orderId}`,
     pickupLocation: sourceOrder.pickupLocation,
   });
   // Mixed repeat: the counter doc holds its items' bare subtotal, so this
@@ -736,6 +740,7 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
         { _id: savedOrder.table, ...tf },
         { status: 'occupied', activeOrder: savedOrder._id },
       );
+      await startTableTimer(savedOrder);
       emitStaffTable('table:updated', { tableId: savedOrder.table, status: 'occupied' }, savedOrder.branch);
     } catch (err) { logger.warn('Repeat-all: table update failed:', err.message); }
   }
@@ -744,14 +749,14 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
     const io = getIO();
     emitToKitchen(io, savedOrder.branch, 'order:new', { orderId: savedOrder.orderId });
     emitToAdmin(io, savedOrder.branch, 'notification:new', {
-      title: 'New Order (Repeat)',
-      description: `Order ${savedOrder.orderId} repeated from ${sourceOrder.orderId}`,
+      title: label?.title ?? 'New Order (Repeat)',
+      description: label?.description ?? `Order ${savedOrder.orderId} repeated from ${sourceOrder.orderId}`,
     });
   } catch { /* socket best-effort */ }
 
   emitOrderEvent('order:updated', { orderId: savedOrder.orderId, status: savedOrder.status }, savedOrder);
 
-  return reply(201, {
+  return reply(label?.status ?? 201, {
     success: true,
     order: savedOrder,
     kotNo: 1,
@@ -760,7 +765,8 @@ async function createRepeatOrder(req, { sourceOrder, repeatKitchen, kitchenTotal
     splitOrder: counterSideOrder || null,
     message: counterSideOrder
       ? 'Two orders created — counter side ready, kitchen side queued.'
-      : 'New order created from repeat',
+      : (label?.message ?? 'New order created from repeat'),
+    ...(label?.extra || {}),
   });
 }
 
@@ -855,6 +861,60 @@ async function repeatOrderAllItems(req) {
 }
 
 // ── Append items (waiter / captain) ─────────────────────────────────
+// Item status is stored on the ORDER, not on each line. Merging a new item
+// into a READY order would flip the whole order (the already-cooked items
+// too) back to Preparing and the chef would re-cook them. So a READY order is
+// left exactly as it is and the added items go on their OWN new order — the
+// same independent-orders model customer "Place Order" and Repeat use — which
+// keeps every item's status separate. The table's bill still sums every
+// unpaid round. Counter (no-prep) items become a ready counter order.
+async function appendAsNewOrder(req, order, enrichedItems) {
+  const tf = tenantFilter(req);
+  const tokenFor = tokenAllocator(req, order, tokenModeFor(req));
+  const { counterItems, kitchenItems } = partitionItemsByStation(enrichedItems);
+  const kitchenTotal = Math.round(
+    kitchenItems.reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.quantity) || 1), 0) * 100,
+  ) / 100;
+  const counterSideOrder = await persistRepeatCounterSide(req, {
+    sourceOrder: order,
+    repeatCounter: counterItems,
+    resolvedTargetTable: order.table,
+    resolvedTargetBranch: order.branch,
+    tf,
+    bare: kitchenItems.length > 0,
+    tokenFor,
+  });
+  if (kitchenItems.length === 0) {
+    if (!counterSideOrder) throw httpError(500, { success: false, message: 'Failed to add items' });
+    return reply(200, {
+      success: true,
+      order: counterSideOrder,
+      appendedAsNewOrder: true,
+      addedCount: enrichedItems.length,
+      message: `${enrichedItems.length} item(s) added as a new ready order`,
+    });
+  }
+  return createRepeatOrder(req, {
+    sourceOrder: order,
+    repeatKitchen: kitchenItems,
+    kitchenTotal,
+    counterSideOrder,
+    counterBare: true,
+    resolvedTargetTable: order.table,
+    resolvedTargetBranch: order.branch,
+    tf,
+    tokenFor,
+    label: {
+      note: `Added to ${order.orderId}`,
+      title: 'New Order (Added)',
+      description: `Items added to table order ${order.orderId} as a new order`,
+      status: 200,
+      message: `${enrichedItems.length} item(s) added as a new order — the ready order is unchanged`,
+      extra: { appendedAsNewOrder: true, addedCount: enrichedItems.length },
+    },
+  });
+}
+
 // Pre-flight stock check for the appended items. Same gate as
 // createOrder — block the append at request time when an ingredient is
 // short, so the chef doesn't end up trying to deduct for items that
@@ -984,6 +1044,11 @@ async function appendOrderItems(req) {
 
   await preflightAppendStock(req, enrichedItems, order.branch);
 
+  // A READY order is finished — don't reopen it (see appendAsNewOrder).
+  if (order.status === 'ready') {
+    return appendAsNewOrder(req, order, enrichedItems);
+  }
+
   // Status revert on append. Same pattern as the customer-side
   // append (createOrder) and the customer Repeat Order flow:
   //   served → new       (table re-opens, kitchen restarts)
@@ -1081,6 +1146,7 @@ async function appendOrderItems(req) {
       { _id: order.table, ...tenantFilter(req) },
       { status: 'occupied', activeOrder: order._id, alerts: [] }
     );
+    await startTableTimer(order);
     emitStaffTable('table:updated', { tableId: order.table, status: 'occupied' }, order.branch);
   }
 

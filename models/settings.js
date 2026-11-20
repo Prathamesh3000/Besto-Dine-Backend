@@ -235,6 +235,14 @@ const settingsSchema = new mongoose.Schema({
     upiPayeeName: { type: String, default: '', trim: true, maxlength: [60, 'Payee name cannot exceed 60 characters'] },
   },
 
+  // Table timer thresholds (minutes a table may stay occupied before the floor
+  // shows it amber / red). Validated (1..1440, red > amber) by
+  // settingsController; inherited from the main branch like taxes.
+  tableTimer: {
+    amberMinutes: { type: Number, default: 60, min: [1, 'Amber minutes must be between 1 and 1440'], max: [1440, 'Amber minutes must be between 1 and 1440'] },
+    redMinutes:   { type: Number, default: 90, min: [1, 'Red minutes must be between 1 and 1440'], max: [1440, 'Red minutes must be between 1 and 1440'] },
+  },
+
   // Thermal printers (KOT / bill) for THIS branch. Not inherited: each
   // location has its own printers and its own print agent (the small
   // program on the counter PC that talks to them — see print-agent/).

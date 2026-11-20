@@ -135,6 +135,7 @@ exports.listMyRefundRequests = async (req, res) => {
         const tf = tenantFilter(req);
         const rows = await RefundRequest.find({ ...tf, user: req.user.id })
             .sort({ createdAt: -1 })
+            .limit(200)
             .lean();
         return res.status(200).json({ success: true, data: rows });
     } catch (err) {

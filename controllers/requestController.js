@@ -13,6 +13,7 @@ const { tenantFilter, tenantId, strictBranchFilter, pinnedBranchId } = require('
 const { findWaitersForTable } = require('../utils/staffAssignment');
 const { devError } = require('../utils/AppError');
 const { verifyTypedToken, TOKEN_TYPES } = require('../middlewares/authMiddleware');
+const { findMovedDestination } = require('../utils/tableMove');
 
 // Valid request types and priorities (centralized)
 const VALID_TYPES = ['water', 'waiter', 'bill', 'other'];
@@ -21,7 +22,8 @@ const VALID_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
 // Create a new request from customer side
 exports.createRequest = async (req, res) => {
   try {
-    const { tableId, type, items, priority } = req.body;
+    const { type, items, priority } = req.body;
+    let { tableId } = req.body;
 
     // Validate input
     if (!tableId) {
@@ -57,6 +59,17 @@ exports.createRequest = async (req, res) => {
 
     // Validate table and populate assignedWaiter (scoped to tenant)
     const tf = tenantFilter(req);
+    // A phone that missed the table:moved push still names its OLD table:
+    // if staff moved this scan session's party, the request belongs to the new one.
+    if ((!req.user || req.user.role === 'customer') && req.headers['x-scan-token']) {
+      try {
+        const d = verifyTypedToken(req.headers['x-scan-token'], TOKEN_TYPES.SCAN);
+        if (d.sessionId && String(d.tableId) === String(tableId)) {
+          const movedTo = await findMovedDestination({ tableId: d.tableId, sessionId: d.sessionId, tenantFilter: tf });
+          if (movedTo) tableId = movedTo;
+        }
+      } catch { /* the scan-token check below reports a bad token */ }
+    }
     // `area` is populated so the notifications this request raises can
     // carry the floor name. Without it the waiter's notification list
     // has no way to group by section (Indoor / Outdoor), which is how
@@ -100,6 +113,12 @@ exports.createRequest = async (req, res) => {
       let sameGroup = groupIds.includes(String(decoded.tableId));
       if (!sameGroup && mongoose.Types.ObjectId.isValid(String(decoded.tableId))) {
         sameGroup = !!(await Table.exists({ _id: decoded.tableId, mergedWith: table._id, ...tf }));
+      }
+      // A party staff moved to this table (POST /tables/move) may still hold
+      // the scan token of its old table.
+      if (!sameGroup && decoded.sessionId) {
+        const movedTo = await findMovedDestination({ tableId: decoded.tableId, sessionId: decoded.sessionId, tenantFilter: tf });
+        sameGroup = !!movedTo && groupIds.includes(String(movedTo));
       }
       const currentTenant = tenantId(req);
       if (!sameGroup
